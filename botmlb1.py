@@ -146,7 +146,7 @@ class IndicatorSnapshot:
 
 class BotWorker(QObject):
     status_changed = pyqtSignal(str)
-    row_ready = pyqtSignal(str, Dict[str, Union[float, str]])
+    row_ready = pyqtSignal(str, dict)
     trade_completed = pyqtSignal(str, str, float, float)
     finished = pyqtSignal()
 
