@@ -2,8 +2,8 @@ import sys
 import time
 import logging
 import threading
-from dataclasses import dataclass, asdict
-from typing import Dict, Optional, Tuple, Union, Set, Iterable, List
+from dataclasses import dataclass, asdict, field
+from typing import Dict, Optional, Tuple, Union, Set, Iterable, List, Iterator
 from datetime import datetime
 from textwrap import dedent
 
@@ -360,7 +360,7 @@ class TradePair:
     api_symbol: str
     active_id: int
     instrument_type: str  # "digital" or "binary"
-    candle_aliases: Tuple[Union[str, int], ...]
+    candle_aliases: Tuple[Union[str, int], ...] = field(default_factory=tuple)
 
 
 class BotWorker(QObject):
@@ -507,6 +507,167 @@ class BotWorker(QObject):
         logging.info("Activo %s descartado: %s", par.display, motivo)
 
     @staticmethod
+    def _es_info_activo(info: Dict) -> bool:
+        if not isinstance(info, dict):
+            return False
+        if info.get("open") is False or info.get("is_open") is False:
+            return False
+        claves = ("id", "active_id", "instrument_id", "asset_id", "underlying_id")
+        if any(info.get(clave) not in (None, {}, []) for clave in claves):
+            return True
+        for nested_key in ("active", "instrument", "asset", "option"):
+            nested = info.get(nested_key)
+            if isinstance(nested, dict) and BotWorker._es_info_activo(nested):
+                return True
+        return False
+
+    @staticmethod
+    def _desempaquetar_id(valor: Union[int, str, Dict, None]) -> Optional[int]:
+        if valor is None:
+            return None
+        if isinstance(valor, dict):
+            for clave in ("id", "value", "active_id", "instrument_id"):
+                if clave in valor:
+                    resultado = BotWorker._desempaquetar_id(valor.get(clave))
+                    if resultado is not None:
+                        return resultado
+            return None
+        if isinstance(valor, (int, float)):
+            try:
+                return int(valor)
+            except (TypeError, ValueError):
+                return None
+        if isinstance(valor, str):
+            texto = valor.strip()
+            if not texto:
+                return None
+            try:
+                return int(texto)
+            except ValueError:
+                digitos = "".join(ch for ch in texto if ch.isdigit())
+                if digitos:
+                    try:
+                        return int(digitos)
+                    except ValueError:
+                        return None
+        return None
+
+    @staticmethod
+    def _extraer_active_id(info: Dict) -> Optional[int]:
+        if not isinstance(info, dict):
+            return None
+        for clave in ("id", "active_id", "instrument_id", "asset_id", "underlying_id"):
+            resultado = BotWorker._desempaquetar_id(info.get(clave))
+            if resultado is not None:
+                return resultado
+        for nested_key in ("active", "instrument", "asset", "option"):
+            nested = info.get(nested_key)
+            if isinstance(nested, dict):
+                nested_id = BotWorker._extraer_active_id(nested)
+                if nested_id is not None:
+                    return nested_id
+        return None
+
+    @staticmethod
+    def _inferir_simbolo(clave: Optional[str], info: Dict) -> Optional[str]:
+        candidatos: List[str] = []
+        if isinstance(clave, str):
+            candidatos.append(clave)
+        if isinstance(info, dict):
+            for key in ("symbol", "active", "underlying", "asset_name", "name", "ticker"):
+                valor = info.get(key)
+                if isinstance(valor, str):
+                    candidatos.append(valor)
+        for candidato in candidatos:
+            texto = candidato.strip()
+            if not texto:
+                continue
+            texto_lower = texto.lower()
+            if texto_lower in {
+                "open",
+                "close",
+                "is_open",
+                "actives",
+                "list",
+                "items",
+                "data",
+                "schedule",
+            }:
+                continue
+            return texto
+        return None
+
+    def _recorrer_catalogo(
+        self,
+        categoria: str,
+        nodo: Union[Dict, List, None],
+        clave_actual: Optional[str] = None,
+    ) -> Iterator[Tuple[str, str, Dict]]:
+        if isinstance(nodo, dict):
+            if self._es_info_activo(nodo):
+                simbolo = self._inferir_simbolo(clave_actual, nodo)
+                if simbolo:
+                    yield categoria, simbolo, nodo
+            for clave, valor in nodo.items():
+                siguiente = clave_actual
+                if isinstance(clave, str):
+                    clave_limpia = clave.strip()
+                    if clave_limpia:
+                        siguiente = clave_limpia
+                if isinstance(valor, (dict, list)):
+                    yield from self._recorrer_catalogo(categoria, valor, siguiente)
+        elif isinstance(nodo, list):
+            for item in nodo:
+                yield from self._recorrer_catalogo(categoria, item, clave_actual)
+
+    def _iterar_activos_abiertos(self, payload: Union[Dict, Tuple, None]) -> Iterator[Tuple[str, str, Dict]]:
+        if isinstance(payload, tuple) and len(payload) == 2 and isinstance(payload[1], dict):
+            payload = payload[1]
+        if not isinstance(payload, dict):
+            return
+        etiquetas = ("digital", "binary", "turbo")
+        for categoria, contenido in payload.items():
+            nombre = str(categoria).lower()
+            token_encontrado = None
+            for token in etiquetas:
+                if token in nombre:
+                    token_encontrado = token
+                    break
+            if not token_encontrado:
+                continue
+            yield from self._recorrer_catalogo(token_encontrado, contenido)
+
+    def _extraer_digital_meta(self, iq) -> Iterator[Tuple[str, str, Dict]]:
+        try:
+            payload = iq.get_digital_underlying_list_data()
+        except Exception:
+            return
+
+        underlying = payload.get("underlying", {}) if isinstance(payload, dict) else {}
+        if not isinstance(underlying, dict):
+            return
+
+        for info in underlying.values():
+            if not isinstance(info, dict):
+                continue
+            if info.get("enabled") is False or info.get("is_suspended") is True:
+                continue
+            simbolo = (
+                info.get("symbol")
+                or info.get("underlying")
+                or info.get("active")
+                or info.get("asset_name")
+                or info.get("name")
+            )
+            if not simbolo:
+                continue
+            yield "digital", simbolo, info
+
+    @staticmethod
+    def _tipo_desde_categoria(nombre: str) -> str:
+        return "digital" if "digital" in nombre else "binary"
+
+    @staticmethod
     def _generar_aliases_candles(
         raw_symbol: Optional[str],
         resolved_symbol: Optional[str],
@@ -602,56 +763,65 @@ class BotWorker(QObject):
         iq.sync_active_catalog(activos)
 
         candidates: Dict[str, TradePair] = {}
-        if isinstance(activos, dict):
-            for category in ("digital", "binary", "turbo"):
-                entries = activos.get(category, {})
-                if not isinstance(entries, dict):
-                    continue
-                for par, info in entries.items():
-                    if not isinstance(info, dict):
-                        continue
-                    if info.get("open") is False:
-                        continue
-                    try:
-                        active_id = int(info.get("id") or info.get("active_id"))
-                    except (TypeError, ValueError):
-                        continue
-                    resolved = iq.resolve_active_symbol(active_id)
-                    if not resolved:
-                        resolved = _sanitize_symbol_name(par)
-                    if not resolved:
-                        continue
-                    instrument_type = "digital" if category == "digital" else "binary"
-                    display_base = resolved
-                    display = display_base
-                    if display in candidates:
-                        suffix = "digital" if instrument_type == "digital" else "binary"
-                        display = f"{display_base} ({suffix})"
-                        idx = 2
-                        while display in candidates:
-                            display = f"{display_base} ({suffix} {idx})"
-                            idx += 1
-                    api_symbol = resolved or _sanitize_symbol_name(par) or par
-                    aliases = self._generar_aliases_candles(
-                        par,
-                        api_symbol,
-                        info,
-                        instrument_type,
-                        active_id,
-                    )
-                    candidates[display] = TradePair(
-                        display=display,
-                        api_symbol=api_symbol,
-                        active_id=active_id,
-                        instrument_type=instrument_type,
-                        candle_aliases=aliases,
-                    )
+        entradas = list(self._iterar_activos_abiertos(activos))
+        if not entradas:
+            logging.warning("No se encontraron pares en la respuesta de horarios.")
+            entradas = list(self._extraer_digital_meta(iq))
+            if entradas:
+                logging.info(
+                    "Se utilizarán metadatos digitales como respaldo para construir la lista de pares."
+                )
+
+        vistos: Set[Tuple[int, str]] = set()
+        for categoria, simbolo_original, info in entradas:
+            if not isinstance(info, dict):
+                continue
+            if info.get("open") is False or info.get("is_open") is False:
+                continue
+            active_id = self._extraer_active_id(info)
+            if active_id is None:
+                continue
+            resolved = iq.resolve_active_symbol(active_id)
+            if not resolved:
+                resolved = _sanitize_symbol_name(simbolo_original)
+            if not resolved:
+                continue
+            tipo = self._tipo_desde_categoria(categoria)
+            clave_vista = (active_id, tipo)
+            if clave_vista in vistos:
+                continue
+            vistos.add(clave_vista)
+            display_base = resolved
+            display = display_base
+            if display in candidates:
+                sufijo = "digital" if tipo == "digital" else "binary"
+                display = f"{display_base} ({sufijo})"
+                idx = 2
+                while display in candidates:
+                    display = f"{display_base} ({sufijo} {idx})"
+                    idx += 1
+            api_symbol = resolved or _sanitize_symbol_name(simbolo_original) or simbolo_original
+            aliases = self._generar_aliases_candles(
+                simbolo_original,
+                api_symbol,
+                info,
+                tipo,
+                active_id,
+            )
+            candidates[display] = TradePair(
+                display=display,
+                api_symbol=api_symbol,
+                active_id=active_id,
+                instrument_type=tipo,
+                candle_aliases=aliases,
+            )
 
         activos_validos = list(candidates.values())
         if not activos_validos:
-            logging.warning("No se encontraron pares en la respuesta de horarios.")
+            logging.warning(
+                "No se encontraron pares operables tras analizar horarios y metadatos digitales."
+            )
 
-        # Solo procesamos los primeros 20 para evitar sobrecargar la GUI
         return activos_validos[:20]
 
     def _filtrar_activos_operables(
