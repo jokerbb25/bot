@@ -1,0 +1,2 @@
+timestamp,step,method,success,raw
+2025-10-03 12:17:16,buy_digital_spot,EURUSD,False,timeout after 8s

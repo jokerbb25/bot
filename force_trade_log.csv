@@ -1,0 +1,37 @@
+timestamp,activo,method,attempt,success,raw
+2025-10-03 12:34:03,EURUSD,buy_digital_spot,1,False,timeout after 12s
+2025-10-03 12:34:16,EURUSD,buy_digital_spot,2,False,timeout after 12s
+2025-10-03 12:34:29,EURUSD,buy_digital_spot,3,False,timeout after 12s
+2025-10-03 12:34:30,EURUSD,buy_binary,1,True,"(False, 'Cannot purchase an option (active is suspended)')"
+2025-10-03 12:34:44,GBPUSD,buy_digital_spot,1,False,timeout after 12s
+2025-10-03 12:34:57,GBPUSD,buy_digital_spot,2,False,timeout after 12s
+2025-10-03 12:35:11,GBPUSD,buy_digital_spot,3,False,timeout after 12s
+2025-10-03 12:35:13,GBPUSD,buy_binary,1,True,"(False, 'Cannot purchase an option (active is suspended)')"
+2025-10-03 12:35:27,USDJPY,buy_digital_spot,1,False,timeout after 12s
+2025-10-03 12:35:42,USDJPY,buy_digital_spot,2,False,timeout after 12s
+2025-10-03 12:35:56,USDJPY,buy_digital_spot,3,False,timeout after 12s
+2025-10-03 12:36:00,USDJPY,buy_binary,1,True,"(False, 'Cannot purchase an option (active is suspended)')"
+2025-10-03 12:36:15,AUDUSD,buy_digital_spot,1,False,timeout after 12s
+2025-10-03 12:36:30,AUDUSD,buy_digital_spot,2,False,timeout after 12s
+2025-10-03 12:36:46,AUDUSD,buy_digital_spot,3,False,timeout after 12s
+2025-10-03 12:36:49,AUDUSD,buy_binary,1,True,"(False, 'Cannot purchase an option (active is suspended)')"
+2025-10-03 12:37:07,USDCAD,buy_digital_spot,1,False,timeout after 12s
+2025-10-03 12:37:23,USDCAD,buy_digital_spot,2,False,timeout after 12s
+2025-10-03 12:37:38,USDCAD,buy_digital_spot,3,False,timeout after 12s
+2025-10-03 12:37:41,USDCAD,buy_binary,1,True,"(False, 'Cannot purchase an option (active is suspended)')"
+2025-10-03 12:37:59,NZDUSD,buy_digital_spot,1,False,timeout after 12s
+2025-10-03 12:38:15,NZDUSD,buy_digital_spot,2,False,timeout after 12s
+2025-10-03 12:38:32,NZDUSD,buy_digital_spot,3,False,timeout after 12s
+2025-10-03 12:38:38,NZDUSD,buy_binary,1,True,"(False, 'Cannot purchase an option (active is suspended)')"
+2025-10-03 12:38:55,BTCUSD,buy_digital_spot,1,False,timeout after 12s
+2025-10-03 12:39:11,BTCUSD,buy_digital_spot,2,False,timeout after 12s
+2025-10-03 12:39:28,BTCUSD,buy_digital_spot,3,False,timeout after 12s
+2025-10-03 12:39:35,BTCUSD,buy_binary,1,True,"(False, 'Cannot purchase an option (active is suspended)')"
+2025-10-03 12:39:54,ETHUSD,buy_digital_spot,1,False,timeout after 12s
+2025-10-03 12:40:09,ETHUSD,buy_digital_spot,2,False,timeout after 12s
+2025-10-03 12:40:24,ETHUSD,buy_digital_spot,3,False,timeout after 12s
+2025-10-03 12:40:38,ETHUSD,buy_binary,1,True,"(False, None)"
+2025-10-03 12:40:58,XRPUSD,buy_digital_spot,1,False,timeout after 12s
+2025-10-03 12:41:18,XRPUSD,buy_digital_spot,2,False,timeout after 12s
+2025-10-03 12:41:34,XRPUSD,buy_digital_spot,3,False,timeout after 12s
+2025-10-03 12:41:49,XRPUSD,buy_binary,1,True,"(False, None)"

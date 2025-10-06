@@ -1,0 +1,34 @@
+timestamp,activo,variant,success,info
+2025-10-03 11:53:22,GBPUSD,open_info_error,False,KeyError('underlying')
+2025-10-03 11:53:22,GBPUSD,"buy(amount,asset,direction,exp)",False,Cannot purchase an option (active is suspended)
+2025-10-03 11:53:22,GBPUSD,"buy(asset,amount,direction,exp)",False,KeyError(1)
+2025-10-03 11:53:22,GBPUSD,"buy_digital(amount,asset,direction,exp)",False,TypeError('IQ_Option.buy_digital() takes 3 positional arguments but 5 were given')
+2025-10-03 11:53:22,GBPUSD,"buy_digital(asset,amount,direction,exp)",False,TypeError('IQ_Option.buy_digital() takes 3 positional arguments but 5 were given')
+2025-10-03 11:53:28,GBPUSD,"buy_digital_spot(asset,amount,direction,exp)",False,timeout after 6s
+2025-10-03 11:53:28,GBPUSD,"buy_digital_spot(amount,asset,direction,exp)",False,"TypeError('can only concatenate str (not ""int"") to str')"
+2025-10-03 11:53:28,GBPUSD,"buy_multi(amount,asset,direction,exp)",False,"TypeError(""object of type 'int' has no len()"")"
+2025-10-03 11:53:29,GBPUSD,"buy_order(amount,asset,direction,exp)",False,"TypeError(""IQ_Option.buy_order() missing 2 required positional arguments: 'leverage' and 'type'"")"
+2025-10-03 11:53:29,GBPUSD,"buy_by_raw_expirations(asset,amount,dir,exp)",False,"TypeError(""IQ_Option.buy_by_raw_expirations() missing 1 required positional argument: 'expired'"")"
+2025-10-03 11:53:29,GBPUSD,final_attempt_None,False,all_variants_failed
+2025-10-03 11:53:35,BTCUSD,open_info_error,False,KeyError('underlying')
+2025-10-03 11:53:35,BTCUSD,"buy(amount,asset,direction,exp)",False,Cannot purchase an option (active is suspended)
+2025-10-03 11:53:35,BTCUSD,"buy(asset,amount,direction,exp)",False,KeyError(1)
+2025-10-03 11:53:36,BTCUSD,"buy_digital(amount,asset,direction,exp)",False,TypeError('IQ_Option.buy_digital() takes 3 positional arguments but 5 were given')
+2025-10-03 11:53:36,BTCUSD,"buy_digital(asset,amount,direction,exp)",False,TypeError('IQ_Option.buy_digital() takes 3 positional arguments but 5 were given')
+2025-10-03 11:53:42,BTCUSD,"buy_digital_spot(asset,amount,direction,exp)",False,timeout after 6s
+2025-10-03 11:53:42,BTCUSD,"buy_digital_spot(amount,asset,direction,exp)",False,"TypeError('can only concatenate str (not ""int"") to str')"
+2025-10-03 11:53:42,BTCUSD,"buy_multi(amount,asset,direction,exp)",False,"TypeError(""object of type 'int' has no len()"")"
+2025-10-03 11:53:42,BTCUSD,"buy_order(amount,asset,direction,exp)",False,"TypeError(""IQ_Option.buy_order() missing 2 required positional arguments: 'leverage' and 'type'"")"
+2025-10-03 11:53:43,BTCUSD,"buy_by_raw_expirations(asset,amount,dir,exp)",False,"TypeError(""IQ_Option.buy_by_raw_expirations() missing 1 required positional argument: 'expired'"")"
+2025-10-03 11:53:43,BTCUSD,final_attempt_None,False,all_variants_failed
+2025-10-03 11:53:50,XRPUSD,open_info_error,False,KeyError('underlying')
+2025-10-03 11:53:50,XRPUSD,"buy(amount,asset,direction,exp)",False,Cannot purchase an option (active is suspended)
+2025-10-03 11:53:51,XRPUSD,"buy(asset,amount,direction,exp)",False,KeyError(1)
+2025-10-03 11:53:51,XRPUSD,"buy_digital(amount,asset,direction,exp)",False,TypeError('IQ_Option.buy_digital() takes 3 positional arguments but 5 were given')
+2025-10-03 11:53:51,XRPUSD,"buy_digital(asset,amount,direction,exp)",False,TypeError('IQ_Option.buy_digital() takes 3 positional arguments but 5 were given')
+2025-10-03 11:53:57,XRPUSD,"buy_digital_spot(asset,amount,direction,exp)",False,timeout after 6s
+2025-10-03 11:53:58,XRPUSD,"buy_digital_spot(amount,asset,direction,exp)",False,"TypeError('can only concatenate str (not ""int"") to str')"
+2025-10-03 11:53:58,XRPUSD,"buy_multi(amount,asset,direction,exp)",False,"TypeError(""object of type 'int' has no len()"")"
+2025-10-03 11:53:58,XRPUSD,"buy_order(amount,asset,direction,exp)",False,"TypeError(""IQ_Option.buy_order() missing 2 required positional arguments: 'leverage' and 'type'"")"
+2025-10-03 11:53:59,XRPUSD,"buy_by_raw_expirations(asset,amount,dir,exp)",False,"TypeError(""IQ_Option.buy_by_raw_expirations() missing 1 required positional argument: 'expired'"")"
+2025-10-03 11:53:59,XRPUSD,final_attempt_None,False,all_variants_failed
