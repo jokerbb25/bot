@@ -1254,7 +1254,7 @@ class BotWorker(QObject):
 
         signal: Optional[str] = None
         if votos:
-            threshold = max(2, math.ceil(votos * 0.6))
+            threshold = max(2, math.ceil(votos * 0.5))
             if up >= threshold:
                 signal = "call"
             elif down >= threshold:
