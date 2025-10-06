@@ -3,7 +3,7 @@ import time
 import logging
 import threading
 from dataclasses import dataclass, asdict
-from typing import Dict, Optional, Tuple, Union, Set
+from typing import Dict, Optional, Tuple, Union, Set, Iterable
 from datetime import datetime
 from textwrap import dedent
 
@@ -41,14 +41,19 @@ from PyQt5.QtWidgets import (  # noqa: E402
     QApplication,
     QWidget,
     QVBoxLayout,
+    QHBoxLayout,
+    QSpacerItem,
+    QSizePolicy,
     QTableWidget,
     QTableWidgetItem,
     QLabel,
+    QPushButton,
     QSplashScreen,
 )
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject, QThread  # noqa: E402
 from PyQt5.QtGui import QFont, QPixmap, QPainter, QColor, QLinearGradient  # noqa: E402
 from iqoptionapi.stable_api import IQ_Option  # noqa: E402
+from iqoptionapi import constants as iq_constants  # noqa: E402
 
 # ---------------- CONFIG ----------------
 EMAIL = "fornerinoalejandro031@gmail.com"
@@ -123,6 +128,153 @@ class SafeIQOption(IQ_Option):
 
         return _normalize_underlying_payload(data)
 
+    def sync_otc_catalog(self, open_time_payload: Optional[Dict] = None) -> None:
+        """Completa los mapas internos del SDK con los pares OTC detectados."""
+
+        try:
+            containers: Iterable[Dict] = self._collect_active_containers()
+        except Exception:
+            logging.debug("No fue posible preparar los contenedores de activos.")
+            containers = ()
+
+        if open_time_payload is None:
+            try:
+                open_time_payload = self.get_all_open_time()
+            except Exception:
+                open_time_payload = {}
+
+        updated_symbols: Set[str] = set()
+
+        def register(symbol: Optional[str], active_id: Optional[Union[int, str]]) -> None:
+            if not symbol or "-OTC" not in symbol:
+                return
+            try:
+                normalized_id = int(active_id) if active_id is not None else None
+            except (TypeError, ValueError):
+                return
+            if normalized_id is None:
+                return
+
+            symbol_key = symbol.upper()
+            changed = False
+            for container in containers:
+                if self._update_container(container, symbol_key, normalized_id):
+                    changed = True
+            if changed:
+                updated_symbols.add(symbol_key)
+
+        # Horarios de apertura (turbo/digital/binario)
+        if isinstance(open_time_payload, dict):
+            for category in ("turbo", "digital", "binary"):
+                entries = open_time_payload.get(category, {})
+                if not isinstance(entries, dict):
+                    continue
+                for symbol, info in entries.items():
+                    if not isinstance(info, dict):
+                        continue
+                    register(symbol, info.get("id") or info.get("active_id"))
+
+        # Metadatos digitales (incluye instrument_id/asset_id)
+        try:
+            digital_meta = self.get_digital_underlying_list_data().get("underlying", {})
+        except Exception:
+            digital_meta = {}
+
+        if isinstance(digital_meta, dict):
+            for _, info in digital_meta.items():
+                if not isinstance(info, dict):
+                    continue
+                symbol = (
+                    info.get("symbol")
+                    or info.get("asset_name")
+                    or info.get("underlying")
+                    or info.get("active")
+                )
+                register(
+                    symbol,
+                    info.get("active_id")
+                    or info.get("id")
+                    or info.get("asset_id")
+                    or info.get("instrument_id"),
+                )
+
+        if updated_symbols:
+            logging.info(
+                "📈 Registrados %s pares OTC adicionales detectados en la API.",
+                len(updated_symbols),
+            )
+
+    # ---- utilitarios internos ----
+    def _collect_active_containers(self) -> Iterable[Dict]:
+        containers = []
+
+        for attr in ("active_to_id", "available_leverages", "instruments", "all_underlying_list"):
+            data = getattr(self, attr, None)
+            if isinstance(data, dict):
+                containers.append(data)
+
+        actives = getattr(self, "ACTIVES", None)
+        if isinstance(actives, dict):
+            containers.append(actives)
+
+        for name in ("ACTIVES", "ACTIVES_ID", "assets", "assets_name"):
+            data = getattr(iq_constants, name, None)
+            if isinstance(data, dict):
+                containers.append(data)
+
+        # Estructuras anidadas usadas por métodos privados del SDK
+        for attr in ("api_option_init_all_result", "api_game_getcandles_v2"):
+            data = getattr(self, attr, None)
+            if isinstance(data, dict):
+                containers.append(data)
+            elif hasattr(data, "__dict__"):
+                nested = getattr(data, "__dict__", {})
+                for value in nested.values():
+                    if isinstance(value, dict):
+                        containers.append(value)
+
+        return containers
+
+    @staticmethod
+    def _update_container(container: Dict, symbol: str, active_id: int) -> bool:
+        if not isinstance(container, dict):
+            return False
+
+        if not container:
+            container[symbol] = {"id": active_id, "name": symbol}
+            return True
+
+        sample_key = next(iter(container.keys()))
+
+        # Diccionarios {"EURUSD-OTC": {...}}
+        if isinstance(sample_key, str):
+            value = container.get(symbol)
+            if isinstance(value, dict):
+                changed = value.get("id") != active_id
+                value["id"] = active_id
+                value.setdefault("name", symbol)
+                return changed
+
+            if value != active_id:
+                if any(isinstance(v, dict) for v in container.values()):
+                    container[symbol] = {"id": active_id, "name": symbol}
+                else:
+                    container[symbol] = active_id
+                return True
+            return False
+
+        # Diccionarios {76: "EURUSD-OTC"}
+        if isinstance(sample_key, int):
+            existing = container.get(active_id)
+            if existing != symbol:
+                container[active_id] = symbol
+                return True
+            return False
+
+        # Fallback genérico
+        container[symbol] = active_id
+        return True
+
 # ---------------- CLASE GUI ----------------
 @dataclass
 class IndicatorSnapshot:
@@ -162,6 +314,7 @@ class BotWorker(QObject):
     def run(self):
         self.status_changed.emit("🔌 Conectando a IQ Option...")
         iq = SafeIQOption(EMAIL, PASSWORD)
+        self._stop_event.clear()
         try:
             check, reason = iq.connect()
         except Exception as exc:  # pragma: no cover - network call
@@ -170,95 +323,117 @@ class BotWorker(QObject):
             self.finished.emit()
             return
 
-        if not check:
-            self.status_changed.emit(f"❌ Error conexión: {reason}")
-            self.finished.emit()
-            return
+        try:
+            if not check:
+                self.status_changed.emit(f"❌ Error conexión: {reason}")
+                self.finished.emit()
+                return
 
-        iq.change_balance(MODO)
-        saldo = iq.get_balance()
-        self.status_changed.emit(f"✅ Conectado a {MODO} | Saldo: {saldo:.2f}")
+            iq.change_balance(MODO)
+            saldo = iq.get_balance()
+            self.status_changed.emit(f"✅ Conectado a {MODO} | Saldo: {saldo:.2f}")
 
-        self._pares_descartados.clear()
-        logging.info("♻️ Escaneando pares OTC disponibles...")
-        pares_validos = self._descubrir_pares(iq)
-        logging.info(f"✅ Pares OTC detectados: {pares_validos}")
+            self._pares_descartados.clear()
+            logging.info("♻️ Escaneando pares OTC disponibles...")
+            pares_validos = self._descubrir_pares(iq)
+            logging.info(f"✅ Pares OTC detectados: {pares_validos}")
 
-        pares_validos = self._filtrar_activos_operables(iq, pares_validos)
-        if not pares_validos:
-            self.status_changed.emit("⚠️ No se encontraron pares OTC disponibles.")
-            self.finished.emit()
-            return
+            pares_validos = self._filtrar_activos_operables(iq, pares_validos)
+            if not pares_validos:
+                self.status_changed.emit("⚠️ No se encontraron pares OTC disponibles.")
+                self.finished.emit()
+                return
 
-        for ciclo in range(1, CICLOS + 1):
-            if self._stop_event.is_set():
-                break
-            logging.info(f"=== Ciclo {ciclo}/{CICLOS} ===")
-            activos_restantes = False
-            for par in list(pares_validos):
+            for ciclo in range(1, CICLOS + 1):
                 if self._stop_event.is_set():
                     break
-                if par in self._pares_descartados:
-                    continue
-                activos_restantes = True
-                df = self.obtener_velas(iq, par)
-                if df.empty:
-                    self._descartar_par(par, "Sin velas devueltas por el broker.")
-                    continue
-                senal, data = self.obtener_senal(df)
-                self.row_ready.emit(par, data)
+                logging.info(f"=== Ciclo {ciclo}/{CICLOS} ===")
+                activos_restantes = False
+                for par in list(pares_validos):
+                    if self._stop_event.is_set():
+                        break
+                    if par in self._pares_descartados:
+                        continue
+                    activos_restantes = True
+                    df = self.obtener_velas(iq, par)
+                    if df.empty:
+                        self._descartar_par(par, "Sin velas devueltas por el broker.")
+                        continue
+                    senal, data = self.obtener_senal(df)
+                    self.row_ready.emit(par, data)
 
-                if senal:
-                    try:
-                        ok, op_id = iq.buy(MONTO, par, senal, EXPIRACION)
-                    except Exception as exc:  # pragma: no cover - network call
-                        logging.exception("Error al ejecutar operacion %s en %s", senal, par)
-                        self._descartar_par(
-                            par,
-                            "Error de red al ejecutar operación, se descarta el par.",
-                        )
-                    else:
-                        if ok:
-                            logging.info(f"[OK] {senal.upper()} en {par}")
-                            resultado, pnl = self._esperar_resultado(iq, op_id)
-                            if resultado:
-                                self._pnl_acumulado += pnl
-                                texto_resultado = self._normalizar_resultado(resultado)
-                                mensaje = (
-                                    f"{texto_resultado} en {par} | PnL operación: {pnl:.2f} | "
-                                    f"PnL acumulado: {self._pnl_acumulado:.2f}"
-                                )
-                                logging.info(mensaje)
-                                self.status_changed.emit(mensaje)
-                                self.trade_completed.emit(par, texto_resultado, pnl, self._pnl_acumulado)
-                            else:
-                                logging.warning(
-                                    "No se obtuvo resultado para la operación en %s", par
-                                )
-                        else:
-                            logging.warning(f"[FAIL] No se pudo ejecutar {senal} en {par}")
+                    if senal:
+                        try:
+                            ok, op_id = iq.buy(MONTO, par, senal, EXPIRACION)
+                        except Exception as exc:  # pragma: no cover - network call
+                            logging.exception(
+                                "Error al ejecutar operacion %s en %s", senal, par
+                            )
                             self._descartar_par(
                                 par,
-                                "El broker rechazó la operación, se descarta el par.",
+                                "Error de red al ejecutar operación, se descarta el par.",
                             )
-                time.sleep(0.6)
+                        else:
+                            if ok:
+                                logging.info(f"[OK] {senal.upper()} en {par}")
+                                resultado, pnl = self._esperar_resultado(iq, op_id)
+                                if resultado:
+                                    self._pnl_acumulado += pnl
+                                    texto_resultado = self._normalizar_resultado(resultado)
+                                    mensaje = (
+                                        f"{texto_resultado} en {par} | PnL operación: {pnl:.2f} | "
+                                        f"PnL acumulado: {self._pnl_acumulado:.2f}"
+                                    )
+                                    logging.info(mensaje)
+                                    self.status_changed.emit(mensaje)
+                                    self.trade_completed.emit(
+                                        par, texto_resultado, pnl, self._pnl_acumulado
+                                    )
+                                else:
+                                    logging.warning(
+                                        "No se obtuvo resultado para la operación en %s", par
+                                    )
+                            else:
+                                logging.warning(
+                                    f"[FAIL] No se pudo ejecutar {senal} en {par}"
+                                )
+                                self._descartar_par(
+                                    par,
+                                    "El broker rechazó la operación, se descarta el par.",
+                                )
+                    time.sleep(0.6)
 
-            pares_validos = [par for par in pares_validos if par not in self._pares_descartados]
-            if not pares_validos:
-                msg = "⚠️ No quedan pares OTC operables tras los descartes."
-                logging.warning(msg)
-                self.status_changed.emit(msg)
-                break
-            if not activos_restantes:
-                msg = "⚠️ Todos los pares OTC fueron descartados por fallos del broker."
-                logging.warning(msg)
-                self.status_changed.emit(msg)
-                break
-            time.sleep(ESPERA_ENTRE_CICLOS)
+                pares_validos = [
+                    par for par in pares_validos if par not in self._pares_descartados
+                ]
+                if not pares_validos:
+                    msg = "⚠️ No quedan pares OTC operables tras los descartes."
+                    logging.warning(msg)
+                    self.status_changed.emit(msg)
+                    break
+                if not activos_restantes:
+                    msg = "⚠️ Todos los pares OTC fueron descartados por fallos del broker."
+                    logging.warning(msg)
+                    self.status_changed.emit(msg)
+                    break
+                time.sleep(ESPERA_ENTRE_CICLOS)
 
-        logging.info("✅ Bot finalizado correctamente.")
-        self.status_changed.emit("✅ Bot finalizado correctamente.")
-        self.finished.emit()
+            if self._stop_event.is_set():
+                mensaje_final = "⏹️ Bot detenido manualmente."
+            else:
+                mensaje_final = "✅ Bot finalizado correctamente."
+            logging.info(mensaje_final)
+            self.status_changed.emit(mensaje_final)
+            self.finished.emit()
+        finally:
+            for cierre in ("close", "close_connection", "api_close"):
+                metodo = getattr(iq, cierre, None)
+                if callable(metodo):
+                    try:
+                        metodo()
+                    except Exception:
+                        continue
+                    break
 
     def _descartar_par(self, par: str, motivo: str) -> None:
         if par in self._pares_descartados:
@@ -272,6 +447,9 @@ class BotWorker(QObject):
         except Exception as exc:  # pragma: no cover - network call
             logging.exception("No se pudieron obtener los horarios de activos: %s", exc)
             return []
+
+        iq.sync_otc_catalog(activos)
+
         turbo = activos.get("turbo", {}) if isinstance(activos, dict) else {}
 
         # Algunos activos devueltos por IQ Option no están disponibles para buy().
@@ -317,7 +495,27 @@ class BotWorker(QObject):
             df.columns = ["open", "high", "low", "close"]
             return df
         except Exception as exc:
-            logging.exception("Error al obtener velas para %s: %s", par, exc)
+            mensaje = str(exc).lower()
+            if "not found on consts" in mensaje:
+                logging.warning(
+                    "Activo %s no encontrado en consts; se sincroniza catálogo OTC y se reintenta.",
+                    par,
+                )
+                iq.sync_otc_catalog()
+                try:
+                    velas = iq.get_candles(par, 60, n, time.time())
+                    df = pd.DataFrame(velas)[["open", "max", "min", "close"]]
+                    df.columns = ["open", "high", "low", "close"]
+                    return df
+                except Exception as retry_exc:
+                    logging.exception(
+                        "Reintento fallido al obtener velas para %s tras sincronizar catálogo: %s",
+                        par,
+                        retry_exc,
+                    )
+            else:
+                logging.exception("Error al obtener velas para %s: %s", par, exc)
+
             self._descartar_par(
                 par, "Excepción al solicitar velas al broker."
             )
@@ -446,21 +644,21 @@ class BotGUI(QWidget):
         self.label_footer = QLabel("", self)
         layout.addWidget(self.label_footer)
 
+        footer_controls = QHBoxLayout()
+        footer_controls.addItem(
+            QSpacerItem(20, 20, QSizePolicy.Expanding, QSizePolicy.Minimum)
+        )
+        self.button_toggle = QPushButton("Iniciar bot", self)
+        self.button_toggle.clicked.connect(self.on_toggle_clicked)
+        footer_controls.addWidget(self.button_toggle)
+        layout.addLayout(footer_controls)
+
         self.timer = QTimer()
         self.timer.timeout.connect(self.update_footer)
         self.timer.start(1000)
 
-        self._thread = QThread(self)
-        self._worker = BotWorker()
-        self._worker.moveToThread(self._thread)
-        self._worker.status_changed.connect(self.label_status.setText)
-        self._worker.row_ready.connect(self.on_row_update)
-        self._worker.trade_completed.connect(self.on_trade_completed)
-        self._worker.finished.connect(self._thread.quit)
-        self._worker.finished.connect(self._worker.deleteLater)
-        self._thread.finished.connect(self._thread.deleteLater)
-        self._thread.started.connect(self._worker.run)
-        self._thread.start()
+        self._thread: Optional[QThread] = None
+        self._worker: Optional[BotWorker] = None
 
     def update_footer(self):
         hora = datetime.now().strftime("%H:%M:%S")
@@ -516,10 +714,61 @@ class BotGUI(QWidget):
         self.table.setItem(r, 10, pnl_item)
         self.label_pnl.setText(f"💰 PnL acumulado: {pnl_total:.2f}")
 
+    def on_toggle_clicked(self) -> None:
+        if self._thread and self._thread.isRunning():
+            self.stop_bot()
+        else:
+            self.start_bot()
+
+    def start_bot(self) -> None:
+        if self._thread and self._thread.isRunning():
+            return
+
+        self.table.setRowCount(0)
+        self.label_pnl.setText("💰 PnL acumulado: 0.00")
+        self.button_toggle.setEnabled(False)
+        self.label_status.setText("⏳ Iniciando bot...")
+
+        self._thread = QThread(self)
+        self._worker = BotWorker()
+        self._worker.moveToThread(self._thread)
+        self._worker.status_changed.connect(self.label_status.setText)
+        self._worker.row_ready.connect(self.on_row_update)
+        self._worker.trade_completed.connect(self.on_trade_completed)
+        self._worker.finished.connect(self._thread.quit)
+        self._worker.finished.connect(self._worker.deleteLater)
+        self._worker.finished.connect(self.on_worker_finished)
+        self._thread.finished.connect(self._thread.deleteLater)
+        self._thread.finished.connect(self.on_thread_finished)
+        self._thread.started.connect(self._worker.run)
+        self._thread.start()
+        self.button_toggle.setText("Detener bot")
+        self.button_toggle.setEnabled(True)
+
+    def stop_bot(self) -> None:
+        if not self._worker or not self._thread:
+            return
+        self.button_toggle.setEnabled(False)
+        self.label_status.setText("⏹️ Deteniendo bot...")
+        self._worker.stop()
+        if self._thread.isRunning():
+            self._thread.quit()
+            self._thread.wait()
+        self.button_toggle.setEnabled(True)
+        self.button_toggle.setText("Iniciar bot")
+
+    def on_worker_finished(self) -> None:
+        self.button_toggle.setText("Iniciar bot")
+        self.button_toggle.setEnabled(True)
+        self._worker = None
+
+    def on_thread_finished(self) -> None:
+        self._thread = None
+
     def closeEvent(self, event):
-        if hasattr(self, "_worker") and self._worker is not None:
+        if self._worker is not None:
             self._worker.stop()
-        if hasattr(self, "_thread") and self._thread.isRunning():
+        if self._thread is not None and self._thread.isRunning():
             self._thread.quit()
             self._thread.wait()
         super().closeEvent(event)
