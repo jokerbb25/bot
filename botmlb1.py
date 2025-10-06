@@ -65,6 +65,34 @@ CICLOS = 50
 MODO = "PRACTICE"
 
 
+MANUAL_FALLBACK_INSTRUMENTS: Tuple[Tuple[str, str], ...] = (
+    # Digital majors
+    ("EURUSD", "digital"),
+    ("GBPUSD", "digital"),
+    ("USDJPY", "digital"),
+    ("AUDUSD", "digital"),
+    ("USDCHF", "digital"),
+    ("USDCAD", "digital"),
+    ("EURJPY", "digital"),
+    ("EURGBP", "digital"),
+    ("GBPJPY", "digital"),
+    ("AUDCAD", "digital"),
+    ("NZDUSD", "digital"),
+    ("CADJPY", "digital"),
+    # Binary majors
+    ("EURUSD", "binary"),
+    ("GBPUSD", "binary"),
+    ("USDJPY", "binary"),
+    ("AUDUSD", "binary"),
+    ("USDCHF", "binary"),
+    ("USDCAD", "binary"),
+    ("EURJPY", "binary"),
+    ("EURGBP", "binary"),
+    ("GBPJPY", "binary"),
+    ("AUDCAD", "binary"),
+)
+
+
 def _normalize_underlying_payload(data: Optional[Dict]) -> Dict:
     """Ensure the IQ Option response always exposes the ``underlying`` key."""
 
@@ -328,6 +356,116 @@ class SafeIQOption(IQ_Option):
                     symbol = self._extract_symbol_from_value(value)
                     if symbol:
                         return _sanitize_symbol_name(symbol)
+
+        return None
+
+    @staticmethod
+    def _symbol_variants(symbol: str) -> Set[str]:
+        variantes: Set[str] = set()
+        if not symbol or not isinstance(symbol, str):
+            return variantes
+
+        bases: List[str] = []
+        base = symbol.strip()
+        if base:
+            bases.append(base)
+        sanitizado = _sanitize_symbol_name(symbol)
+        if sanitizado and sanitizado not in bases:
+            bases.append(sanitizado)
+
+        for texto in bases:
+            if not texto:
+                continue
+            variantes.add(texto.upper())
+            variantes.add(texto.replace("/", "").upper())
+            variantes.add(texto.replace("-", "").upper())
+            variantes.add(texto.lower())
+            variantes.add(texto.replace("/", "").lower())
+            variantes.add(texto.replace("-", "").lower())
+            sufijos = ("-OTC", "-otc", "-OP", "-op")
+            for sufijo in sufijos:
+                variantes.add(f"{texto}{sufijo}".upper())
+                variantes.add(f"{texto}{sufijo}".lower())
+
+        return {valor for valor in variantes if valor}
+
+    @staticmethod
+    def _extract_id_from_value(value: Union[str, int, float, Dict, None]) -> Optional[int]:
+        if isinstance(value, (int, float)):
+            try:
+                return int(value)
+            except (TypeError, ValueError):
+                return None
+        if isinstance(value, str):
+            texto = value.strip()
+            if texto.isdigit():
+                return int(texto)
+            digitos = "".join(ch for ch in texto if ch.isdigit())
+            if digitos:
+                try:
+                    return int(digitos)
+                except ValueError:
+                    return None
+            return None
+        if isinstance(value, dict):
+            for clave in ("id", "active_id", "instrument_id", "asset_id", "underlying_id"):
+                candidato = value.get(clave)
+                if candidato is None:
+                    continue
+                try:
+                    return int(candidato)
+                except (TypeError, ValueError):
+                    continue
+        return None
+
+    def lookup_active_id(self, symbol: str) -> Optional[int]:
+        variantes = self._symbol_variants(symbol)
+        if not variantes:
+            return None
+
+        for container in self._collect_active_containers():
+            if not isinstance(container, dict):
+                continue
+            for key, value in container.items():
+                clave_str = key.strip().upper() if isinstance(key, str) else None
+                if clave_str and clave_str in variantes:
+                    candidato = self._extract_id_from_value(value)
+                    if candidato is not None:
+                        return candidato
+                    if isinstance(value, dict):
+                        simbolo = self._extract_symbol_from_value(value)
+                        if simbolo and simbolo.strip().upper() in variantes:
+                            candidato = self._extract_id_from_value(value)
+                            if candidato is not None:
+                                return candidato
+                clave_id: Optional[int]
+                if isinstance(key, (int, float)):
+                    try:
+                        clave_id = int(key)
+                    except (TypeError, ValueError):
+                        clave_id = None
+                else:
+                    clave_id = None
+
+                if isinstance(value, str):
+                    valor_str = value.strip().upper()
+                    if valor_str in variantes and clave_id is not None:
+                        return clave_id
+
+                if isinstance(value, dict):
+                    simbolo = self._extract_symbol_from_value(value)
+                    if simbolo and simbolo.strip().upper() in variantes:
+                        candidato = self._extract_id_from_value(value)
+                        if candidato is not None:
+                            return candidato
+                        if clave_id is not None:
+                            return clave_id
+
+                if isinstance(value, (int, float)) and clave_str and clave_str in variantes:
+                    try:
+                        return int(value)
+                    except (TypeError, ValueError):
+                        continue
 
         return None
 
@@ -821,8 +959,96 @@ class BotWorker(QObject):
             logging.warning(
                 "No se encontraron pares operables tras analizar horarios y metadatos digitales."
             )
+            manual = self._construir_pares_manuales(iq)
+            if manual:
+                logging.info(
+                    "Se utilizará un catálogo manual de %s pares como respaldo.",
+                    len(manual),
+                )
+                return manual[:20]
+            return []
 
         return activos_validos[:20]
+
+    def _construir_pares_manuales(self, iq) -> List[TradePair]:
+        try:
+            iq.sync_active_catalog()
+        except Exception:
+            logging.debug("No fue posible sincronizar catálogo antes del fallback manual.")
+
+        try:
+            digital_payload = iq.get_digital_underlying_list_data()
+        except Exception:
+            digital_payload = {}
+
+        meta_por_simbolo: Dict[str, Dict] = {}
+        if isinstance(digital_payload, dict):
+            underlying = digital_payload.get("underlying", {})
+            if isinstance(underlying, dict):
+                for info in underlying.values():
+                    if not isinstance(info, dict):
+                        continue
+                    simbolo = (
+                        info.get("symbol")
+                        or info.get("underlying")
+                        or info.get("active")
+                        or info.get("asset_name")
+                        or info.get("name")
+                    )
+                    clave = _sanitize_symbol_name(simbolo)
+                    if clave:
+                        meta_por_simbolo[clave.upper()] = info
+
+        candidatos: Dict[str, TradePair] = {}
+        vistos: Set[Tuple[int, str]] = set()
+
+        for simbolo, tipo in MANUAL_FALLBACK_INSTRUMENTS:
+            limpio = _sanitize_symbol_name(simbolo)
+            if limpio:
+                base = limpio.upper()
+            else:
+                base = simbolo.strip().upper()
+            if not base:
+                continue
+
+            active_id = iq.lookup_active_id(base)
+            if active_id is None:
+                continue
+
+            clave_vista = (active_id, tipo)
+            if clave_vista in vistos:
+                continue
+            vistos.add(clave_vista)
+
+            display = base
+            if display in candidatos:
+                sufijo = "digital" if tipo == "digital" else "binary"
+                display = f"{base} ({sufijo})"
+                idx = 2
+                while display in candidatos:
+                    display = f"{base} ({sufijo} {idx})"
+                    idx += 1
+
+            info = meta_por_simbolo.get(base)
+            aliases = self._generar_aliases_candles(
+                simbolo,
+                base,
+                info if isinstance(info, dict) else {},
+                tipo,
+                active_id,
+            )
+            if not aliases:
+                aliases = (base,)
+
+            candidatos[display] = TradePair(
+                display=display,
+                api_symbol=base,
+                active_id=active_id,
+                instrument_type=tipo,
+                candle_aliases=aliases,
+            )
+
+        return list(candidatos.values())
 
     def _filtrar_activos_operables(
         self, iq, pares: List[TradePair]
