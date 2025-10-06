@@ -44,8 +44,10 @@ from PyQt5.QtWidgets import (  # noqa: E402
     QTableWidget,
     QTableWidgetItem,
     QLabel,
+    QSplashScreen,
 )
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject, QThread  # noqa: E402
+from PyQt5.QtGui import QFont, QPixmap, QPainter, QColor, QLinearGradient  # noqa: E402
 from iqoptionapi.stable_api import IQ_Option  # noqa: E402
 
 # ---------------- CONFIG ----------------
@@ -56,6 +58,56 @@ EXPIRACION = 1
 ESPERA_ENTRE_CICLOS = 3
 CICLOS = 50
 MODO = "PRACTICE"
+
+
+def _normalize_underlying_payload(data: Optional[Dict]) -> Dict:
+    """Ensure the IQ Option response always exposes the ``underlying`` key."""
+
+    if not isinstance(data, dict):
+        logging.debug(
+            "Respuesta de digitales sin formato dict (%s); se normaliza estructura vacía.",
+            type(data).__name__,
+        )
+        return {"underlying": {}}
+
+    underlying = data.get("underlying")
+    if isinstance(underlying, dict):
+        return data
+
+    logging.debug(
+        "Respuesta de digitales sin clave 'underlying' válida (%s); se fuerza diccionario vacío.",
+        type(underlying).__name__,
+    )
+    data["underlying"] = {}
+    return data
+
+
+def _patch_iqoption_underlying() -> None:
+    """Monkey patch IQ Option SDK to avoid KeyError in internal threads."""
+
+    original = IQ_Option.get_digital_underlying_list_data
+
+    # Evita volver a aplicar el parche
+    if getattr(original, "__name__", "") == "safe_get_digital_underlying_list_data":
+        return
+
+    def safe_get_digital_underlying_list_data(self, *args, **kwargs):  # type: ignore
+        try:
+            raw = original(self, *args, **kwargs)
+        except Exception:
+            logging.exception(
+                "Fallo al obtener digitales desde el SDK; se devuelve estructura vacía."
+            )
+            return {"underlying": {}}
+
+        return _normalize_underlying_payload(raw)
+
+    safe_get_digital_underlying_list_data.__name__ = "safe_get_digital_underlying_list_data"
+    safe_get_digital_underlying_list_data.__wrapped__ = original  # type: ignore[attr-defined]
+    IQ_Option.get_digital_underlying_list_data = safe_get_digital_underlying_list_data  # type: ignore[assignment]
+
+
+_patch_iqoption_underlying()
 
 class SafeIQOption(IQ_Option):
     """Versión protegida del cliente IQ Option que evita fallos del SDK."""
@@ -69,21 +121,7 @@ class SafeIQOption(IQ_Option):
             )
             return {"underlying": {}}
 
-        if not isinstance(data, dict):
-            logging.debug(
-                "Respuesta inesperada %s al solicitar digitales; se fuerza diccionario vacío.",
-                type(data).__name__,
-            )
-            return {"underlying": {}}
-
-        underlying = data.get("underlying")
-        if not isinstance(underlying, dict):
-            logging.debug(
-                "Respuesta sin clave 'underlying' válida al solicitar digitales; se normaliza.",
-            )
-            data["underlying"] = {}
-
-        return data
+        return _normalize_underlying_payload(data)
 
 # ---------------- CLASE GUI ----------------
 @dataclass
@@ -384,7 +422,7 @@ class BotGUI(QWidget):
         self.label_status = QLabel("⏳ Iniciando conexión...", self)
         layout.addWidget(self.label_status)
 
-        self.table = QTableWidget(0, 10)
+        self.table = QTableWidget(0, 11)
         self.table.setHorizontalHeaderLabels(
             [
                 "Par",
@@ -392,11 +430,12 @@ class BotGUI(QWidget):
                 "EMA Fast",
                 "EMA Slow",
                 "MACD",
-                "Signal",
+                "MACD Señal",
                 "STK %K",
                 "STK %D",
                 "Señal",
                 "Resultado",
+                "PnL",
             ]
         )
         layout.addWidget(self.table)
@@ -439,36 +478,25 @@ class BotGUI(QWidget):
     # 🔧 FIX QTableWidgetItem error
     def on_row_update(self, par: str, payload: Dict[str, Union[float, str]]) -> None:
         r = self.ensure_row(par)
-        vals = [
-            f"{payload.get('rsi', 0):.1f}",
-            f"{payload.get('emaf', 0):.5f}",
-            f"{payload.get('emas', 0):.5f}",
-            f"{payload.get('macd', 0):.5f}",
-            f"{payload.get('macds', 0):.5f}",
-            f"{payload.get('stk', 0):.1f}",
-            f"{payload.get('std', 0):.1f}",
-            f"{payload.get('signal', '-')}",
-        ]
-        for i, v in enumerate(vals, start=1):
-            item = QTableWidgetItem(v)
-            if i == 8:  # Señal
-                sig = payload.get("signal", "-")
-                if sig == "call":
-                    item.setForeground(Qt.green)
-                elif sig == "put":
-                    item.setForeground(Qt.red)
-            self.table.setItem(r, i, item)
+        keys = ["rsi", "emaf", "emas", "macd", "macds", "stk", "std"]
+        formats = ["{:.1f}", "{:.5f}", "{:.5f}", "{:.5f}", "{:.5f}", "{:.1f}", "{:.1f}"]
+        for column, (key, fmt) in enumerate(zip(keys, formats), start=1):
+            value = payload.get(key, 0)
+            item = QTableWidgetItem(fmt.format(value))
+            self.table.setItem(r, column, item)
 
-        if payload.get("result"):
-            resultado = payload["result"]
-            item_res = QTableWidgetItem(resultado)
-            if "WIN" in resultado.upper():
-                item_res.setForeground(Qt.green)
-            elif any(x in resultado.upper() for x in ("LOST", "LOSS")):
-                item_res.setForeground(Qt.red)
-            self.table.setItem(r, 9, item_res)
-        elif self.table.item(r, 9) is None:
+        signal_text = f"{payload.get('signal', '-')}"
+        signal_item = QTableWidgetItem(signal_text)
+        if signal_text == "call":
+            signal_item.setForeground(Qt.green)
+        elif signal_text == "put":
+            signal_item.setForeground(Qt.red)
+        self.table.setItem(r, 8, signal_item)
+
+        if self.table.item(r, 9) is None:
             self.table.setItem(r, 9, QTableWidgetItem("-"))
+        if self.table.item(r, 10) is None:
+            self.table.setItem(r, 10, QTableWidgetItem("-"))
 
     def on_trade_completed(self, par: str, resultado: str, pnl: float, pnl_total: float) -> None:
         r = self.ensure_row(par)
@@ -479,6 +507,13 @@ class BotGUI(QWidget):
         elif resultado == "LOST":
             item.setForeground(Qt.red)
         self.table.setItem(r, 9, item)
+
+        pnl_item = QTableWidgetItem(f"{pnl:.2f}")
+        if pnl > 0:
+            pnl_item.setForeground(Qt.green)
+        elif pnl < 0:
+            pnl_item.setForeground(Qt.red)
+        self.table.setItem(r, 10, pnl_item)
         self.label_pnl.setText(f"💰 PnL acumulado: {pnl_total:.2f}")
 
     def closeEvent(self, event):
@@ -491,8 +526,57 @@ class BotGUI(QWidget):
 
 
 # ---------------- MAIN ----------------
+def create_splash_screen() -> QSplashScreen:
+    """Construye una pantalla de bienvenida ilustrativa antes de abrir la GUI."""
+
+    width, height = 640, 320
+    pixmap = QPixmap(width, height)
+    pixmap.fill(Qt.transparent)
+
+    painter = QPainter(pixmap)
+    gradient = QLinearGradient(0, 0, 0, height)
+    gradient.setColorAt(0.0, QColor(17, 46, 89))
+    gradient.setColorAt(1.0, QColor(6, 20, 43))
+    painter.fillRect(pixmap.rect(), gradient)
+
+    painter.setPen(QColor("#F5F5F5"))
+    title_font = QFont("Segoe UI", 26, QFont.Bold)
+    painter.setFont(title_font)
+    painter.drawText(
+        pixmap.rect(),
+        Qt.AlignHCenter | Qt.AlignTop,
+        "\nIQ Option Bot"
+    )
+
+    subtitle_font = QFont("Segoe UI", 14)
+    painter.setFont(subtitle_font)
+    painter.drawText(
+        pixmap.rect().adjusted(0, 90, 0, -120),
+        Qt.AlignHCenter | Qt.AlignTop,
+        "Escáner OTC + Panel de PnL"
+    )
+
+    painter.setFont(QFont("Consolas", 11))
+    painter.drawText(
+        pixmap.rect().adjusted(0, 150, 0, -80),
+        Qt.AlignHCenter | Qt.AlignTop,
+        "Conectando con IQ Option y preparando indicadores..."
+    )
+    painter.end()
+
+    splash = QSplashScreen(pixmap)
+    splash.setFont(QFont("Segoe UI", 9))
+    return splash
+
+
 if __name__ == "__main__":
     app = QApplication(sys.argv)
+    splash = create_splash_screen()
+    splash.show()
+    app.processEvents()
+
     window = BotGUI()
     window.show()
+
+    QTimer.singleShot(2000, lambda: splash.finish(window))
     sys.exit(app.exec_())
