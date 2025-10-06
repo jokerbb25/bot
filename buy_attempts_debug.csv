@@ -1,5 +1,0 @@
-timestamp,step,method,attempt,success,raw
-2025-10-03 12:22:06,buy_digital_spot,EURUSD,1,False,timeout after 20s
-2025-10-03 12:22:27,buy_digital_spot,EURUSD,2,False,timeout after 20s
-2025-10-03 12:22:49,buy_digital_spot,EURUSD,3,False,timeout after 20s
-2025-10-03 12:22:51,buy(binary),EURUSD,1,True,"(False, 'Cannot purchase an option (active is suspended)')"

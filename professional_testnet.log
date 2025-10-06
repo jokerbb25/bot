@@ -1,7 +1,0 @@
-2025-10-02 00:37:26,072 [INFO] Starting professional TESTNET bot (reading .env)
-2025-10-02 00:37:26,072 [INFO] USE_TESTNET=True LIVE=False
-2025-10-02 00:37:31,612 [INFO] GUI: starting manager...
-2025-10-02 00:37:31,928 [INFO] Bootstrapped BTCUSDT
-2025-10-02 00:37:32,344 [INFO] Bootstrapped ETHUSDT
-2025-10-02 00:37:33,265 [INFO] Bootstrapped BNBUSDT
-2025-10-02 00:37:34,375 [INFO] TWM started
