@@ -585,12 +585,47 @@ class BotWorker(QObject):
 
         return pares_operables
 
+    @staticmethod
+    def _normalizar_candles(raw) -> List[Dict]:
+        if isinstance(raw, dict):
+            for key in ("candles", "data", "list", "items"):
+                maybe = raw.get(key)
+                if isinstance(maybe, list):
+                    return maybe
+            return []
+        if isinstance(raw, list):
+            return raw
+        return []
+
+    @staticmethod
+    def _construir_dataframe_velas(candles: List[Dict]) -> pd.DataFrame:
+        if not candles:
+            return pd.DataFrame()
+
+        df = pd.DataFrame(candles)
+        if df.empty:
+            return df
+
+        columnas = {col.lower(): col for col in df.columns if isinstance(col, str)}
+        esquemas = [
+            (("open", "max", "min", "close"), {"open": "open", "max": "high", "min": "low", "close": "close"}),
+            (("open", "high", "low", "close"), {"open": "open", "high": "high", "low": "low", "close": "close"}),
+            (("o", "h", "l", "c"), {"o": "open", "h": "high", "l": "low", "c": "close"}),
+        ]
+
+        for required, mapping in esquemas:
+            if all(name in columnas for name in required):
+                selected = [columnas[name] for name in required]
+                renombrado = df[selected].rename(
+                    columns={columnas[name]: mapping[name] for name in required}
+                )
+                return renombrado[["open", "high", "low", "close"]]
+
+        return pd.DataFrame()
+
     def obtener_velas(self, iq, par: TradePair, n=60):
         try:
-            velas = iq.get_candles(par.api_symbol, 60, n, time.time())
-            df = pd.DataFrame(velas)[["open", "max", "min", "close"]]
-            df.columns = ["open", "high", "low", "close"]
-            return df
+            raw = iq.get_candles(par.api_symbol, 60, n, time.time())
         except Exception as exc:
             mensaje = str(exc).lower()
             if "not found on consts" in mensaje:
@@ -600,23 +635,42 @@ class BotWorker(QObject):
                 )
                 iq.sync_active_catalog()
                 try:
-                    velas = iq.get_candles(par.api_symbol, 60, n, time.time())
-                    df = pd.DataFrame(velas)[["open", "max", "min", "close"]]
-                    df.columns = ["open", "high", "low", "close"]
-                    return df
+                    raw = iq.get_candles(par.api_symbol, 60, n, time.time())
                 except Exception as retry_exc:
                     logging.exception(
                         "Reintento fallido al obtener velas para %s tras sincronizar catálogo: %s",
                         par.api_symbol,
                         retry_exc,
                     )
+                    self._descartar_par(
+                        par, "Excepción al solicitar velas al broker tras reintento."
+                    )
+                    return pd.DataFrame()
             else:
                 logging.exception("Error al obtener velas para %s: %s", par.api_symbol, exc)
+                self._descartar_par(par, "Excepción al solicitar velas al broker.")
+                return pd.DataFrame()
 
+        candles = self._normalizar_candles(raw)
+        df = self._construir_dataframe_velas(candles)
+        if df.empty:
+            if isinstance(raw, dict):
+                claves = list(raw.keys())
+            elif candles:
+                claves = list(candles[0].keys())
+            else:
+                claves = []
+            logging.error(
+                "Estructura de velas inválida para %s. Claves recibidas: %s",
+                par.api_symbol,
+                claves,
+            )
             self._descartar_par(
-                par, "Excepción al solicitar velas al broker."
+                par, "El broker devolvió velas sin columnas OHLC."
             )
             return pd.DataFrame()
+
+        return df
 
     def obtener_senal(self, df) -> Tuple[Optional[str], Dict[str, Union[float, str]]]:
         close = df["close"]
