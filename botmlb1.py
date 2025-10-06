@@ -1,5 +1,6 @@
 import sys
 import time
+import math
 import logging
 import threading
 from dataclasses import dataclass, asdict, field
@@ -558,6 +559,9 @@ class BotWorker(QObject):
                 if self._stop_event.is_set():
                     break
                 logging.info(f"=== Ciclo {ciclo}/{CICLOS} ===")
+                self.status_changed.emit(
+                    f"🔁 Ciclo {ciclo}/{CICLOS} | PnL acumulado: {self._pnl_acumulado:.2f}"
+                )
                 activos_restantes = False
                 for par in list(pares_validos):
                     if self._stop_event.is_set():
@@ -1111,7 +1115,10 @@ class BotWorker(QObject):
                 renombrado = df[selected].rename(
                     columns={columnas[name]: mapping[name] for name in required}
                 )
-                return renombrado[["open", "high", "low", "close"]]
+                renombrado = renombrado[["open", "high", "low", "close"]]
+                renombrado = renombrado.apply(pd.to_numeric, errors="coerce")
+                renombrado = renombrado.dropna().reset_index(drop=True)
+                return renombrado
 
         return pd.DataFrame()
 
@@ -1185,9 +1192,14 @@ class BotWorker(QObject):
         return pd.DataFrame()
 
     def obtener_senal(self, df) -> Tuple[Optional[str], Dict[str, Union[float, str]]]:
-        close = df["close"]
-        high = df["high"]
-        low = df["low"]
+        datos = df.apply(pd.to_numeric, errors="coerce").dropna()
+        if datos.empty:
+            snapshot = IndicatorSnapshot(*(float("nan") for _ in range(7)))
+            return None, snapshot.to_table_payload(None)
+
+        close = datos["close"]
+        high = datos["high"]
+        low = datos["low"]
 
         rsi_indicator = ta.momentum.RSIIndicator(close)
         ema_fast_indicator = ta.trend.EMAIndicator(close, 9)
@@ -1195,39 +1207,64 @@ class BotWorker(QObject):
         macd_indicator = ta.trend.MACD(close)
         stoch_indicator = ta.momentum.StochasticOscillator(high, low, close)
 
+        rsi_val = float(rsi_indicator.rsi().iloc[-1])
+        ema_fast_val = float(ema_fast_indicator.ema_indicator().iloc[-1])
+        ema_slow_val = float(ema_slow_indicator.ema_indicator().iloc[-1])
+        macd_val = float(macd_indicator.macd().iloc[-1])
+        macd_signal_val = float(macd_indicator.macd_signal().iloc[-1])
+        stoch_val = float(stoch_indicator.stoch().iloc[-1])
+        stoch_signal_val = float(stoch_indicator.stoch_signal().iloc[-1])
+
         snapshot = IndicatorSnapshot(
-            rsi=rsi_indicator.rsi().iloc[-1],
-            emaf=ema_fast_indicator.ema_indicator().iloc[-1],
-            emas=ema_slow_indicator.ema_indicator().iloc[-1],
-            macd=macd_indicator.macd().iloc[-1],
-            macds=macd_indicator.macd_signal().iloc[-1],
-            stk=stoch_indicator.stoch().iloc[-1],
-            std=stoch_indicator.stoch_signal().iloc[-1],
+            rsi=rsi_val,
+            emaf=ema_fast_val,
+            emas=ema_slow_val,
+            macd=macd_val,
+            macds=macd_signal_val,
+            stk=stoch_val,
+            std=stoch_signal_val,
         )
 
-        up, down = 0, 0
-        if snapshot.rsi < 35:
-            up += 1
-        if snapshot.rsi > 65:
-            down += 1
-        if snapshot.emaf > snapshot.emas:
-            up += 1
-        if snapshot.emaf < snapshot.emas:
-            down += 1
-        if snapshot.macd > snapshot.macds:
-            up += 1
-        if snapshot.macd < snapshot.macds:
-            down += 1
-        if snapshot.stk > snapshot.std:
-            up += 1
-        if snapshot.stk < snapshot.std:
-            down += 1
+        up = down = votos = 0
+
+        def voto_umbral(valor: float, minimo: Optional[float], maximo: Optional[float]) -> None:
+            nonlocal up, down, votos
+            if math.isnan(valor):
+                return
+            votos += 1
+            if minimo is not None and valor < minimo:
+                up += 1
+            if maximo is not None and valor > maximo:
+                down += 1
+
+        def voto_relacional(a: float, b: float) -> None:
+            nonlocal up, down, votos
+            if math.isnan(a) or math.isnan(b):
+                return
+            votos += 1
+            if a > b:
+                up += 1
+            elif a < b:
+                down += 1
+
+        voto_umbral(rsi_val, 35, 65)
+        voto_relacional(ema_fast_val, ema_slow_val)
+        voto_relacional(macd_val, macd_signal_val)
+        voto_relacional(stoch_val, stoch_signal_val)
 
         signal: Optional[str] = None
-        if up >= 3:
-            signal = "call"
-        elif down >= 3:
-            signal = "put"
+        if votos:
+            threshold = max(2, math.ceil(votos * 0.6))
+            if up >= threshold:
+                signal = "call"
+            elif down >= threshold:
+                signal = "put"
+            elif votos >= 3:
+                diferencia = up - down
+                if diferencia >= 2:
+                    signal = "call"
+                elif diferencia <= -2:
+                    signal = "put"
 
         return signal, snapshot.to_table_payload(signal)
 
@@ -1377,7 +1414,24 @@ class BotGUI(QWidget):
         formats = ["{:.1f}", "{:.5f}", "{:.5f}", "{:.5f}", "{:.5f}", "{:.1f}", "{:.1f}"]
         for column, (key, fmt) in enumerate(zip(keys, formats), start=1):
             value = payload.get(key, 0)
-            item = QTableWidgetItem(fmt.format(value))
+            display_text: str
+            if isinstance(value, (int, float)):
+                numero = float(value)
+                if math.isnan(numero):
+                    display_text = "-"
+                else:
+                    display_text = fmt.format(numero)
+            else:
+                try:
+                    numero = float(value)
+                except (TypeError, ValueError):
+                    display_text = str(value)
+                else:
+                    if math.isnan(numero):
+                        display_text = "-"
+                    else:
+                        display_text = fmt.format(numero)
+            item = QTableWidgetItem(display_text)
             self.table.setItem(r, column, item)
 
         signal_text = f"{payload.get('signal', '-')}"
