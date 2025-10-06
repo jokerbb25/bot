@@ -360,6 +360,7 @@ class TradePair:
     api_symbol: str
     active_id: int
     instrument_type: str  # "digital" or "binary"
+    candle_aliases: Tuple[Union[str, int], ...]
 
 
 class BotWorker(QObject):
@@ -505,6 +506,92 @@ class BotWorker(QObject):
         self._pares_descartados.add(par.display)
         logging.info("Activo %s descartado: %s", par.display, motivo)
 
+    @staticmethod
+    def _generar_aliases_candles(
+        raw_symbol: Optional[str],
+        resolved_symbol: Optional[str],
+        info: Optional[Dict],
+        instrument_type: str,
+        active_id: Optional[int],
+    ) -> Tuple[Union[str, int], ...]:
+        """Return a tuple of symbol aliases to try when requesting candles."""
+
+        seen: List[Union[str, int]] = []
+
+        def agregar(valor: Union[str, int, None]) -> None:
+            if valor is None:
+                return
+            if isinstance(valor, (int, float)):
+                try:
+                    cast = int(valor)
+                except (TypeError, ValueError):
+                    return
+                if cast not in seen:
+                    seen.append(cast)
+                return
+            if not isinstance(valor, str):
+                return
+            texto = valor.strip()
+            if not texto:
+                return
+            if texto not in seen:
+                seen.append(texto)
+
+        def agregar_variantes(base: Optional[str]) -> None:
+            if not base or not isinstance(base, str):
+                return
+            base = base.strip()
+            if not base:
+                return
+
+            candidatos: List[str] = []
+            candidatos.append(base)
+            candidatos.append(base.upper())
+
+            sanitizado = _sanitize_symbol_name(base)
+            if sanitizado:
+                candidatos.append(sanitizado)
+                candidatos.append(sanitizado.upper())
+                if "/" in sanitizado:
+                    candidatos.append(sanitizado.replace("/", ""))
+                if "-" in sanitizado:
+                    candidatos.append(sanitizado.replace("-", ""))
+
+            if "/" in base:
+                candidatos.append(base.replace("/", ""))
+            if "-" in base:
+                candidatos.append(base.replace("-", ""))
+
+            base_sin_sufijo = _sanitize_symbol_name(base)
+            if base_sin_sufijo:
+                sufijos: List[str] = []
+                if instrument_type == "digital":
+                    sufijos.extend(["-OP", "-op"])
+                sufijos.extend(["-OTC", "-otc"])
+                for sufijo in sufijos:
+                    candidatos.append(f"{base_sin_sufijo}{sufijo}")
+
+            for candidato in candidatos:
+                agregar(candidato)
+
+        agregar_variantes(raw_symbol)
+        agregar_variantes(resolved_symbol)
+
+        if isinstance(info, dict):
+            for clave in ("symbol", "underlying", "active", "asset_name", "name", "ticker"):
+                agregar_variantes(info.get(clave))
+
+        agregar(active_id)
+
+        if seen:
+            return tuple(seen)
+
+        fallback = _sanitize_symbol_name(resolved_symbol or raw_symbol or "")
+        if fallback:
+            return (fallback,)
+
+        return tuple()
+
     def _descubrir_pares(self, iq) -> List[TradePair]:
         try:
             activos = iq.get_all_open_time()
@@ -544,11 +631,20 @@ class BotWorker(QObject):
                         while display in candidates:
                             display = f"{display_base} ({suffix} {idx})"
                             idx += 1
+                    api_symbol = resolved or _sanitize_symbol_name(par) or par
+                    aliases = self._generar_aliases_candles(
+                        par,
+                        api_symbol,
+                        info,
+                        instrument_type,
+                        active_id,
+                    )
                     candidates[display] = TradePair(
                         display=display,
-                        api_symbol=resolved,
+                        api_symbol=api_symbol,
                         active_id=active_id,
                         instrument_type=instrument_type,
+                        candle_aliases=aliases,
                     )
 
         activos_validos = list(candidates.values())
@@ -624,53 +720,73 @@ class BotWorker(QObject):
         return pd.DataFrame()
 
     def obtener_velas(self, iq, par: TradePair, n=60):
-        try:
-            raw = iq.get_candles(par.api_symbol, 60, n, time.time())
-        except Exception as exc:
-            mensaje = str(exc).lower()
-            if "not found on consts" in mensaje:
-                logging.warning(
-                    "Activo %s no encontrado en consts; se sincroniza catálogo y se reintenta.",
-                    par.api_symbol,
-                )
-                iq.sync_active_catalog()
-                try:
-                    raw = iq.get_candles(par.api_symbol, 60, n, time.time())
-                except Exception as retry_exc:
-                    logging.exception(
-                        "Reintento fallido al obtener velas para %s tras sincronizar catálogo: %s",
-                        par.api_symbol,
-                        retry_exc,
-                    )
-                    self._descartar_par(
-                        par, "Excepción al solicitar velas al broker tras reintento."
-                    )
-                    return pd.DataFrame()
-            else:
-                logging.exception("Error al obtener velas para %s: %s", par.api_symbol, exc)
-                self._descartar_par(par, "Excepción al solicitar velas al broker.")
-                return pd.DataFrame()
+        aliases = par.candle_aliases or (par.api_symbol,)
+        errores: List[Tuple[Union[str, int], Exception]] = []
+        claves_malformadas: Optional[List[str]] = None
+        sync_intentado = False
 
-        candles = self._normalizar_candles(raw)
-        df = self._construir_dataframe_velas(candles)
-        if df.empty:
+        for alias in aliases:
+            objetivo = alias if alias not in (None, "") else par.api_symbol
+            if objetivo in (None, ""):
+                continue
+
+            try:
+                raw = iq.get_candles(objetivo, 60, n, time.time())
+            except Exception as exc:
+                mensaje = str(exc).lower()
+                if "not found on consts" in mensaje and not sync_intentado:
+                    logging.debug(
+                        "Alias %s no encontrado en consts. Re-sincronizando catálogo...",
+                        objetivo,
+                    )
+                    try:
+                        iq.sync_active_catalog()
+                    except Exception:
+                        logging.debug("Sincronización de catálogo falló para %s", objetivo)
+                    sync_intentado = True
+                    try:
+                        raw = iq.get_candles(objetivo, 60, n, time.time())
+                    except Exception as retry_exc:
+                        errores.append((objetivo, retry_exc))
+                        continue
+                else:
+                    errores.append((objetivo, exc))
+                    continue
+
+            candles = self._normalizar_candles(raw)
+            df = self._construir_dataframe_velas(candles)
+            if not df.empty:
+                if objetivo != par.api_symbol:
+                    logging.debug(
+                        "Velas para %s obtenidas usando alias %s.", par.display, objetivo
+                    )
+                return df
+
             if isinstance(raw, dict):
-                claves = list(raw.keys())
+                claves_malformadas = list(raw.keys())
             elif candles:
-                claves = list(candles[0].keys())
+                claves_malformadas = list(candles[0].keys())
             else:
-                claves = []
-            logging.error(
-                "Estructura de velas inválida para %s. Claves recibidas: %s",
-                par.api_symbol,
-                claves,
+                claves_malformadas = []
+            logging.debug(
+                "Alias %s devolvió estructura de velas sin OHLC: %s", objetivo, claves_malformadas
             )
-            self._descartar_par(
-                par, "El broker devolvió velas sin columnas OHLC."
-            )
-            return pd.DataFrame()
 
-        return df
+        if errores:
+            for alias, exc in errores:
+                logging.debug("Error solicitando velas para %s: %s", alias, exc)
+
+        if claves_malformadas is not None:
+            logging.error(
+                "Estructura de velas inválida para %s tras probar alias. Claves: %s",
+                par.display,
+                claves_malformadas,
+            )
+
+        self._descartar_par(
+            par, "El broker no entregó velas válidas tras probar alias."
+        )
+        return pd.DataFrame()
 
     def obtener_senal(self, df) -> Tuple[Optional[str], Dict[str, Union[float, str]]]:
         close = df["close"]
