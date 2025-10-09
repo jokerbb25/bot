@@ -500,6 +500,7 @@ class TradePair:
     active_id: int
     instrument_type: str  # "digital" or "binary"
     candle_aliases: Tuple[Union[str, int], ...] = field(default_factory=tuple)
+    trade_aliases: Tuple[str, ...] = field(default_factory=tuple)
 
 
 class BotWorker(QObject):
@@ -895,6 +896,36 @@ class BotWorker(QObject):
 
         return tuple()
 
+    def _generar_aliases_operacion(
+        self,
+        raw_symbol: Optional[str],
+        resolved_symbol: Optional[str],
+        info: Optional[Dict],
+        instrument_type: str,
+        active_id: Optional[int],
+    ) -> Tuple[str, ...]:
+        aliases_candles = self._generar_aliases_candles(
+            raw_symbol,
+            resolved_symbol,
+            info,
+            instrument_type,
+            active_id,
+        )
+
+        trade_aliases: List[str] = []
+        for alias in aliases_candles:
+            if isinstance(alias, str) and alias not in trade_aliases:
+                trade_aliases.append(alias)
+
+        if not trade_aliases:
+            for candidate in (raw_symbol, resolved_symbol):
+                if isinstance(candidate, str) and candidate.strip():
+                    valor = candidate.strip()
+                    if valor not in trade_aliases:
+                        trade_aliases.append(valor)
+
+        return tuple(trade_aliases)
+
     def _descubrir_pares(self, iq) -> List[TradePair]:
         try:
             activos = iq.get_all_open_time()
@@ -950,12 +981,20 @@ class BotWorker(QObject):
                 tipo,
                 active_id,
             )
+            trade_aliases = self._generar_aliases_operacion(
+                simbolo_original,
+                api_symbol,
+                info,
+                tipo,
+                active_id,
+            )
             candidates[display] = TradePair(
                 display=display,
                 api_symbol=api_symbol,
                 active_id=active_id,
                 instrument_type=tipo,
                 candle_aliases=aliases,
+                trade_aliases=trade_aliases,
             )
 
         activos_validos = list(candidates.values())
@@ -1044,12 +1083,23 @@ class BotWorker(QObject):
             if not aliases:
                 aliases = (base,)
 
+            trade_aliases = self._generar_aliases_operacion(
+                simbolo,
+                base,
+                info if isinstance(info, dict) else {},
+                tipo,
+                active_id,
+            )
+            if not trade_aliases:
+                trade_aliases = (base,)
+
             candidatos[display] = TradePair(
                 display=display,
                 api_symbol=base,
                 active_id=active_id,
                 instrument_type=tipo,
                 candle_aliases=aliases,
+                trade_aliases=trade_aliases,
             )
 
         return list(candidatos.values())
@@ -1271,27 +1321,56 @@ class BotWorker(QObject):
     def _ejecutar_operacion(
         self, iq, par: TradePair, senal: str
     ) -> Tuple[bool, Optional[Tuple[str, Union[int, str]]]]:
-        try:
-            if par.instrument_type == "digital":
-                ok, op_id = iq.buy_digital_spot(par.api_symbol, MONTO, senal, EXPIRACION)
-                tipo = "digital"
-            else:
-                ok, op_id = iq.buy(MONTO, par.api_symbol, senal, EXPIRACION)
-                tipo = "binary"
-        except Exception:
-            logging.exception(
-                "Error al ejecutar operacion %s en %s", senal, par.display
-            )
-            self._descartar_par(
-                par,
-                "Error de red al ejecutar operación, se descarta el par.",
-            )
-            return False, None
+        aliases = par.trade_aliases or (par.api_symbol,)
+        ultimo_error: Optional[Exception] = None
+        for alias in aliases:
+            if not alias:
+                continue
+            try:
+                if par.instrument_type == "digital":
+                    ok, op_id = iq.buy_digital_spot(alias, MONTO, senal, EXPIRACION)
+                    tipo = "digital"
+                else:
+                    ok, op_id = iq.buy(MONTO, alias, senal, EXPIRACION)
+                    tipo = "binary"
+            except Exception as exc:
+                ultimo_error = exc
+                mensaje = str(exc).lower()
+                if "not found on consts" in mensaje:
+                    logging.debug(
+                        "Alias %s no encontrado para operar; se sincroniza catálogo.",
+                        alias,
+                    )
+                    try:
+                        iq.sync_active_catalog()
+                    except Exception:
+                        logging.debug("Fallo al sincronizar catálogo antes de reintentar operación.")
+                    continue
+                continue
 
-        if not ok or op_id in (None, ""):
-            return False, None
+            if ok and op_id not in (None, ""):
+                if alias != par.api_symbol:
+                    logging.debug(
+                        "Operación en %s ejecutada usando alias %s.",
+                        par.display,
+                        alias,
+                    )
+                return True, (tipo, op_id)
 
-        return True, (tipo, op_id)
+        if ultimo_error is not None:
+            logging.error(
+                "Fallo al ejecutar operacion %s en %s", senal, par.display, exc_info=(
+                    type(ultimo_error),
+                    ultimo_error,
+                    ultimo_error.__traceback__,
+                )
+            )
+
+        self._descartar_par(
+            par,
+            "El broker rechazó la operación en todos los alias disponibles.",
+        )
+        return False, None
 
     def _esperar_resultado(
         self, iq, par: TradePair, ticket: Tuple[str, Union[int, str]]
