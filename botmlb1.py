@@ -310,6 +310,18 @@ def _fetch_candles(api: SafeIQOption, pair: OtcPair, count: int = 120) -> pd.Dat
     for alias in pair.aliases[:3]:
         _register_symbol(api, alias, active_id)
 
+    if active_id is not None:
+        try:
+            payload = api.get_candles(active_id, 60, count, time.time())
+        except Exception as exc:
+            logging.debug("Error obteniendo velas por id %s (%s): %s", pair.name, active_id, exc)
+        else:
+            candles = payload.get("candles") if isinstance(payload, dict) else payload
+            if isinstance(candles, list):
+                df = _build_dataframe(candles)
+                if not df.empty:
+                    return df
+
     for alias in pair.aliases[:3]:
         try:
             payload = api.get_candles(alias, 60, count, time.time())
@@ -491,8 +503,8 @@ class BotWorker(QObject):
                     if df.empty:
                         failures = self._failures.get(pair.name, 0) + 1
                         if failures >= 2:
-                            failures = 2
                             logging.info("%s descartado temporalmente tras fallos de velas", pair.name)
+                            pairs.remove(pair)
                         else:
                             logging.debug("%s sin velas válidas", pair.name)
                         self._failures[pair.name] = failures
