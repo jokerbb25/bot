@@ -516,6 +516,7 @@ class BotWorker(QObject):
         self._pares_descartados: Set[str] = set()
         self._cooldowns: Dict[str, float] = {}
         self._fallas_temporales: Dict[str, int] = {}
+        self._cooldown_notices: Dict[str, float] = {}
 
     def stop(self):
         self._stop_event.set()
@@ -571,13 +572,18 @@ class BotWorker(QObject):
                         break
                     if par.display in self._pares_descartados:
                         continue
-                    if self._en_cooldown(par):
-                        restante = self._cooldowns.get(par.display, 0.0) - time.time()
-                        logging.debug(
-                            "Par %s en cooldown, se reintentará en %.1f s",
-                            par.display,
-                            max(0.0, restante),
-                        )
+                    en_cooldown, restante = self._cooldown_status(par)
+                    if en_cooldown:
+                        now = time.time()
+                        last_notice = self._cooldown_notices.get(par.display, 0.0)
+                        if now - last_notice >= 5.0:
+                            logging.info(
+                                "⏳ %s en cooldown (%ss restantes, fallos consecutivos: %s)",
+                                par.display,
+                                math.ceil(restante),
+                                self._fallas_temporales.get(par.display, 0),
+                            )
+                            self._cooldown_notices[par.display] = now
                         continue
                     activos_restantes = True
                     df = self.obtener_velas(iq, par)
@@ -615,8 +621,16 @@ class BotWorker(QObject):
                             )
                             # El detalle del fallo y el cooldown se gestionan dentro de _ejecutar_operacion
                     else:
-                        logging.debug(
-                            "[%s] Sin señal operativa en este ciclo.", par.display
+                        logging.info(
+                            "[%s] Sin señal clara | RSI %.1f | EMA9 %.5f / EMA21 %.5f | MACD %.5f / %.5f | STK %.1f / %.1f",
+                            par.display,
+                            self._to_float(data.get("rsi")),
+                            self._to_float(data.get("emaf")),
+                            self._to_float(data.get("emas")),
+                            self._to_float(data.get("macd")),
+                            self._to_float(data.get("macds")),
+                            self._to_float(data.get("stk")),
+                            self._to_float(data.get("std")),
                         )
                     time.sleep(0.6)
 
@@ -660,23 +674,27 @@ class BotWorker(QObject):
         self._pares_descartados.add(par.display)
         self._cooldowns.pop(par.display, None)
         self._fallas_temporales.pop(par.display, None)
+        self._cooldown_notices.pop(par.display, None)
         logging.info("Activo %s descartado: %s", par.display, motivo)
 
-    def _en_cooldown(self, par: TradePair) -> bool:
+    def _cooldown_status(self, par: TradePair) -> Tuple[bool, float]:
         vencimiento = self._cooldowns.get(par.display)
         if not vencimiento:
-            return False
-        if time.time() >= vencimiento:
+            return False, 0.0
+        restante = vencimiento - time.time()
+        if restante <= 0:
             self._cooldowns.pop(par.display, None)
-            return False
-        return True
+            self._cooldown_notices.pop(par.display, None)
+            return False, 0.0
+        return True, restante
 
-    def _marcar_fallo_temporal(self, par: TradePair, motivo: str, cooldown: int = 60) -> None:
+    def _marcar_fallo_temporal(self, par: TradePair, motivo: str, cooldown: int = 20) -> None:
         if par.display in self._pares_descartados:
             return
         contador = self._fallas_temporales.get(par.display, 0) + 1
         self._fallas_temporales[par.display] = contador
-        self._cooldowns[par.display] = time.time() + cooldown
+        self._cooldowns[par.display] = time.time() + max(10, cooldown)
+        self._cooldown_notices.pop(par.display, None)
         restantes = max(0, 3 - contador)
         logging.info(
             "Activo %s en cooldown (%s). Nuevos intentos disponibles en %ss. Reintentos restantes antes de descartar: %s",
@@ -687,6 +705,13 @@ class BotWorker(QObject):
         )
         if contador >= 3:
             self._descartar_par(par, "Superó el límite de fallos consecutivos.")
+
+    @staticmethod
+    def _to_float(value: Union[float, int, str]) -> float:
+        try:
+            return float(value)
+        except (TypeError, ValueError):
+            return float("nan")
 
     @staticmethod
     def _es_info_activo(info: Dict) -> bool:
@@ -1404,6 +1429,7 @@ class BotWorker(QObject):
                     )
                 self._fallas_temporales.pop(par.display, None)
                 self._cooldowns.pop(par.display, None)
+                self._cooldown_notices.pop(par.display, None)
                 return True, (tipo, op_id)
 
             logging.debug(
