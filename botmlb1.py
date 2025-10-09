@@ -3,7 +3,7 @@ import time
 import math
 import logging
 import threading
-from dataclasses import dataclass, asdict, field
+from dataclasses import dataclass, asdict
 from typing import Dict, Optional, Tuple, Union, List, Set
 from datetime import datetime
 from textwrap import dedent
@@ -52,7 +52,6 @@ from PyQt5.QtWidgets import (  # noqa: E402
 from PyQt5.QtCore import Qt, QTimer, pyqtSignal, QObject, QThread  # noqa: E402
 from PyQt5.QtGui import QFont, QPixmap, QPainter, QColor, QLinearGradient  # noqa: E402
 from iqoptionapi.stable_api import IQ_Option  # noqa: E402
-from iqoptionapi import constants as iq_constants  # noqa: E402
 
 EMAIL = "fornerinoalejandro031@gmail.com"
 PASSWORD = "484572ale"
@@ -102,7 +101,10 @@ def _sanitize(symbol: Optional[str]) -> Optional[str]:
         if cleaned.endswith(suffix):
             cleaned = cleaned[: -len(suffix)]
             break
-    return cleaned.replace(" ", "") or None
+    cleaned = cleaned.replace(" ", "")
+    cleaned = cleaned.replace("/", "")
+    cleaned = cleaned.replace("-", "")
+    return cleaned or None
 
 
 def _ensure_underlying_patch() -> None:
@@ -137,6 +139,26 @@ class SafeIQOption(IQ_Option):
             logging.exception("Fallo al pedir horarios")
             return {}
 
+    def ensure_connection(self) -> bool:
+        try:
+            if self.check_connect() is True:
+                return True
+        except Exception:
+            pass
+        try:
+            ok, reason = self.connect()
+        except Exception:
+            logging.exception("Error al reconectar")
+            return False
+        if not ok:
+            logging.error("La reconexión fue rechazada: %s", reason)
+            return False
+        try:
+            self.change_balance(MODO)
+        except Exception:
+            logging.exception("No se pudo restablecer el balance tras la reconexión")
+        return True
+
 
 @dataclass
 class IndicatorSnapshot:
@@ -154,55 +176,34 @@ class IndicatorSnapshot:
         return payload
 
 
-@dataclass
+@dataclass(frozen=True)
 class TradePair:
     name: str
     instrument_type: str
-    active_id: Optional[int]
-    candle_aliases: Tuple[str, ...] = field(default_factory=tuple)
-    trade_aliases: Tuple[str, ...] = field(default_factory=tuple)
+    aliases: Tuple[str, ...]
 
     @classmethod
-    def build(
-        cls,
-        base_symbol: str,
-        instrument_type: str,
-        active_id: Optional[int],
-        raw_symbol: Optional[str] = None,
-        extra_aliases: Optional[List[str]] = None,
-    ) -> "TradePair":
-        base = base_symbol.upper()
-        alias_pool: Set[str] = set()
-        if base:
-            alias_pool.add(base)
-        if raw_symbol:
-            raw = raw_symbol.strip().upper()
-            if raw and "OTC" not in raw:
-                alias_pool.add(raw)
-        if extra_aliases:
-            for alias in extra_aliases:
-                cleaned = (alias or "").strip().upper()
-                if cleaned and "OTC" not in cleaned:
-                    alias_pool.add(cleaned)
-        generated = list(alias_pool)
-        for alias in list(generated):
-            generated.append(alias.replace("/", ""))
-            generated.append(alias.replace("-", ""))
-        alias_pool.update(alias for alias in generated if alias)
-        if instrument_type == "digital":
-            for alias in list(alias_pool):
-                alias_pool.add(f"{alias}-OP")
-        candle_aliases: List[str] = []
-        trade_aliases: List[str] = []
-        for alias in alias_pool:
-            cleaned = alias.strip()
-            if not cleaned:
-                continue
-            if cleaned not in candle_aliases:
-                candle_aliases.append(cleaned)
-            if cleaned not in trade_aliases:
-                trade_aliases.append(cleaned)
-        return cls(base, instrument_type, active_id, tuple(candle_aliases), tuple(trade_aliases))
+    def build(cls, symbol: str, instrument_type: str) -> Optional["TradePair"]:
+        base = _sanitize(symbol)
+        if not base:
+            return None
+        alias_set: Set[str] = {base}
+        alias_set.add(base.replace(" ", ""))
+        alias_set.add(base.replace("-", ""))
+        alias_set.add(base.replace("/", ""))
+        alias_set = {alias for alias in alias_set if alias}
+        if not alias_set:
+            return None
+        aliases = tuple(sorted(alias_set))
+        return cls(base, instrument_type, aliases)
+
+    @property
+    def candle_aliases(self) -> Tuple[str, ...]:
+        return self.aliases
+
+    @property
+    def trade_aliases(self) -> Tuple[str, ...]:
+        return self.aliases
 
 
 class BotWorker(QObject):
@@ -215,7 +216,6 @@ class BotWorker(QObject):
         super().__init__()
         self._stop = threading.Event()
         self._pnl = 0.0
-        self._digital_meta: Dict[str, List[Dict]] = {}
 
     def stop(self) -> None:
         self._stop.set()
@@ -238,10 +238,8 @@ class BotWorker(QObject):
         balance = api.get_balance()
         self.status_changed.emit(f"✅ Conectado a {MODO} | Saldo: {balance:.2f}")
         open_time = api.get_all_open_time()
-        digital_payload = api.get_digital_underlying_list_data()
-        self._digital_meta = self._index_digital_meta(digital_payload)
-        pares = self._discover_pairs(api, open_time)
-        if not pares:
+        pairs = self._discover_pairs(api, open_time)
+        if not pairs:
             self.status_changed.emit("⚠️ No se encontraron pares digitales/binarios disponibles")
             try:
                 api.close()
@@ -249,25 +247,24 @@ class BotWorker(QObject):
                 pass
             self.finished.emit()
             return
-        self.status_changed.emit(f"📈 {len(pares)} pares listos para operar")
+        self.status_changed.emit(f"📈 {len(pairs)} pares listos para operar")
         try:
             for ciclo in range(1, CICLOS + 1):
                 if self._stop.is_set():
                     break
                 logging.info("=== Ciclo %s/%s ===", ciclo, CICLOS)
-                for par in pares:
+                for pair in pairs:
                     if self._stop.is_set():
                         break
-                    self._register_pair(api, par)
-                    df = self._fetch_candles(api, par)
+                    df = self._fetch_candles(api, pair)
                     if df.empty:
-                        logging.warning("%s sin velas válidas", par.name)
+                        logging.warning("%s sin velas válidas", pair.name)
                         continue
                     signal, payload = self._analyze(df)
-                    self.row_ready.emit(par.name, payload)
+                    self.row_ready.emit(pair.name, payload)
                     if not signal:
                         continue
-                    ok, ticket = self._execute_trade(api, par, signal)
+                    ok, ticket = self._execute_trade(api, pair, signal)
                     if not ok or ticket is None:
                         continue
                     result, pnl = self._wait_result(api, ticket)
@@ -275,10 +272,10 @@ class BotWorker(QObject):
                         continue
                     self._pnl += pnl
                     label = self._normalize_result(result)
-                    mensaje = f"{label} en {par.name} | PnL: {pnl:.2f} | Total: {self._pnl:.2f}"
+                    mensaje = f"{label} en {pair.name} | PnL: {pnl:.2f} | Total: {self._pnl:.2f}"
                     logging.info(mensaje)
                     self.status_changed.emit(mensaje)
-                    self.trade_finished.emit(par.name, label, pnl, self._pnl)
+                    self.trade_finished.emit(pair.name, label, pnl, self._pnl)
                     if self._stop.is_set():
                         break
                     time.sleep(0.5)
@@ -291,27 +288,6 @@ class BotWorker(QObject):
             except Exception:
                 pass
             self.finished.emit()
-
-    def _index_digital_meta(self, payload: Dict) -> Dict[str, List[Dict]]:
-        mapping: Dict[str, List[Dict]] = {}
-        underlying = payload.get("underlying", {}) if isinstance(payload, dict) else {}
-        if not isinstance(underlying, dict):
-            return mapping
-        for info in underlying.values():
-            if not isinstance(info, dict):
-                continue
-            symbol = (
-                info.get("symbol")
-                or info.get("underlying")
-                or info.get("active")
-                or info.get("asset_name")
-                or info.get("name")
-            )
-            key = _sanitize(symbol)
-            if not key:
-                continue
-            mapping.setdefault(key, []).append(info)
-        return mapping
 
     def _discover_pairs(self, api: SafeIQOption, open_time: Dict) -> List[TradePair]:
         logging.info("♻️ Escaneando pares digitales y binarias disponibles...")
@@ -330,19 +306,12 @@ class BotWorker(QObject):
                         continue
                     if "OTC" in str(symbol).upper():
                         continue
-                    base = _sanitize(symbol)
-                    if not base:
+                    pair = TradePair.build(str(symbol), instrument_type)
+                    if not pair:
                         continue
-                    active_id = self._extract_active_id(info)
-                    if active_id is None:
-                        active_id = self._lookup_active_id(base, instrument_type)
-                    key = (base, instrument_type)
+                    key = (pair.name, pair.instrument_type)
                     if key in seen:
                         continue
-                    pair = TradePair.build(base, instrument_type, active_id, str(symbol))
-                    if not pair.candle_aliases or not pair.trade_aliases:
-                        continue
-                    self._register_pair(api, pair)
                     if self._fetch_candles(api, pair, sample=True).empty:
                         continue
                     candidates.append(pair)
@@ -350,92 +319,28 @@ class BotWorker(QObject):
         if not candidates:
             logging.warning("No se encontraron pares activos en el horario; usando respaldo estándar")
             for symbol in FALLBACK_DIGITAL:
-                base = _sanitize(symbol)
-                if not base:
+                pair = TradePair.build(symbol, "digital")
+                if not pair:
                     continue
-                key = (base, "digital")
+                key = (pair.name, pair.instrument_type)
                 if key in seen:
                     continue
-                active_id = self._lookup_active_id(base, "digital")
-                pair = TradePair.build(base, "digital", active_id, symbol)
-                if not pair.candle_aliases:
-                    continue
-                self._register_pair(api, pair)
                 if self._fetch_candles(api, pair, sample=True).empty:
                     continue
                 candidates.append(pair)
                 seen.add(key)
             for symbol in FALLBACK_BINARY:
-                base = _sanitize(symbol)
-                if not base:
+                pair = TradePair.build(symbol, "binary")
+                if not pair:
                     continue
-                key = (base, "binary")
+                key = (pair.name, pair.instrument_type)
                 if key in seen:
                     continue
-                active_id = self._lookup_active_id(base, "binary")
-                pair = TradePair.build(base, "binary", active_id, symbol)
-                if not pair.candle_aliases:
-                    continue
-                self._register_pair(api, pair)
                 if self._fetch_candles(api, pair, sample=True).empty:
                     continue
                 candidates.append(pair)
                 seen.add(key)
         return candidates
-
-    def _extract_active_id(self, info: Dict) -> Optional[int]:
-        for key in ("id", "active_id", "instrument_id", "asset_id"):
-            value = info.get(key)
-            if value is None:
-                continue
-            try:
-                return int(value)
-            except (TypeError, ValueError):
-                continue
-        nested = info.get("active") or info.get("instrument") or info.get("asset")
-        if isinstance(nested, dict):
-            return self._extract_active_id(nested)
-        return None
-
-    def _lookup_active_id(self, symbol: str, instrument_type: str) -> Optional[int]:
-        entries = self._digital_meta.get(symbol)
-        if entries:
-            for info in entries:
-                try:
-                    return int(info.get("active_id") or info.get("id"))
-                except (TypeError, ValueError):
-                    continue
-        source = iq_constants.ACTIVES.get(symbol)
-        if isinstance(source, dict):
-            try:
-                return int(source.get("id"))
-            except (TypeError, ValueError):
-                return None
-        if isinstance(source, int):
-            return int(source)
-        return None
-
-    def _register_pair(self, api: SafeIQOption, pair: TradePair) -> None:
-        if pair.active_id is None:
-            return
-        aliases = set(pair.candle_aliases) | set(pair.trade_aliases) | {pair.name}
-        for alias in aliases:
-            if not alias or "OTC" in alias.upper():
-                continue
-            data = {"id": pair.active_id, "name": alias}
-            try:
-                api.ACTIVES[alias] = data
-            except Exception:
-                pass
-            try:
-                api.active_to_id[alias] = pair.active_id
-            except Exception:
-                pass
-            iq_constants.ACTIVES[alias] = data
-            try:
-                iq_constants.ACTIVES_ID[pair.active_id] = alias
-            except Exception:
-                pass
 
     def _fetch_candles(self, api: SafeIQOption, pair: TradePair, sample: bool = False) -> pd.DataFrame:
         history = 30 if sample else 60
@@ -443,8 +348,12 @@ class BotWorker(QObject):
             try:
                 candles = api.get_candles(alias, 60, history, time.time())
             except Exception as exc:
-                logging.debug("Error obteniendo velas %s (%s)", alias, exc)
-                self._register_pair(api, pair)
+                message = str(exc).lower()
+                logging.debug("Error obteniendo velas para %s (%s)", alias, exc)
+                if "need reconnect" in message or "connection" in message:
+                    if not api.ensure_connection():
+                        break
+                    continue
                 continue
             df = self._build_dataframe(candles)
             if not df.empty:
@@ -464,12 +373,7 @@ class BotWorker(QObject):
         if not isinstance(candles, list) or not candles:
             return pd.DataFrame()
         df = pd.DataFrame(candles)
-        schemes = (
-            ("open", "max", "min", "close"),
-            ("open", "high", "low", "close"),
-            ("o", "h", "l", "c"),
-        )
-        for columns in schemes:
+        for columns in (("open", "max", "min", "close"), ("open", "high", "low", "close"), ("o", "h", "l", "c")):
             if all(col in df.columns for col in columns):
                 mapping = dict(zip(columns, ("open", "high", "low", "close")))
                 frame = df[list(columns)].rename(columns=mapping)
@@ -532,22 +436,22 @@ class BotWorker(QObject):
         pair: TradePair,
         signal: str,
     ) -> Tuple[bool, Optional[Tuple[str, str]]]:
-        self._register_pair(api, pair)
         for alias in pair.trade_aliases:
             try:
                 if pair.instrument_type == "digital":
                     ok, trade_id = api.buy_digital_spot(alias, MONTO, signal, EXPIRACION)
-                    trade_type = "digital"
+                    trade_kind = "digital"
                 else:
                     ok, trade_id = api.buy(MONTO, alias, signal, EXPIRACION)
-                    trade_type = "binary"
+                    trade_kind = "binary"
             except Exception as exc:
-                logging.debug("Error ejecutando operación con %s (%s)", alias, exc)
-                self._register_pair(api, pair)
+                logging.debug("Error ejecutando operación %s (%s)", alias, exc)
+                if "need reconnect" in str(exc).lower():
+                    api.ensure_connection()
                 continue
             if ok and trade_id:
                 logging.info("[OK] %s en %s (alias %s)", signal.upper(), pair.name, alias)
-                return True, (trade_type, str(trade_id))
+                return True, (trade_kind, str(trade_id))
         logging.warning("[FAIL] Broker rechazó %s en %s", signal.upper(), pair.name)
         return False, None
 
@@ -558,15 +462,20 @@ class BotWorker(QObject):
     ) -> Tuple[Optional[str], float]:
         trade_type, trade_id = ticket
         timeout = EXPIRACION * 60 + 120
-        elapsed = 0
-        while elapsed < timeout and not self._stop.is_set():
+        waited = 0
+        while waited < timeout and not self._stop.is_set():
             try:
                 if trade_type == "digital":
                     result, pnl = api.check_win_digital_v2(trade_id)
                 else:
                     result, pnl = api.check_win_v4(trade_id)
             except Exception as exc:
-                logging.debug("Error verificando resultado %s", exc)
+                logging.debug("Error consultando resultado (%s)", exc)
+                if "need reconnect" in str(exc).lower():
+                    api.ensure_connection()
+                    time.sleep(1)
+                    waited += 1
+                    continue
                 return None, 0.0
             if result is not None:
                 try:
@@ -575,7 +484,7 @@ class BotWorker(QObject):
                     pnl_value = 0.0
                 return result, pnl_value
             time.sleep(1)
-            elapsed += 1
+            waited += 1
         logging.warning("Timeout esperando resultado %s", trade_id)
         return None, 0.0
 
@@ -595,33 +504,35 @@ class BotGUI(QWidget):
     def __init__(self) -> None:
         super().__init__()
         self.setWindowTitle("IQ Option Digital/Binary Bot")
-        self.resize(1024, 560)
+        self.resize(1000, 520)
         layout = QVBoxLayout(self)
         self.label_status = QLabel("⏳ Iniciando...", self)
         layout.addWidget(self.label_status)
         self.table = QTableWidget(0, 11)
-        self.table.setHorizontalHeaderLabels([
-            "Par",
-            "RSI",
-            "EMA Fast",
-            "EMA Slow",
-            "MACD",
-            "MACD Señal",
-            "STK %K",
-            "STK %D",
-            "Señal",
-            "Resultado",
-            "PnL",
-        ])
+        self.table.setHorizontalHeaderLabels(
+            [
+                "Par",
+                "RSI",
+                "EMA Fast",
+                "EMA Slow",
+                "MACD",
+                "MACD Señal",
+                "STK %K",
+                "STK %D",
+                "Señal",
+                "Resultado",
+                "PnL",
+            ]
+        )
         layout.addWidget(self.table)
         self.label_pnl = QLabel("💰 PnL acumulado: 0.00", self)
         layout.addWidget(self.label_pnl)
-        footer_controls = QHBoxLayout()
-        footer_controls.addItem(QSpacerItem(20, 20, QSizePolicy.Expanding, QSizePolicy.Minimum))
+        footer = QHBoxLayout()
+        footer.addItem(QSpacerItem(20, 20, QSizePolicy.Expanding, QSizePolicy.Minimum))
         self.button_toggle = QPushButton("Iniciar bot", self)
-        self.button_toggle.clicked.connect(self._toggle)
-        footer_controls.addWidget(self.button_toggle)
-        layout.addLayout(footer_controls)
+        self.button_toggle.clicked.connect(self._on_toggle)
+        footer.addWidget(self.button_toggle)
+        layout.addLayout(footer)
         self.label_footer = QLabel("", self)
         layout.addWidget(self.label_footer)
         self.timer = QTimer(self)
@@ -633,7 +544,7 @@ class BotGUI(QWidget):
     def _update_clock(self) -> None:
         self.label_footer.setText(datetime.now().strftime("🕓 %H:%M:%S"))
 
-    def _toggle(self) -> None:
+    def _on_toggle(self) -> None:
         if self._thread and self._thread.isRunning():
             self._stop_bot()
         else:
@@ -654,7 +565,7 @@ class BotGUI(QWidget):
         self._worker.trade_finished.connect(self._update_trade)
         self._worker.finished.connect(self._thread.quit)
         self._worker.finished.connect(self._worker.deleteLater)
-        self._worker.finished.connect(self._on_worker_finished)
+        self._worker.finished.connect(self._on_finished)
         self._thread.finished.connect(self._thread.deleteLater)
         self._thread.started.connect(self._worker.run)
         self._thread.start()
@@ -673,14 +584,24 @@ class BotGUI(QWidget):
         self.button_toggle.setEnabled(True)
         self.button_toggle.setText("Iniciar bot")
 
-    def _on_worker_finished(self) -> None:
+    def _on_finished(self) -> None:
         self.button_toggle.setEnabled(True)
         self.button_toggle.setText("Iniciar bot")
         self._worker = None
         self._thread = None
 
-    def _update_row(self, par: str, payload: Dict[str, Union[float, str]]) -> None:
-        row = self._row_for(par)
+    def _row_for(self, pair: str) -> int:
+        for row in range(self.table.rowCount()):
+            item = self.table.item(row, 0)
+            if item and item.text() == pair:
+                return row
+        row = self.table.rowCount()
+        self.table.insertRow(row)
+        self.table.setItem(row, 0, QTableWidgetItem(pair))
+        return row
+
+    def _update_row(self, pair: str, payload: Dict[str, Union[float, str]]) -> None:
+        row = self._row_for(pair)
         columns = [
             ("rsi", "{:.1f}"),
             ("ema_fast", "{:.5f}"),
@@ -709,8 +630,8 @@ class BotGUI(QWidget):
         if self.table.item(row, 10) is None:
             self.table.setItem(row, 10, QTableWidgetItem("-"))
 
-    def _update_trade(self, par: str, result: str, pnl: float, total: float) -> None:
-        row = self._row_for(par)
+    def _update_trade(self, pair: str, result: str, pnl: float, total: float) -> None:
+        row = self._row_for(pair)
         result_item = QTableWidgetItem(result)
         if result == "WIN":
             result_item.setForeground(Qt.green)
@@ -724,16 +645,6 @@ class BotGUI(QWidget):
             pnl_item.setForeground(Qt.red)
         self.table.setItem(row, 10, pnl_item)
         self.label_pnl.setText(f"💰 PnL acumulado: {total:.2f}")
-
-    def _row_for(self, par: str) -> int:
-        for row in range(self.table.rowCount()):
-            item = self.table.item(row, 0)
-            if item and item.text() == par:
-                return row
-        row = self.table.rowCount()
-        self.table.insertRow(row)
-        self.table.setItem(row, 0, QTableWidgetItem(par))
-        return row
 
     def closeEvent(self, event):
         if self._worker is not None:
