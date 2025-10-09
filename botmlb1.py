@@ -52,6 +52,35 @@ from PyQt5.QtWidgets import (  # noqa: E402
 )
 from iqoptionapi.stable_api import IQ_Option  # noqa: E402
 
+
+def _patch_digital_underlying() -> None:
+    original = IQ_Option.get_digital_underlying_list_data
+
+    if getattr(original, "__name__", "") == "safe_get_digital_underlying_list_data":
+        return
+
+    def safe_get_digital_underlying_list_data(self, *args, **kwargs):  # type: ignore
+        try:
+            payload = original(self, *args, **kwargs)
+        except Exception:
+            logging.debug("Fallo al obtener metadatos digitales; se devuelve estructura vacía")
+            return {"underlying": {}}
+
+        if not isinstance(payload, dict):
+            return {"underlying": {}}
+
+        underlying = payload.get("underlying")
+        if not isinstance(underlying, dict):
+            payload["underlying"] = {}
+
+        return payload
+
+    safe_get_digital_underlying_list_data.__name__ = "safe_get_digital_underlying_list_data"
+    IQ_Option.get_digital_underlying_list_data = safe_get_digital_underlying_list_data  # type: ignore
+
+
+_patch_digital_underlying()
+
 EMAIL = "fornerinoalejandro031@gmail.com"
 PASSWORD = "484572ale"
 MODO = "PRACTICE"
