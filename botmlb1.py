@@ -50,6 +50,7 @@ from PyQt5.QtWidgets import (  # noqa: E402
     QVBoxLayout,
     QWidget,
 )
+from iqoptionapi import constants as iq_constants  # noqa: E402
 from iqoptionapi.stable_api import IQ_Option  # noqa: E402
 
 
@@ -155,6 +156,7 @@ class TradeResult:
 @dataclass
 class OtcPair:
     name: str
+    active_id: int
 
 
 def _format(value: float, precision: int) -> str:
@@ -163,7 +165,7 @@ def _format(value: float, precision: int) -> str:
     return f"{value:.{precision}f}"
 
 
-def _iter_open_otc(payload: Dict) -> Iterable[str]:
+def _iter_open_otc(payload: Dict) -> Iterable[Tuple[str, int]]:
     for category in ("turbo", "binary", "digital"):
         entries = payload.get(category, {})
         if not isinstance(entries, dict):
@@ -174,8 +176,16 @@ def _iter_open_otc(payload: Dict) -> Iterable[str]:
             if info.get("open") is False or info.get("enabled") is False:
                 continue
             candidate = _sanitize(symbol)
-            if candidate:
-                yield candidate
+            if not candidate:
+                continue
+            active_id = info.get("id") or info.get("active_id")
+            try:
+                active_id = int(active_id)
+            except (TypeError, ValueError):
+                active_id = None
+            if active_id is None:
+                continue
+            yield candidate, active_id
 
 
 def _discover_otc_pairs(api: SafeIQOption) -> List[OtcPair]:
@@ -185,12 +195,15 @@ def _discover_otc_pairs(api: SafeIQOption) -> List[OtcPair]:
         logging.exception("No se pudieron obtener los horarios de activos")
         schedule = {}
     seen: Dict[str, OtcPair] = {}
-    for symbol in _iter_open_otc(schedule):
-        seen.setdefault(symbol, OtcPair(symbol))
+    for symbol, active_id in _iter_open_otc(schedule):
+        seen.setdefault(symbol, OtcPair(symbol, active_id))
     if not seen:
         logging.warning("No se detectaron pares OTC abiertos; se usa respaldo estático")
         for symbol in OTC_FALLBACK:
-            seen.setdefault(symbol, OtcPair(symbol))
+            active_id = iq_constants.ACTIVES.get(symbol)
+            if active_id is None:
+                continue
+            seen.setdefault(symbol, OtcPair(symbol, int(active_id)))
     return list(seen.values())
 
 
@@ -211,24 +224,29 @@ def _build_dataframe(candles: Sequence[Dict]) -> pd.DataFrame:
     return pd.DataFrame()
 
 
-def _fetch_candles(api: SafeIQOption, symbol: str, count: int = 120) -> pd.DataFrame:
+def _fetch_candles(api: SafeIQOption, pair: OtcPair, count: int = 120) -> pd.DataFrame:
     for attempt in range(3):
         try:
-            payload = api.get_candles(symbol, 60, count, time.time())
+            payload = api.get_candles(pair.active_id, 60, count, time.time())
         except Exception as exc:
-            logging.warning("Error obteniendo velas %s (intento %s/3): %s", symbol, attempt + 1, exc)
+            logging.warning(
+                "Error obteniendo velas %s (intento %s/3): %s",
+                pair.name,
+                attempt + 1,
+                exc,
+            )
             time.sleep(1)
             continue
         if isinstance(payload, dict):
             payload = payload.get("candles") or payload.get("data") or []
         if not isinstance(payload, list):
-            logging.debug("Respuesta de velas inesperada para %s: %s", symbol, type(payload))
+            logging.debug("Respuesta de velas inesperada para %s: %s", pair.name, type(payload))
             time.sleep(1)
             continue
         df = _build_dataframe(payload)
         if not df.empty:
             return df
-        logging.debug("Velas vacías para %s (intento %s/3)", symbol, attempt + 1)
+        logging.debug("Velas vacías para %s (intento %s/3)", pair.name, attempt + 1)
         time.sleep(1)
     return pd.DataFrame()
 
@@ -317,6 +335,7 @@ class BotWorker(QObject):
         super().__init__()
         self._stop = False
         self._pnl = 0.0
+        self._failures: Dict[str, int] = {}
 
     def stop(self) -> None:
         self._stop = True
@@ -359,13 +378,20 @@ class BotWorker(QObject):
                 self.status_changed.emit(
                     f"🔁 Ciclo {ciclo}/{CICLOS} | PnL acumulado: {self._pnl:.2f}"
                 )
-                for par in pares:
+                for par in list(pares):
                     if self._stop:
                         break
-                    df = _fetch_candles(api, par.name)
+                    df = _fetch_candles(api, par)
                     if df.empty:
                         logging.warning("%s sin velas válidas", par.name)
+                        fails = self._failures.get(par.name, 0) + 1
+                        self._failures[par.name] = fails
+                        if fails >= 3:
+                            logging.warning("%s eliminado tras %s fallos de velas", par.name, fails)
+                            pares.remove(par)
                         continue
+                    if par.name in self._failures:
+                        self._failures.pop(par.name, None)
                     signal, snapshot = _compute_signal(df)
                     self.row_ready.emit(par.name, snapshot.to_row(signal))
                     if not signal:
