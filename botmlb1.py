@@ -592,6 +592,7 @@ class BotWorker(QObject):
                         continue
                     senal, data = self.obtener_senal(df)
                     self.row_ready.emit(par.display, data)
+                    self._log_snapshot(par, data, senal)
 
                     if senal:
                         ok, ticket = self._ejecutar_operacion(iq, par, senal)
@@ -620,18 +621,6 @@ class BotWorker(QObject):
                                 f"[FAIL] No se pudo ejecutar {senal} en {par.display}"
                             )
                             # El detalle del fallo y el cooldown se gestionan dentro de _ejecutar_operacion
-                    else:
-                        logging.info(
-                            "[%s] Sin señal clara | RSI %.1f | EMA9 %.5f / EMA21 %.5f | MACD %.5f / %.5f | STK %.1f / %.1f",
-                            par.display,
-                            self._to_float(data.get("rsi")),
-                            self._to_float(data.get("emaf")),
-                            self._to_float(data.get("emas")),
-                            self._to_float(data.get("macd")),
-                            self._to_float(data.get("macds")),
-                            self._to_float(data.get("stk")),
-                            self._to_float(data.get("std")),
-                        )
                     time.sleep(0.6)
 
                 pares_validos = [
@@ -712,6 +701,33 @@ class BotWorker(QObject):
             return float(value)
         except (TypeError, ValueError):
             return float("nan")
+
+    def _log_snapshot(
+        self, par: TradePair, payload: Dict[str, Union[float, str]], signal: Optional[str]
+    ) -> None:
+        rsi = self._to_float(payload.get("rsi", float("nan")))
+        emaf = self._to_float(payload.get("emaf", float("nan")))
+        emas = self._to_float(payload.get("emas", float("nan")))
+        macd = self._to_float(payload.get("macd", float("nan")))
+        macds = self._to_float(payload.get("macds", float("nan")))
+        stk = self._to_float(payload.get("stk", float("nan")))
+        std = self._to_float(payload.get("std", float("nan")))
+
+        def fmt(valor: float, precision: int) -> str:
+            if math.isnan(valor):
+                return "-"
+            return f"{valor:.{precision}f}"
+
+        resumen = (
+            f"[{par.display}] RSI={fmt(rsi, 1)} EMAf={fmt(emaf, 5)} "
+            f"EMAs={fmt(emas, 5)} MACD={fmt(macd, 5)}/{fmt(macds, 5)} "
+            f"STK={fmt(stk, 1)}/{fmt(std, 1)}"
+        )
+
+        if signal:
+            logging.info("%s | Señal=%s", resumen, signal.upper())
+        else:
+            logging.info("%s | Sin señal operativa", resumen)
 
     @staticmethod
     def _es_info_activo(info: Dict) -> bool:
@@ -1240,54 +1256,55 @@ class BotWorker(QObject):
         aliases = par.candle_aliases or (par.api_symbol,)
         errores: List[Tuple[Union[str, int], Exception]] = []
         claves_malformadas: Optional[List[str]] = None
-        sync_intentado = False
 
         for alias in aliases:
             objetivo = alias if alias not in (None, "") else par.api_symbol
             if objetivo in (None, ""):
                 continue
 
-            try:
-                raw = iq.get_candles(objetivo, 60, n, time.time())
-            except Exception as exc:
-                mensaje = str(exc).lower()
-                if "not found on consts" in mensaje and not sync_intentado:
-                    logging.debug(
-                        "Alias %s no encontrado en consts. Re-sincronizando catálogo...",
-                        objetivo,
-                    )
-                    try:
-                        iq.sync_active_catalog()
-                    except Exception:
-                        logging.debug("Sincronización de catálogo falló para %s", objetivo)
-                    sync_intentado = True
-                    try:
-                        raw = iq.get_candles(objetivo, 60, n, time.time())
-                    except Exception as retry_exc:
-                        errores.append((objetivo, retry_exc))
+            intento = 0
+            while intento < 2:
+                try:
+                    raw = iq.get_candles(objetivo, 60, n, time.time())
+                except Exception as exc:
+                    mensaje = str(exc).lower()
+                    if "not found on consts" in mensaje and intento == 0:
+                        logging.debug(
+                            "Alias %s no encontrado en consts. Re-sincronizando catálogo...",
+                            objetivo,
+                        )
+                        try:
+                            iq.sync_active_catalog()
+                        except Exception:
+                            logging.debug(
+                                "Sincronización de catálogo falló para %s", objetivo
+                            )
+                        intento += 1
                         continue
-                else:
                     errores.append((objetivo, exc))
-                    continue
+                    break
 
-            candles = self._normalizar_candles(raw)
-            df = self._construir_dataframe_velas(candles)
-            if not df.empty:
-                if objetivo != par.api_symbol:
-                    logging.debug(
-                        "Velas para %s obtenidas usando alias %s.", par.display, objetivo
-                    )
-                return df
+                candles = self._normalizar_candles(raw)
+                df = self._construir_dataframe_velas(candles)
+                if not df.empty:
+                    if objetivo != par.api_symbol:
+                        logging.debug(
+                            "Velas para %s obtenidas usando alias %s.", par.display, objetivo
+                        )
+                    return df
 
-            if isinstance(raw, dict):
-                claves_malformadas = list(raw.keys())
-            elif candles:
-                claves_malformadas = list(candles[0].keys())
-            else:
-                claves_malformadas = []
-            logging.debug(
-                "Alias %s devolvió estructura de velas sin OHLC: %s", objetivo, claves_malformadas
-            )
+                if isinstance(raw, dict):
+                    claves_malformadas = list(raw.keys())
+                elif candles:
+                    claves_malformadas = list(candles[0].keys())
+                else:
+                    claves_malformadas = []
+                logging.debug(
+                    "Alias %s devolvió estructura de velas sin OHLC: %s",
+                    objetivo,
+                    claves_malformadas,
+                )
+                break
 
         if errores:
             for alias, exc in errores:
@@ -1390,55 +1407,66 @@ class BotWorker(QObject):
         for alias in aliases:
             if not alias:
                 continue
-            try:
-                if par.instrument_type == "digital":
-                    ok, op_id = iq.buy_digital_spot(alias, MONTO, senal, EXPIRACION)
-                    tipo = "digital"
-                else:
-                    ok, op_id = iq.buy(MONTO, alias, senal, EXPIRACION)
-                    tipo = "binary"
-            except Exception as exc:
-                ultimo_error = exc
-                mensaje = str(exc).lower()
-                if "not found on consts" in mensaje:
-                    logging.debug(
-                        "Alias %s no encontrado para operar; se sincroniza catálogo.",
-                        alias,
-                    )
-                    try:
-                        iq.sync_active_catalog()
-                    except Exception:
+            intento = 0
+            while intento < 2:
+                try:
+                    if par.instrument_type == "digital":
+                        ok, op_id = iq.buy_digital_spot(alias, MONTO, senal, EXPIRACION)
+                        tipo = "digital"
+                    else:
+                        ok, op_id = iq.buy(MONTO, alias, senal, EXPIRACION)
+                        tipo = "binary"
+                except Exception as exc:
+                    ultimo_error = exc
+                    mensaje = str(exc).lower()
+                    if "not found on consts" in mensaje and intento == 0:
                         logging.debug(
-                            "Fallo al sincronizar catálogo antes de reintentar operación."
+                            "Alias %s no encontrado para operar; se sincroniza catálogo.",
+                            alias,
                         )
-                    continue
-                logging.debug(
-                    "Error intentando operar %s con alias %s: %s",
-                    par.display,
-                    alias,
-                    exc,
-                )
-                continue
-
-            if ok and op_id not in (None, ""):
-                if alias != par.api_symbol:
+                        try:
+                            iq.sync_active_catalog()
+                        except Exception:
+                            logging.debug(
+                                "Fallo al sincronizar catálogo antes de reintentar operación."
+                            )
+                        intento += 1
+                        continue
                     logging.debug(
-                        "Operación en %s ejecutada usando alias %s.",
+                        "Error intentando operar %s con alias %s: %s",
                         par.display,
                         alias,
+                        exc,
                     )
-                self._fallas_temporales.pop(par.display, None)
-                self._cooldowns.pop(par.display, None)
-                self._cooldown_notices.pop(par.display, None)
-                return True, (tipo, op_id)
+                    break
 
-            logging.debug(
-                "El broker devolvió estado negativo para %s usando alias %s (ok=%s, id=%s).",
-                par.display,
-                alias,
-                ok,
-                op_id,
-            )
+                if ok and op_id not in (None, ""):
+                    if alias != par.api_symbol:
+                        logging.debug(
+                            "Operación en %s ejecutada usando alias %s.",
+                            par.display,
+                            alias,
+                        )
+                    self._fallas_temporales.pop(par.display, None)
+                    self._cooldowns.pop(par.display, None)
+                    self._cooldown_notices.pop(par.display, None)
+                    return True, (tipo, op_id)
+
+                logging.debug(
+                    "El broker devolvió estado negativo para %s usando alias %s (ok=%s, id=%s).",
+                    par.display,
+                    alias,
+                    ok,
+                    op_id,
+                )
+                logging.info(
+                    "[RECHAZADO] %s alias %s (ok=%s id=%s)",
+                    par.display,
+                    alias,
+                    ok,
+                    op_id,
+                )
+                break
 
         if ultimo_error is not None:
             logging.error(
