@@ -1033,27 +1033,93 @@ class BotWorker(QObject):
         instrument_type: str,
         active_id: Optional[int],
     ) -> Tuple[str, ...]:
-        aliases_candles = self._generar_aliases_candles(
-            raw_symbol,
-            resolved_symbol,
-            info,
-            instrument_type,
-            active_id,
-        )
+        candidatos: List[str] = []
 
-        trade_aliases: List[str] = []
-        for alias in aliases_candles:
-            if isinstance(alias, str) and alias not in trade_aliases:
-                trade_aliases.append(alias)
+        def agregar(valor: Optional[str]) -> None:
+            if not isinstance(valor, str):
+                return
+            texto = valor.strip()
+            if not texto or texto in candidatos:
+                return
+            candidatos.append(texto)
 
-        if not trade_aliases:
-            for candidate in (raw_symbol, resolved_symbol):
-                if isinstance(candidate, str) and candidate.strip():
-                    valor = candidate.strip()
-                    if valor not in trade_aliases:
-                        trade_aliases.append(valor)
+        def agregar_variantes(base: Optional[str]) -> None:
+            if not isinstance(base, str):
+                return
+            texto = base.strip()
+            if not texto:
+                return
+            agregar(texto)
+            agregar(texto.upper())
+            agregar(texto.lower())
 
-        return tuple(trade_aliases)
+            normalizado = _sanitize_symbol_name(texto)
+            if normalizado and normalizado != texto:
+                agregar(normalizado)
+                agregar(normalizado.upper())
+                agregar(normalizado.lower())
+            if "/" in texto:
+                agregar(texto.replace("/", ""))
+            if "-" in texto:
+                agregar(texto.replace("-", ""))
+            if normalizado:
+                if "/" in normalizado:
+                    agregar(normalizado.replace("/", ""))
+                if "-" in normalizado:
+                    agregar(normalizado.replace("-", ""))
+
+        agregar_variantes(resolved_symbol)
+        agregar_variantes(raw_symbol)
+
+        if isinstance(info, dict):
+            for clave in ("symbol", "underlying", "active", "asset_name", "name", "ticker", "pair"):
+                agregar_variantes(info.get(clave))
+            for clave in ("instrument_id", "instrumentId", "symbol_id", "symbolId"):
+                valor = info.get(clave)
+                if isinstance(valor, str):
+                    agregar(valor)
+
+        if instrument_type == "digital":
+            base = _sanitize_symbol_name(resolved_symbol or raw_symbol or "")
+            if base:
+                agregar(f"do{base}")
+                agregar(f"do{base.upper()}")
+                agregar(f"do{base.lower()}")
+                if not base.endswith("-OTC"):
+                    agregar(f"{base}-OTC")
+
+        simbolo_principal = resolved_symbol or raw_symbol or ""
+        if isinstance(simbolo_principal, str):
+            simbolo_principal = simbolo_principal.strip()
+        else:
+            simbolo_principal = ""
+
+        if simbolo_principal:
+            agregar(simbolo_principal)
+            normalizado_principal = _sanitize_symbol_name(simbolo_principal)
+            if normalizado_principal:
+                agregar(normalizado_principal)
+                if not normalizado_principal.endswith("OTC"):
+                    agregar(f"{normalizado_principal}-OTC")
+        else:
+            normalizado_principal = None
+
+        ordenados: List[str] = []
+        for alias in candidatos:
+            texto = alias.strip()
+            if texto and texto not in ordenados:
+                ordenados.append(texto)
+
+        for preferido in (simbolo_principal, normalizado_principal):
+            if preferido and preferido in ordenados:
+                ordenados.insert(0, ordenados.pop(ordenados.index(preferido)))
+
+        if not ordenados:
+            for candidato in (resolved_symbol, raw_symbol):
+                if isinstance(candidato, str) and candidato.strip():
+                    ordenados.append(candidato.strip())
+
+        return tuple(ordenados)
 
     def _descubrir_pares(self, iq) -> List[TradePair]:
         try:
@@ -1560,39 +1626,76 @@ class BotWorker(QObject):
         iq, alias: str, senal: str
     ) -> Tuple[bool, Optional[Union[int, str]], str]:
         alias_binario = BotWorker._preparar_alias_binario(alias)
-        candidatos = []
-        if alias_binario:
-            candidatos.append(alias_binario)
-        if alias and alias not in candidatos:
-            candidatos.append(alias)
-        alias_sanitizado = _sanitize_symbol_name(alias_binario or alias)
-        if alias_sanitizado and alias_sanitizado not in candidatos:
-            candidatos.append(alias_sanitizado)
+        candidatos: List[str] = []
+
+        def agregar(valor: Optional[str]) -> None:
+            if not isinstance(valor, str):
+                return
+            texto = valor.strip()
+            if not texto or texto in candidatos:
+                return
+            candidatos.append(texto)
+
+        agregar(alias_binario)
+        agregar(alias)
+        agregar(_sanitize_symbol_name(alias_binario or alias))
+
+        admite_parametro_option = True
 
         for objetivo in candidatos:
-            try:
-                ok_bin, op_id_bin = iq.buy(MONTO, objetivo, senal, EXPIRACION)
-            except Exception as exc:
-                logging.debug(
-                    "Fallo en intento binario para alias %s: %s",
-                    objetivo,
-                    exc,
-                )
+            if not objetivo:
                 continue
+            for option_type in ("turbo", "binary"):
+                try:
+                    if admite_parametro_option:
+                        ok_bin, op_id_bin = iq.buy(
+                            MONTO,
+                            objetivo,
+                            senal,
+                            EXPIRACION,
+                            option=option_type,
+                        )
+                    else:
+                        ok_bin, op_id_bin = iq.buy(MONTO, objetivo, senal, EXPIRACION)
+                except TypeError:
+                    admite_parametro_option = False
+                    try:
+                        ok_bin, op_id_bin = iq.buy(MONTO, objetivo, senal, EXPIRACION)
+                    except Exception as exc:
+                        logging.debug(
+                            "Fallo en intento binario para alias %s: %s",
+                            objetivo,
+                            exc,
+                        )
+                        break
+                except Exception as exc:
+                    logging.debug(
+                        "Fallo en intento binario para alias %s: %s",
+                        objetivo,
+                        exc,
+                    )
+                    break
 
-            if ok_bin and op_id_bin not in (None, ""):
+                if ok_bin and op_id_bin not in (None, ""):
+                    opcion = option_type if admite_parametro_option else "turbo"
+                    logging.debug(
+                        "Operación binaria ejecutada usando alias %s (option=%s).",
+                        objetivo,
+                        opcion,
+                    )
+                    return True, op_id_bin, "binary"
+
+                opcion = option_type if admite_parametro_option else "turbo"
                 logging.debug(
-                    "Operación binaria ejecutada correctamente usando alias %s.",
+                    "El broker devolvió estado negativo en fallback binario (alias %s, option=%s, ok=%s, id=%s).",
                     objetivo,
+                    opcion,
+                    ok_bin,
+                    op_id_bin,
                 )
-                return True, op_id_bin, "binary"
 
-            logging.debug(
-                "El broker devolvió estado negativo en fallback binario (alias %s, ok=%s, id=%s).",
-                objetivo,
-                ok_bin,
-                op_id_bin,
-            )
+                if not admite_parametro_option:
+                    break
 
         return False, None, "binary"
 
