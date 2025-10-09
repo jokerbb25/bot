@@ -514,6 +514,8 @@ class BotWorker(QObject):
         self._stop_event = threading.Event()
         self._pnl_acumulado = 0.0
         self._pares_descartados: Set[str] = set()
+        self._cooldowns: Dict[str, float] = {}
+        self._fallas_temporales: Dict[str, int] = {}
 
     def stop(self):
         self._stop_event.set()
@@ -569,6 +571,14 @@ class BotWorker(QObject):
                         break
                     if par.display in self._pares_descartados:
                         continue
+                    if self._en_cooldown(par):
+                        restante = self._cooldowns.get(par.display, 0.0) - time.time()
+                        logging.debug(
+                            "Par %s en cooldown, se reintentará en %.1f s",
+                            par.display,
+                            max(0.0, restante),
+                        )
+                        continue
                     activos_restantes = True
                     df = self.obtener_velas(iq, par)
                     if df.empty:
@@ -603,10 +613,11 @@ class BotWorker(QObject):
                             logging.warning(
                                 f"[FAIL] No se pudo ejecutar {senal} en {par.display}"
                             )
-                            self._descartar_par(
-                                par,
-                                "El broker rechazó la operación, se descarta el par.",
-                            )
+                            # El detalle del fallo y el cooldown se gestionan dentro de _ejecutar_operacion
+                    else:
+                        logging.debug(
+                            "[%s] Sin señal operativa en este ciclo.", par.display
+                        )
                     time.sleep(0.6)
 
                 pares_validos = [
@@ -647,7 +658,35 @@ class BotWorker(QObject):
         if par.display in self._pares_descartados:
             return
         self._pares_descartados.add(par.display)
+        self._cooldowns.pop(par.display, None)
+        self._fallas_temporales.pop(par.display, None)
         logging.info("Activo %s descartado: %s", par.display, motivo)
+
+    def _en_cooldown(self, par: TradePair) -> bool:
+        vencimiento = self._cooldowns.get(par.display)
+        if not vencimiento:
+            return False
+        if time.time() >= vencimiento:
+            self._cooldowns.pop(par.display, None)
+            return False
+        return True
+
+    def _marcar_fallo_temporal(self, par: TradePair, motivo: str, cooldown: int = 60) -> None:
+        if par.display in self._pares_descartados:
+            return
+        contador = self._fallas_temporales.get(par.display, 0) + 1
+        self._fallas_temporales[par.display] = contador
+        self._cooldowns[par.display] = time.time() + cooldown
+        restantes = max(0, 3 - contador)
+        logging.info(
+            "Activo %s en cooldown (%s). Nuevos intentos disponibles en %ss. Reintentos restantes antes de descartar: %s",
+            par.display,
+            motivo,
+            cooldown,
+            restantes,
+        )
+        if contador >= 3:
+            self._descartar_par(par, "Superó el límite de fallos consecutivos.")
 
     @staticmethod
     def _es_info_activo(info: Dict) -> bool:
@@ -1344,8 +1383,16 @@ class BotWorker(QObject):
                     try:
                         iq.sync_active_catalog()
                     except Exception:
-                        logging.debug("Fallo al sincronizar catálogo antes de reintentar operación.")
+                        logging.debug(
+                            "Fallo al sincronizar catálogo antes de reintentar operación."
+                        )
                     continue
+                logging.debug(
+                    "Error intentando operar %s con alias %s: %s",
+                    par.display,
+                    alias,
+                    exc,
+                )
                 continue
 
             if ok and op_id not in (None, ""):
@@ -1355,7 +1402,17 @@ class BotWorker(QObject):
                         par.display,
                         alias,
                     )
+                self._fallas_temporales.pop(par.display, None)
+                self._cooldowns.pop(par.display, None)
                 return True, (tipo, op_id)
+
+            logging.debug(
+                "El broker devolvió estado negativo para %s usando alias %s (ok=%s, id=%s).",
+                par.display,
+                alias,
+                ok,
+                op_id,
+            )
 
         if ultimo_error is not None:
             logging.error(
@@ -1366,7 +1423,7 @@ class BotWorker(QObject):
                 )
             )
 
-        self._descartar_par(
+        self._marcar_fallo_temporal(
             par,
             "El broker rechazó la operación en todos los alias disponibles.",
         )
