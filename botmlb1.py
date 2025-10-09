@@ -26,13 +26,17 @@ def _ensure_dependency(module_name: str, pip_name: Optional[str] = None) -> None
         sys.exit(1)
 
 
-for _module, _pip in (
-    ("pandas", None),
-    ("ta", None),
-    ("PyQt5", "PyQt5"),
-    ("iqoptionapi", "iqoptionapi"),
-):
-    _ensure_dependency(_module, _pip)
+def _verify_dependencies() -> None:
+    for module, pip_name in (
+        ("pandas", None),
+        ("ta", None),
+        ("PyQt5", "PyQt5"),
+        ("iqoptionapi", "iqoptionapi"),
+    ):
+        _ensure_dependency(module, pip_name)
+
+
+_verify_dependencies()
 
 import pandas as pd  # noqa: E402
 import ta  # noqa: E402
@@ -66,9 +70,11 @@ def _sanitize(symbol: Optional[str]) -> Optional[str]:
     if not symbol or not isinstance(symbol, str):
         return None
     cleaned = symbol.strip().upper()
-    if not cleaned or "OTC" in cleaned:
+    if not cleaned:
         return None
-    for suffix in ("-OP", "-DIGITAL", "-BINARY"):
+    if "OTC" in cleaned:
+        return None
+    for suffix in ("-OP", "-DIGITAL", "-BINARY", "-F", "-FX"):
         if cleaned.endswith(suffix):
             cleaned = cleaned[: -len(suffix)]
             break
@@ -87,7 +93,7 @@ def _ensure_underlying_patch() -> None:
         try:
             payload = original(self, *args, **kwargs)
         except Exception:
-            logging.exception("Fallo al pedir metadatos digitales")
+            logging.exception("Fallo al solicitar metadatos digitales")
             return {"underlying": {}}
         if not isinstance(payload, dict):
             return {"underlying": {}}
@@ -107,7 +113,7 @@ class SafeIQOption(IQ_Option):
         try:
             return super().get_all_open_time()
         except Exception:
-            logging.exception("Fallo al pedir horarios")
+            logging.exception("Fallo al consultar horarios")
             return {}
 
     def ensure_connection(self) -> bool:
@@ -119,15 +125,15 @@ class SafeIQOption(IQ_Option):
         try:
             ok, reason = self.connect()
         except Exception:
-            logging.exception("Error al reconectar")
+            logging.exception("Error intentando reconectar")
             return False
         if not ok:
-            logging.error("La reconexión fue rechazada: %s", reason)
+            logging.error("Reconexión rechazada: %s", reason)
             return False
         try:
             self.change_balance(MODO)
         except Exception:
-            logging.exception("No se pudo restablecer el balance tras la reconexión")
+            logging.exception("No se pudo restaurar el balance tras reconectar")
         return True
 
 
@@ -211,6 +217,7 @@ class BotWorker(QObject):
         super().__init__()
         self._stop = threading.Event()
         self._pnl = 0.0
+        self._digital_subscriptions: Set[Tuple[str, int]] = set()
 
     def stop(self) -> None:
         self._stop.set()
@@ -232,17 +239,15 @@ class BotWorker(QObject):
         api.change_balance(MODO)
         balance = api.get_balance()
         self.status_changed.emit(f"✅ Conectado a {MODO} | Saldo: {balance:.2f}")
+
         open_time = api.get_all_open_time()
         pairs = self._discover_pairs(api, open_time)
         if not pairs:
             self.status_changed.emit("⚠️ No se encontraron pares digitales/binarios abiertos")
-            try:
-                api.close()
-            except Exception:
-                pass
-            self.finished.emit()
+            self._cleanup(api)
             return
         self.status_changed.emit(f"📈 {len(pairs)} pares listos para operar")
+
         try:
             for ciclo in range(1, CICLOS + 1):
                 if self._stop.is_set():
@@ -278,11 +283,20 @@ class BotWorker(QObject):
                     break
                 time.sleep(ESPERA_ENTRE_CICLOS)
         finally:
+            self._cleanup(api)
+
+    def _cleanup(self, api: SafeIQOption) -> None:
+        for alias, duration in list(self._digital_subscriptions):
             try:
-                api.close()
+                api.unsubscribe_strike_list(alias, duration)
             except Exception:
                 pass
-            self.finished.emit()
+        self._digital_subscriptions.clear()
+        try:
+            api.close()
+        except Exception:
+            pass
+        self.finished.emit()
 
     def _discover_pairs(self, api: SafeIQOption, open_time: Dict) -> List[TradePair]:
         logging.info("♻️ Escaneando pares digitales y binarias disponibles...")
@@ -466,6 +480,7 @@ class BotWorker(QObject):
         for alias in pair.trade_aliases:
             try:
                 if pair.instrument_type == "digital":
+                    self._ensure_digital_subscription(api, alias)
                     ok, trade_id = api.buy_digital_spot(alias, MONTO, signal, EXPIRACION)
                     trade_kind = "digital"
                 else:
@@ -477,10 +492,23 @@ class BotWorker(QObject):
                     api.ensure_connection()
                 continue
             if ok and trade_id:
-                logging.info("[OK] %s en %s (alias %s)", signal.upper(), pair.name, alias)
+                logging.info("[OK] %s %s en %s (alias %s)", pair.instrument_type.upper(), signal.upper(), pair.name, alias)
                 return True, (trade_kind, str(trade_id))
         logging.warning("[FAIL] Broker rechazó %s en %s", signal.upper(), pair.name)
         return False, None
+
+    def _ensure_digital_subscription(self, api: SafeIQOption, alias: str) -> None:
+        base = _sanitize(alias) or alias.replace("-OP", "")
+        if not base or "OTC" in base:
+            return
+        key = (base, EXPIRACION)
+        if key in self._digital_subscriptions:
+            return
+        try:
+            api.subscribe_strike_list(base, EXPIRACION)
+            self._digital_subscriptions.add(key)
+        except Exception as exc:
+            logging.debug("No se pudo suscribir strikes para %s (%s)", base, exc)
 
     def _wait_result(
         self,
@@ -504,9 +532,6 @@ class BotWorker(QObject):
                         result, pnl = response[0], response[1]
                     else:
                         result, pnl = response, 0.0
-                        extra = api.check_win_v4(trade_id)
-                        if isinstance(extra, (list, tuple)) and len(extra) >= 2:
-                            pnl = extra[1]
                 if result is None:
                     time.sleep(1)
                     waited += 1
@@ -520,10 +545,8 @@ class BotWorker(QObject):
                 logging.debug("Error consultando resultado (%s)", exc)
                 if "need reconnect" in str(exc).lower():
                     api.ensure_connection()
-                    time.sleep(1)
-                    waited += 1
-                    continue
-                return None, 0.0
+                time.sleep(1)
+                waited += 1
         logging.warning("Timeout esperando resultado %s", trade_id)
         return None, 0.0
 
@@ -540,43 +563,48 @@ class BotWorker(QObject):
 
 
 class BotGUI(QWidget):
-    def __init__(self) -> None:
+    def __init__(self):
         super().__init__()
         self.setWindowTitle("IQ Option Digital/Binary Bot")
         self.resize(1000, 520)
+
         layout = QVBoxLayout(self)
         self.label_status = QLabel("⏳ Iniciando...", self)
         layout.addWidget(self.label_status)
+
         self.table = QTableWidget(0, 11)
-        self.table.setHorizontalHeaderLabels(
-            [
-                "Par",
-                "RSI",
-                "EMA Fast",
-                "EMA Slow",
-                "MACD",
-                "MACD Señal",
-                "STK %K",
-                "STK %D",
-                "Señal",
-                "Resultado",
-                "PnL",
-            ]
-        )
+        self.table.setHorizontalHeaderLabels([
+            "Par",
+            "RSI",
+            "EMA Fast",
+            "EMA Slow",
+            "MACD",
+            "MACD Señal",
+            "STK %K",
+            "STK %D",
+            "Señal",
+            "Resultado",
+            "PnL",
+        ])
         layout.addWidget(self.table)
+
         self.label_pnl = QLabel("💰 PnL acumulado: 0.00", self)
         layout.addWidget(self.label_pnl)
+
         footer = QHBoxLayout()
         footer.addItem(QSpacerItem(20, 20, QSizePolicy.Expanding, QSizePolicy.Minimum))
         self.button_toggle = QPushButton("Iniciar bot", self)
         self.button_toggle.clicked.connect(self.on_toggle)
         footer.addWidget(self.button_toggle)
         layout.addLayout(footer)
+
         self.label_footer = QLabel("", self)
         layout.addWidget(self.label_footer)
+
         self.timer = QTimer(self)
         self.timer.timeout.connect(self._update_clock)
         self.timer.start(1000)
+
         self._thread: Optional[QThread] = None
         self._worker: Optional[BotWorker] = None
 
@@ -596,6 +624,7 @@ class BotGUI(QWidget):
         self.label_pnl.setText("💰 PnL acumulado: 0.00")
         self.button_toggle.setEnabled(False)
         self.label_status.setText("⏳ Conectando...")
+
         self._thread = QThread(self)
         self._worker = BotWorker()
         self._worker.moveToThread(self._thread)
