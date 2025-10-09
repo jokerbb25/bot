@@ -165,25 +165,17 @@ def _format(value: float, precision: int) -> str:
 
 
 def _alias_variations(symbol: str) -> List[str]:
-    variants = []
-    base = symbol.strip()
+    base = symbol.strip().upper()
     if not base:
-        return variants
-    candidates = {
-        base,
-        base.upper(),
-        base.lower(),
-        base.replace("/", ""),
-        base.replace("/", "").upper(),
-        base.replace("/", "").lower(),
-        base.replace("-", ""),
-        base.replace("-", "").upper(),
-        base.replace("-", "").lower(),
-    }
-    for candidate in candidates:
-        cleaned = candidate.strip()
-        if cleaned and cleaned not in variants:
-            variants.append(cleaned)
+        return []
+
+    variants = [base]
+    compact_slash = base.replace("/", "")
+    if compact_slash and compact_slash not in variants:
+        variants.append(compact_slash)
+    compact_dash = base.replace("-", "")
+    if compact_dash and compact_dash not in variants:
+        variants.append(compact_dash)
     return variants
 
 
@@ -314,35 +306,33 @@ def _build_dataframe(candles: Sequence[Dict]) -> pd.DataFrame:
 
 
 def _fetch_candles(api: SafeIQOption, pair: OtcPair, count: int = 120) -> pd.DataFrame:
-    for alias in pair.aliases:
+    for alias in pair.aliases[:3]:
         _register_symbol(api, alias, pair.active_id)
-    for alias in pair.aliases:
-        for attempt in range(3):
-            try:
-                payload = api.get_candles(alias, 60, count, time.time())
-            except Exception as exc:
-                message = str(exc).lower()
-                if "need reconnect" in message:
-                    logging.warning("Se requiere reconexión para %s; reintentando", alias)
-                    time.sleep(1)
-                    continue
-                if "not found on consts" in message and pair.active_id:
-                    logging.debug("Registrando %s con id %s y reintentando", alias, pair.active_id)
-                    _register_symbol(api, alias, pair.active_id)
-                    time.sleep(1)
-                    continue
+
+    for alias in pair.aliases[:3]:
+        try:
+            payload = api.get_candles(alias, 60, count, time.time())
+        except Exception as exc:
+            message = str(exc).lower()
+            if "not found on consts" in message and pair.active_id:
+                _register_symbol(api, alias, pair.active_id)
+            elif "need reconnect" in message:
+                logging.warning("Se requiere reconexión al solicitar velas de %s", alias)
+            else:
                 logging.debug("Error obteniendo velas %s: %s", alias, exc)
-                break
-            candles = payload.get("candles") if isinstance(payload, dict) else payload
-            if not isinstance(candles, list):
-                logging.debug("Respuesta de velas inesperada para %s", alias)
-                time.sleep(1)
-                continue
-            df = _build_dataframe(candles)
-            if not df.empty:
-                return df
-            logging.debug("Velas vacías para %s (intento %s/3)", alias, attempt + 1)
-            time.sleep(1)
+            continue
+
+        candles = payload.get("candles") if isinstance(payload, dict) else payload
+        if not isinstance(candles, list):
+            logging.debug("Respuesta de velas inesperada para %s", alias)
+            continue
+
+        df = _build_dataframe(candles)
+        if not df.empty:
+            return df
+
+        logging.debug("Velas vacías para %s", alias)
+
     return pd.DataFrame()
 
 
@@ -478,12 +468,13 @@ class BotWorker(QObject):
                         break
                     df = _fetch_candles(api, pair)
                     if df.empty:
-                        logging.warning("%s sin velas válidas", pair.name)
                         failures = self._failures.get(pair.name, 0) + 1
                         self._failures[pair.name] = failures
-                        if failures >= 3:
-                            logging.warning("%s eliminado tras %s fallos de velas", pair.name, failures)
+                        if failures >= 2:
+                            logging.info("%s eliminado tras intentos fallidos de velas", pair.name)
                             pairs.remove(pair)
+                        else:
+                            logging.debug("%s sin velas válidas", pair.name)
                         continue
                     if pair.name in self._failures:
                         self._failures.pop(pair.name, None)
