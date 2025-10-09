@@ -477,14 +477,6 @@ class BotWorker(QObject):
                     f"🔁 Ciclo {cycle}/{CICLOS} | PnL acumulado: {self._pnl:.2f}"
                 )
 
-                if self._failures:
-                    for nombre in list(self._failures.keys()):
-                        valor = self._failures[nombre]
-                        if valor <= 0:
-                            self._failures.pop(nombre, None)
-                        else:
-                            self._failures[nombre] = valor - 1
-
                 pairs = _discover_otc_pairs(api)
                 if not pairs:
                     self.status_changed.emit("⚠️ No se detectaron pares OTC disponibles en este ciclo")
@@ -494,19 +486,27 @@ class BotWorker(QObject):
                 listado = ", ".join(pair.name for pair in pairs)
                 logging.debug("Pares OTC ciclo %s: %s", cycle, listado)
 
+                if self._failures:
+                    for nombre, valor in list(self._failures.items()):
+                        actualizado = max(valor - 1, 0)
+                        if actualizado:
+                            self._failures[nombre] = actualizado
+                        else:
+                            self._failures.pop(nombre, None)
+
                 for pair in pairs:
                     if self._stop:
                         break
 
-                    if self._failures.get(pair.name, 0) >= 3:
+                    fails = self._failures.get(pair.name, 0)
+                    if fails >= 3:
                         logging.debug("%s omitido temporalmente por fallos previos", pair.name)
                         continue
 
                     df = _fetch_candles(api, pair)
                     if df.empty:
-                        intentos = self._failures.get(pair.name, 0) + 1
-                        self._failures[pair.name] = intentos
-                        logging.debug("%s sin velas válidas (intento %s)", pair.name, intentos)
+                        self._failures[pair.name] = fails + 1
+                        logging.debug("%s sin velas válidas (intento %s)", pair.name, fails + 1)
                         continue
 
                     self._failures[pair.name] = 0
@@ -526,6 +526,7 @@ class BotWorker(QObject):
                     ok, ticket = api.buy(MONTO, pair.name, signal, EXPIRACION)
                     if not ok or not ticket:
                         logging.warning("[FAIL] Broker rechazó %s en %s", signal.upper(), pair.name)
+                        self._failures[pair.name] = fails + 1
                         time.sleep(1)
                         continue
 
