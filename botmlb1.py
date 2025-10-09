@@ -70,18 +70,42 @@ def _sanitize(symbol: Optional[str]) -> Optional[str]:
     if not symbol or not isinstance(symbol, str):
         return None
     cleaned = symbol.strip().upper()
-    if not cleaned:
+    if "OTC" not in cleaned:
         return None
-    if "OTC" in cleaned:
-        return None
-    for suffix in ("-OP", "-DIGITAL", "-BINARY", "-F", "-FX"):
-        if cleaned.endswith(suffix):
-            cleaned = cleaned[: -len(suffix)]
-            break
     cleaned = cleaned.replace(" ", "")
-    if cleaned.endswith("-"):
-        cleaned = cleaned[:-1]
+    if not cleaned.endswith("OTC"):
+        return None
+    if not cleaned.endswith("-OTC"):
+        if cleaned.endswith("OTC"):
+            cleaned = f"{cleaned[:-3]}-OTC"
+    if cleaned.count("-OTC") > 1:
+        cleaned = cleaned.replace("-OTC", "") + "-OTC"
     return cleaned or None
+
+
+def _alias_variants(symbol: str) -> Tuple[str, ...]:
+    base = _sanitize(symbol)
+    if not base:
+        return tuple()
+    candidates: List[str] = []
+    seen: Set[str] = set()
+
+    def add(candidate: Optional[str]) -> None:
+        if not candidate:
+            return
+        cleaned = candidate.strip()
+        if not cleaned:
+            return
+        cleaned = cleaned.replace(" ", "")
+        if cleaned not in seen:
+            seen.add(cleaned)
+            candidates.append(cleaned)
+
+    add(base)
+    add(base.replace("-", ""))
+    add(base.replace("/", ""))
+    add(base.replace("-OTC", "OTC"))
+    return tuple(candidates)
 
 
 def _ensure_underlying_patch() -> None:
@@ -153,42 +177,6 @@ class IndicatorSnapshot:
         return payload
 
 
-def _alias_variants(symbol: str, instrument_type: str) -> Tuple[str, ...]:
-    raw = symbol.strip() if symbol else ""
-    if not raw:
-        return tuple()
-    if "OTC" in raw.upper():
-        return tuple()
-    upper_raw = raw.upper()
-    candidates: List[str] = []
-    seen: Set[str] = set()
-
-    def add(candidate: Optional[str]) -> None:
-        if not candidate:
-            return
-        cleaned = candidate.strip()
-        if not cleaned:
-            return
-        cleaned = cleaned.replace(" ", "")
-        if cleaned not in seen:
-            seen.add(cleaned)
-            candidates.append(cleaned)
-
-    add(upper_raw)
-    add(upper_raw.replace("-", ""))
-    add(upper_raw.replace("/", ""))
-
-    base = _sanitize(upper_raw)
-    add(base)
-    if base:
-        add(base.replace("-", ""))
-        add(base.replace("/", ""))
-    if instrument_type == "digital" and base:
-        add(f"{base}-OP")
-
-    return tuple(candidates)
-
-
 @dataclass(frozen=True)
 class TradePair:
     name: str
@@ -198,13 +186,13 @@ class TradePair:
 
     @classmethod
     def from_symbol(cls, symbol: str, instrument_type: str) -> Optional["TradePair"]:
-        if not symbol or "OTC" in symbol.upper():
+        sanitized = _sanitize(symbol)
+        if not sanitized:
             return None
-        aliases = _alias_variants(symbol, instrument_type)
+        aliases = _alias_variants(symbol)
         if not aliases:
             return None
-        display = _sanitize(symbol) or symbol.strip().upper()
-        return cls(display, instrument_type, aliases, aliases)
+        return cls(sanitized, instrument_type, aliases, aliases)
 
 
 class BotWorker(QObject):
@@ -217,7 +205,6 @@ class BotWorker(QObject):
         super().__init__()
         self._stop = threading.Event()
         self._pnl = 0.0
-        self._digital_subscriptions: Set[Tuple[str, int]] = set()
 
     def stop(self) -> None:
         self._stop.set()
@@ -243,10 +230,10 @@ class BotWorker(QObject):
         open_time = api.get_all_open_time()
         pairs = self._discover_pairs(api, open_time)
         if not pairs:
-            self.status_changed.emit("⚠️ No se encontraron pares digitales/binarios abiertos")
+            self.status_changed.emit("⚠️ No se encontraron pares OTC abiertos")
             self._cleanup(api)
             return
-        self.status_changed.emit(f"📈 {len(pairs)} pares listos para operar")
+        self.status_changed.emit(f"📈 {len(pairs)} pares OTC listos para operar")
 
         try:
             for ciclo in range(1, CICLOS + 1):
@@ -286,12 +273,6 @@ class BotWorker(QObject):
             self._cleanup(api)
 
     def _cleanup(self, api: SafeIQOption) -> None:
-        for alias, duration in list(self._digital_subscriptions):
-            try:
-                api.unsubscribe_strike_list(alias, duration)
-            except Exception:
-                pass
-        self._digital_subscriptions.clear()
         try:
             api.close()
         except Exception:
@@ -299,89 +280,33 @@ class BotWorker(QObject):
         self.finished.emit()
 
     def _discover_pairs(self, api: SafeIQOption, open_time: Dict) -> List[TradePair]:
-        logging.info("♻️ Escaneando pares digitales y binarias disponibles...")
-        digital_meta = self._load_digital_metadata(api)
+        logging.info("♻️ Escaneando pares OTC disponibles...")
         candidates: List[TradePair] = []
-        seen: Set[Tuple[str, str]] = set()
+        seen: Set[str] = set()
         if isinstance(open_time, dict):
-            for category in ("digital", "binary", "turbo"):
+            for category in ("binary", "turbo", "digital"):
                 entries = open_time.get(category, {})
                 if not isinstance(entries, dict):
                     continue
-                instrument_type = "digital" if category == "digital" else "binary"
                 for symbol, info in entries.items():
                     if not isinstance(info, dict):
                         continue
                     if not info.get("open", True):
                         continue
                     symbol_text = str(symbol)
-                    pair = TradePair.from_symbol(symbol_text, instrument_type)
+                    if "OTC" not in symbol_text.upper():
+                        continue
+                    pair = TradePair.from_symbol(symbol_text, category)
                     if not pair:
                         continue
-                    if instrument_type == "digital":
-                        meta = self._resolve_digital_meta(digital_meta, symbol_text, pair.name)
-                        if meta and (meta.get("enabled") is False or meta.get("is_suspended") is True):
-                            logging.info("⏭️ %s omitido (digital cerrado/suspendido)", pair.name)
-                            continue
-                    key = (pair.name, pair.instrument_type)
-                    if key in seen:
+                    if pair.name in seen:
                         continue
-                    if self._fetch_candles(api, pair, sample=True).empty:
+                    df = self._fetch_candles(api, pair, sample=True)
+                    if df.empty:
                         continue
                     candidates.append(pair)
-                    seen.add(key)
+                    seen.add(pair.name)
         return candidates
-
-    def _load_digital_metadata(self, api: SafeIQOption) -> Dict[str, Dict]:
-        mapping: Dict[str, Dict] = {}
-        try:
-            payload = api.get_digital_underlying_list_data()
-        except Exception:
-            logging.exception("No se pudieron obtener metadatos digitales")
-            return mapping
-        if not isinstance(payload, dict):
-            return mapping
-        underlying = payload.get("underlying", {})
-        if not isinstance(underlying, dict):
-            return mapping
-        for info in underlying.values():
-            if not isinstance(info, dict):
-                continue
-            symbol = (
-                info.get("symbol")
-                or info.get("underlying")
-                or info.get("active")
-                or info.get("asset_name")
-                or info.get("name")
-            )
-            if not symbol:
-                continue
-            symbol_text = str(symbol).strip().upper()
-            if not symbol_text or "OTC" in symbol_text:
-                continue
-            base = _sanitize(symbol_text)
-            keys = [symbol_text]
-            if base:
-                keys.append(base)
-                keys.append(base.replace("/", ""))
-                keys.append(base.replace("-", ""))
-            for key in keys:
-                if key and key not in mapping:
-                    mapping[key] = info
-        return mapping
-
-    def _resolve_digital_meta(self, metadata: Dict[str, Dict], raw_symbol: str, base_name: str) -> Optional[Dict]:
-        candidates = [
-            raw_symbol.strip().upper(),
-            _sanitize(raw_symbol),
-            base_name,
-            base_name.replace("/", ""),
-            base_name.replace("-", ""),
-        ]
-        for candidate in candidates:
-            if candidate and candidate in metadata:
-                return metadata[candidate]
-        return None
 
     def _fetch_candles(self, api: SafeIQOption, pair: TradePair, sample: bool = False) -> pd.DataFrame:
         history = 30 if sample else 60
@@ -463,6 +388,7 @@ class BotWorker(QObject):
         compare(ema_fast, ema_slow)
         compare(macd, macd_signal)
         compare(stoch_k, stoch_d)
+
         signal: Optional[str] = None
         if votos:
             if up >= 2 and up > down:
@@ -471,84 +397,32 @@ class BotWorker(QObject):
                 signal = "put"
         return signal, snapshot.as_payload(signal)
 
-    def _execute_trade(
-        self,
-        api: SafeIQOption,
-        pair: TradePair,
-        signal: str,
-    ) -> Tuple[bool, Optional[Tuple[str, str]]]:
+    def _execute_trade(self, api: SafeIQOption, pair: TradePair, signal: str) -> Tuple[bool, Optional[str]]:
         for alias in pair.trade_aliases:
             try:
-                if pair.instrument_type == "digital":
-                    self._ensure_digital_subscription(api, alias)
-                    ok, trade_id = api.buy_digital_spot(alias, MONTO, signal, EXPIRACION)
-                    trade_kind = "digital"
-                else:
-                    ok, trade_id = api.buy(MONTO, alias, signal, EXPIRACION)
-                    trade_kind = "binary"
+                ok, trade_id = api.buy(MONTO, alias, signal, EXPIRACION)
             except Exception as exc:
-                logging.debug("Error ejecutando operación %s (%s)", alias, exc)
+                logging.debug("Error ejecutando operación en %s (%s)", alias, exc)
                 if "need reconnect" in str(exc).lower():
                     api.ensure_connection()
                 continue
             if ok and trade_id:
-                logging.info("[OK] %s %s en %s (alias %s)", pair.instrument_type.upper(), signal.upper(), pair.name, alias)
-                return True, (trade_kind, str(trade_id))
+                logging.info("[OK] %s %s", signal.upper(), alias)
+                return True, str(trade_id)
         logging.warning("[FAIL] Broker rechazó %s en %s", signal.upper(), pair.name)
         return False, None
 
-    def _ensure_digital_subscription(self, api: SafeIQOption, alias: str) -> None:
-        base = _sanitize(alias) or alias.replace("-OP", "")
-        if not base or "OTC" in base:
-            return
-        key = (base, EXPIRACION)
-        if key in self._digital_subscriptions:
-            return
+    def _wait_result(self, api: SafeIQOption, ticket: str) -> Tuple[Optional[str], float]:
         try:
-            api.subscribe_strike_list(base, EXPIRACION)
-            self._digital_subscriptions.add(key)
-        except Exception as exc:
-            logging.debug("No se pudo suscribir strikes para %s (%s)", base, exc)
-
-    def _wait_result(
-        self,
-        api: SafeIQOption,
-        ticket: Tuple[str, str],
-    ) -> Tuple[Optional[str], float]:
-        trade_type, trade_id = ticket
-        timeout = EXPIRACION * 60 + 120
-        waited = 0
-        while waited < timeout and not self._stop.is_set():
-            try:
-                if trade_type == "digital":
-                    result, pnl = api.check_win_digital_v2(trade_id)
-                else:
-                    response = api.check_win_v3(trade_id)
-                    if response is None:
-                        time.sleep(1)
-                        waited += 1
-                        continue
-                    if isinstance(response, (list, tuple)) and len(response) >= 2:
-                        result, pnl = response[0], response[1]
-                    else:
-                        result, pnl = response, 0.0
-                if result is None:
-                    time.sleep(1)
-                    waited += 1
-                    continue
-                try:
-                    pnl_value = float(pnl)
-                except (TypeError, ValueError):
-                    pnl_value = 0.0
-                return result, pnl_value
-            except Exception as exc:
-                logging.debug("Error consultando resultado (%s)", exc)
-                if "need reconnect" in str(exc).lower():
-                    api.ensure_connection()
-                time.sleep(1)
-                waited += 1
-        logging.warning("Timeout esperando resultado %s", trade_id)
-        return None, 0.0
+            result, pnl = api.check_win_v3(ticket)
+        except Exception:
+            logging.exception("Error al consultar resultado de la operación")
+            return None, 0.0
+        try:
+            pnl_value = float(pnl)
+        except (TypeError, ValueError):
+            pnl_value = 0.0
+        return result, pnl_value
 
     @staticmethod
     def _normalize_result(value: str) -> str:
@@ -563,9 +437,9 @@ class BotWorker(QObject):
 
 
 class BotGUI(QWidget):
-    def __init__(self):
+    def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("IQ Option Digital/Binary Bot")
+        self.setWindowTitle("IQ Option Bot - OTC")
         self.resize(1000, 520)
 
         layout = QVBoxLayout(self)
@@ -573,19 +447,21 @@ class BotGUI(QWidget):
         layout.addWidget(self.label_status)
 
         self.table = QTableWidget(0, 11)
-        self.table.setHorizontalHeaderLabels([
-            "Par",
-            "RSI",
-            "EMA Fast",
-            "EMA Slow",
-            "MACD",
-            "MACD Señal",
-            "STK %K",
-            "STK %D",
-            "Señal",
-            "Resultado",
-            "PnL",
-        ])
+        self.table.setHorizontalHeaderLabels(
+            [
+                "Par",
+                "RSI",
+                "EMA Fast",
+                "EMA Slow",
+                "MACD",
+                "MACD Señal",
+                "STK %K",
+                "STK %D",
+                "Señal",
+                "Resultado",
+                "PnL",
+            ]
+        )
         layout.addWidget(self.table)
 
         self.label_pnl = QLabel("💰 PnL acumulado: 0.00", self)
@@ -682,8 +558,13 @@ class BotGUI(QWidget):
         for index, (key, fmt) in enumerate(columns, start=1):
             value = payload.get(key, "-")
             text = "-"
-            if isinstance(value, (int, float)) and not math.isnan(float(value)):
-                text = fmt.format(float(value))
+            if isinstance(value, (int, float)):
+                try:
+                    number = float(value)
+                except (TypeError, ValueError):
+                    number = math.nan
+                if not math.isnan(number):
+                    text = fmt.format(number)
             item = QTableWidgetItem(text)
             self.table.setItem(row, index, item)
         signal_text = str(payload.get("signal", "-"))
@@ -729,23 +610,23 @@ def create_splash() -> QSplashScreen:
     pixmap.fill(Qt.transparent)
     painter = QPainter(pixmap)
     gradient = QLinearGradient(0, 0, 0, height)
-    gradient.setColorAt(0.0, QColor(12, 38, 76))
-    gradient.setColorAt(1.0, QColor(5, 18, 40))
+    gradient.setColorAt(0.0, QColor(15, 40, 70))
+    gradient.setColorAt(1.0, QColor(6, 18, 38))
     painter.fillRect(pixmap.rect(), gradient)
     painter.setPen(QColor("#F5F5F5"))
     painter.setFont(QFont("Segoe UI", 26, QFont.Bold))
-    painter.drawText(pixmap.rect(), Qt.AlignHCenter | Qt.AlignTop, "\nIQ Option Digital/Binary Bot")
+    painter.drawText(pixmap.rect(), Qt.AlignHCenter | Qt.AlignTop, "\nIQ Option OTC Bot")
     painter.setFont(QFont("Segoe UI", 14))
     painter.drawText(
         pixmap.rect().adjusted(0, 90, 0, -120),
         Qt.AlignHCenter | Qt.AlignTop,
-        "Escáner de pares digitales/binarios con panel de PnL",
+        "Escáner de pares OTC con panel de PnL",
     )
     painter.setFont(QFont("Consolas", 11))
     painter.drawText(
         pixmap.rect().adjusted(0, 150, 0, -90),
         Qt.AlignHCenter | Qt.AlignTop,
-        "Preparando conexión y analizando indicadores...",
+        "Conectando con IQ Option y preparando indicadores...",
     )
     painter.end()
     splash = QSplashScreen(pixmap)
