@@ -501,6 +501,7 @@ class TradePair:
     instrument_type: str  # "digital" or "binary"
     candle_aliases: Tuple[Union[str, int], ...] = field(default_factory=tuple)
     trade_aliases: Tuple[str, ...] = field(default_factory=tuple)
+    digital_instrument_ids: Tuple[str, ...] = field(default_factory=tuple)
 
 
 class BotWorker(QObject):
@@ -517,6 +518,7 @@ class BotWorker(QObject):
         self._cooldowns: Dict[str, float] = {}
         self._fallas_temporales: Dict[str, int] = {}
         self._cooldown_notices: Dict[str, float] = {}
+        self._instrument_cache: Dict[Tuple[str, str, int], Optional[str]] = {}
 
     def stop(self):
         self._stop_event.set()
@@ -1121,6 +1123,49 @@ class BotWorker(QObject):
 
         return tuple(ordenados)
 
+    @staticmethod
+    def _extraer_instrument_ids(
+        info: Optional[Dict],
+        instrument_type: str,
+    ) -> Tuple[str, ...]:
+        if instrument_type != "digital" or not isinstance(info, dict):
+            return tuple()
+
+        candidatos: List[str] = []
+
+        def agregar(valor: Optional[Union[str, Iterable]]):
+            if isinstance(valor, str):
+                texto = valor.strip()
+                if texto and texto not in candidatos:
+                    candidatos.append(texto)
+            elif isinstance(valor, (list, tuple, set)):
+                for item in valor:
+                    agregar(item)
+            elif isinstance(valor, dict):
+                for clave in ("instrument_id", "instrumentId", "id", "value", "spot_id"):
+                    if clave in valor:
+                        agregar(valor.get(clave))
+
+        for clave in (
+            "instrument_id",
+            "instrumentId",
+            "id",
+            "value",
+            "spot_id",
+        ):
+            agregar(info.get(clave))
+
+        for clave in (
+            "instruments",
+            "available_instruments",
+            "instrument_ids",
+            "items",
+            "list",
+        ):
+            agregar(info.get(clave))
+
+        return tuple(candidatos)
+
     def _descubrir_pares(self, iq) -> List[TradePair]:
         try:
             activos = iq.get_all_open_time()
@@ -1183,6 +1228,7 @@ class BotWorker(QObject):
                 tipo,
                 active_id,
             )
+            instrument_ids = self._extraer_instrument_ids(info, tipo)
             candidates[display] = TradePair(
                 display=display,
                 api_symbol=api_symbol,
@@ -1190,6 +1236,7 @@ class BotWorker(QObject):
                 instrument_type=tipo,
                 candle_aliases=aliases,
                 trade_aliases=trade_aliases,
+                digital_instrument_ids=instrument_ids,
             )
 
         activos_validos = list(candidates.values())
@@ -1288,6 +1335,11 @@ class BotWorker(QObject):
             if not trade_aliases:
                 trade_aliases = (base,)
 
+            instrument_ids = self._extraer_instrument_ids(
+                info if isinstance(info, dict) else {},
+                tipo,
+            )
+
             candidatos[display] = TradePair(
                 display=display,
                 api_symbol=base,
@@ -1295,6 +1347,7 @@ class BotWorker(QObject):
                 instrument_type=tipo,
                 candle_aliases=aliases,
                 trade_aliases=trade_aliases,
+                digital_instrument_ids=instrument_ids,
             )
 
         return list(candidatos.values())
@@ -1514,6 +1567,119 @@ class BotWorker(QObject):
 
         return signal, snapshot.to_table_payload(signal)
 
+    def _resolver_instrumento_digital(
+        self,
+        iq,
+        par: TradePair,
+        alias: str,
+    ) -> Optional[str]:
+        candidato = (alias or "").strip()
+        if not candidato:
+            return None
+
+        cache_key = (par.display, candidato.upper(), EXPIRACION)
+        if cache_key in self._instrument_cache:
+            return self._instrument_cache[cache_key]
+
+        posibles: List[str] = []
+
+        def agregar(valor: Optional[str]) -> None:
+            if not isinstance(valor, str):
+                return
+            texto = valor.strip()
+            if texto and texto not in posibles:
+                posibles.append(texto)
+
+        agregar(candidato)
+        if candidato.lower().startswith("do") and len(candidato) > 2:
+            agregar(candidato[2:])
+
+        sanitizado = _sanitize_symbol_name(candidato)
+        agregar(sanitizado)
+
+        if sanitizado and not sanitizado.endswith("-OTC"):
+            agregar(f"{sanitizado}-OTC")
+
+        if candidato.endswith("-OTC"):
+            agregar(candidato[:-4])
+
+        for posible in posibles:
+            try:
+                resultado = iq.get_digital_spot_instrument(posible, EXPIRACION)
+            except AttributeError:
+                self._instrument_cache[cache_key] = None
+                return None
+            except Exception as exc:
+                logging.debug(
+                    "No se pudo obtener instrument_id para %s alias %s: %s",
+                    par.display,
+                    posible,
+                    exc,
+                )
+                continue
+
+            instrument_id = None
+            if isinstance(resultado, dict):
+                instrument_id = (
+                    resultado.get("instrument_id")
+                    or resultado.get("instrumentId")
+                    or resultado.get("id")
+                    or resultado.get("value")
+                )
+                if not instrument_id:
+                    for clave in ("result", "instrument", "data"):
+                        nested = resultado.get(clave)
+                        if isinstance(nested, dict):
+                            instrument_id = (
+                                nested.get("instrument_id")
+                                or nested.get("instrumentId")
+                                or nested.get("id")
+                                or nested.get("value")
+                            )
+                            if instrument_id:
+                                break
+                        elif isinstance(nested, (list, tuple)):
+                            for item in nested:
+                                if isinstance(item, dict):
+                                    instrument_id = (
+                                        item.get("instrument_id")
+                                        or item.get("instrumentId")
+                                        or item.get("id")
+                                        or item.get("value")
+                                    )
+                                    if instrument_id:
+                                        break
+                            if instrument_id:
+                                break
+            elif isinstance(resultado, (list, tuple)):
+                for item in resultado:
+                    if isinstance(item, dict):
+                        instrument_id = (
+                            item.get("instrument_id")
+                            or item.get("instrumentId")
+                            or item.get("id")
+                            or item.get("value")
+                        )
+                        if instrument_id:
+                            break
+                    elif isinstance(item, str):
+                        instrument_id = item
+                        break
+
+            if isinstance(instrument_id, str) and instrument_id.strip():
+                instrument_id = instrument_id.strip()
+                self._instrument_cache[cache_key] = instrument_id
+                logging.debug(
+                    "Instrumento digital resuelto para %s usando %s -> %s",
+                    par.display,
+                    posible,
+                    instrument_id,
+                )
+                return instrument_id
+
+        self._instrument_cache[cache_key] = None
+        return None
+
     def _ejecutar_operacion(
         self, iq, par: TradePair, senal: str
     ) -> Tuple[bool, Optional[Tuple[str, Union[int, str]]]]:
@@ -1526,8 +1692,42 @@ class BotWorker(QObject):
             while intento < 2:
                 try:
                     if par.instrument_type == "digital":
-                        ok, op_id = iq.buy_digital_spot(alias, MONTO, senal, EXPIRACION)
+                        candidatos_instrumento: List[str] = [
+                            instrumento.strip()
+                            for instrumento in par.digital_instrument_ids
+                            if isinstance(instrumento, str) and instrumento.strip()
+                        ]
+
+                        if not candidatos_instrumento:
+                            instrument_id = self._resolver_instrumento_digital(iq, par, alias)
+                            if instrument_id:
+                                candidatos_instrumento.append(instrument_id)
+
+                        ok = False
+                        op_id: Optional[Union[int, str]] = None
                         tipo = "digital"
+
+                        for instrument_id in candidatos_instrumento:
+                            try:
+                                ok, op_id = iq.buy_digital_spot(
+                                    instrument_id,
+                                    MONTO,
+                                    senal,
+                                    EXPIRACION,
+                                )
+                            except Exception as exc:
+                                logging.debug(
+                                    "Error al ejecutar digital en %s con instrument_id %s: %s",
+                                    par.display,
+                                    instrument_id,
+                                    exc,
+                                )
+                                ok, op_id = False, None
+                                continue
+
+                            if ok and op_id not in (None, ""):
+                                break
+
                         if not ok or op_id in (None, ""):
                             logging.debug(
                                 "Digital rechazado en %s con alias %s; se intentará versión binaria.",
