@@ -3,9 +3,9 @@ import time
 import math
 import logging
 from dataclasses import dataclass
-from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 from datetime import datetime
 from textwrap import dedent
+from typing import Dict, Iterable, List, Optional, Sequence, Tuple
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 
@@ -104,16 +104,25 @@ OTC_FALLBACK = (
     "CADJPY-OTC",
 )
 
+BINARY_FALLBACK = (
+    "EURUSD",
+    "GBPUSD",
+    "USDJPY",
+    "AUDUSD",
+    "USDCHF",
+    "USDCAD",
+    "EURJPY",
+    "EURGBP",
+    "GBPJPY",
+    "AUDCAD",
+)
+
 
 def _sanitize(symbol: Optional[str]) -> Optional[str]:
     if not symbol or not isinstance(symbol, str):
         return None
     cleaned = symbol.strip().upper()
-    if "OTC" not in cleaned:
-        return None
-    if not cleaned.endswith("-OTC"):
-        cleaned = f"{cleaned}-OTC"
-    return cleaned
+    return cleaned or None
 
 
 class SafeIQOption(IQ_Option):
@@ -152,9 +161,10 @@ class TradeResult:
 
 
 @dataclass
-class OtcPair:
+class TradePair:
     name: str
     active_id: Optional[int]
+    instrument_type: str
     aliases: Tuple[str, ...]
 
 
@@ -165,17 +175,19 @@ def _format(value: float, precision: int) -> str:
 
 
 def _alias_variations(symbol: str) -> List[str]:
-    base = symbol.strip().upper()
+    base = symbol.strip()
     if not base:
         return []
-
-    variants = [base]
-    compact_slash = base.replace("/", "")
-    if compact_slash and compact_slash not in variants:
-        variants.append(compact_slash)
-    compact_dash = base.replace("-", "")
-    if compact_dash and compact_dash not in variants:
-        variants.append(compact_dash)
+    variants: List[str] = []
+    for candidate in {base.upper(), base.lower()}:
+        if candidate and candidate not in variants:
+            variants.append(candidate)
+        compact_slash = candidate.replace("/", "")
+        if compact_slash and compact_slash not in variants:
+            variants.append(compact_slash)
+        compact_dash = candidate.replace("-", "")
+        if compact_dash and compact_dash not in variants:
+            variants.append(compact_dash)
     return variants
 
 
@@ -192,7 +204,7 @@ def _build_aliases(symbol: str, info: Optional[Dict]) -> Tuple[str, ...]:
                 for variant in _alias_variations(normalized):
                     if variant not in aliases:
                         aliases.append(variant)
-    deduped = []
+    deduped: List[str] = []
     for alias in aliases:
         if alias not in deduped:
             deduped.append(alias)
@@ -215,23 +227,23 @@ def _tables_to_update(api: SafeIQOption) -> List[Dict]:
 def _register_symbol(api: SafeIQOption, alias: str, active_id: Optional[int]) -> None:
     if not active_id:
         return
-    alias_upper = alias.upper()
-    for table in _tables_to_update(api):
-        if not table:
-            table[alias_upper] = {"id": active_id, "name": alias_upper}
-            continue
-        sample_key = next(iter(table.keys()))
-        if isinstance(sample_key, str):
-            value = table.get(alias_upper)
-            if isinstance(value, dict):
-                value["id"] = active_id
-                value.setdefault("name", alias_upper)
-            elif isinstance(value, int):
-                table[alias_upper] = active_id
-            else:
-                table[alias_upper] = {"id": active_id, "name": alias_upper}
-        elif isinstance(sample_key, int):
-            table[active_id] = alias_upper
+    for candidate in {alias.upper(), alias.lower()}:
+        for table in _tables_to_update(api):
+            if not table:
+                table[candidate] = {"id": active_id, "name": candidate}
+                continue
+            sample_key = next(iter(table.keys()))
+            if isinstance(sample_key, str):
+                value = table.get(candidate)
+                if isinstance(value, dict):
+                    value["id"] = active_id
+                    value.setdefault("name", candidate)
+                elif isinstance(value, int):
+                    table[candidate] = active_id
+                else:
+                    table[candidate] = {"id": active_id, "name": candidate}
+            elif isinstance(sample_key, int):
+                table[active_id] = candidate
 
 
 def _lookup_active_id(api: SafeIQOption, alias: str) -> Optional[int]:
@@ -248,8 +260,8 @@ def _lookup_active_id(api: SafeIQOption, alias: str) -> Optional[int]:
     return None
 
 
-def _iter_open_otc(payload: Dict) -> Iterable[Tuple[str, Dict]]:
-    for category in ("turbo", "binary", "digital"):
+def _iter_open_pairs(payload: Dict) -> Iterable[Tuple[str, Dict, str]]:
+    for category in ("turbo", "binary"):
         entries = payload.get(category, {})
         if not isinstance(entries, dict):
             continue
@@ -261,30 +273,36 @@ def _iter_open_otc(payload: Dict) -> Iterable[Tuple[str, Dict]]:
             normalized = _sanitize(symbol)
             if not normalized:
                 continue
-            yield normalized, info
+            instrument_type = "otc" if "OTC" in normalized else "binary"
+            yield normalized, info, instrument_type
 
 
-def _discover_otc_pairs(api: SafeIQOption) -> List[OtcPair]:
+def _discover_pairs(api: SafeIQOption) -> List[TradePair]:
     try:
         schedule = api.get_all_open_time()
     except Exception:
         logging.exception("No se pudieron obtener los horarios de activos")
         schedule = {}
-    pairs: Dict[str, OtcPair] = {}
-    for symbol, info in _iter_open_otc(schedule):
+    pairs: Dict[Tuple[str, str], TradePair] = {}
+    for symbol, info, instrument_type in _iter_open_pairs(schedule):
         active_id = info.get("id") or info.get("active_id")
         try:
             active_id_int = int(active_id) if active_id is not None else None
         except (TypeError, ValueError):
             active_id_int = None
         aliases = _build_aliases(symbol, info)
-        pairs.setdefault(symbol, OtcPair(symbol, active_id_int, aliases))
+        key = (symbol, instrument_type)
+        pairs[key] = TradePair(symbol, active_id_int, instrument_type, aliases)
     if not pairs:
-        logging.warning("No se detectaron pares OTC abiertos; se usa respaldo estático")
+        logging.warning("No se detectaron pares abiertos en la API; se usan respaldos")
         for symbol in OTC_FALLBACK:
             aliases = _build_aliases(symbol, None)
             active_id = _lookup_active_id(api, symbol)
-            pairs.setdefault(symbol, OtcPair(symbol, active_id, aliases))
+            pairs[(symbol, "otc")] = TradePair(symbol, active_id, "otc", aliases)
+        for symbol in BINARY_FALLBACK:
+            aliases = _build_aliases(symbol, None)
+            active_id = _lookup_active_id(api, symbol)
+            pairs[(symbol, "binary")] = TradePair(symbol, active_id, "binary", aliases)
     return list(pairs.values())
 
 
@@ -305,7 +323,7 @@ def _build_dataframe(candles: Sequence[Dict]) -> pd.DataFrame:
     return pd.DataFrame()
 
 
-def _fetch_candles(api: SafeIQOption, pair: OtcPair, count: int = 120) -> pd.DataFrame:
+def _fetch_candles(api: SafeIQOption, pair: TradePair, count: int = 120) -> pd.DataFrame:
     active_id = _ensure_active_id(api, pair)
     for alias in pair.aliases[:3]:
         _register_symbol(api, alias, active_id)
@@ -401,7 +419,7 @@ def _compute_signal(df: pd.DataFrame) -> Tuple[Optional[str], IndicatorSnapshot]
     return signal, snapshot
 
 
-def _ensure_active_id(api: SafeIQOption, pair: OtcPair) -> Optional[int]:
+def _ensure_active_id(api: SafeIQOption, pair: TradePair) -> Optional[int]:
     if pair.active_id is None:
         for alias in pair.aliases:
             candidate = _lookup_active_id(api, alias)
@@ -477,14 +495,14 @@ class BotWorker(QObject):
                     f"🔁 Ciclo {cycle}/{CICLOS} | PnL acumulado: {self._pnl:.2f}"
                 )
 
-                pairs = _discover_otc_pairs(api)
+                pairs = _discover_pairs(api)
                 if not pairs:
-                    self.status_changed.emit("⚠️ No se detectaron pares OTC disponibles en este ciclo")
+                    self.status_changed.emit("⚠️ No se detectaron pares disponibles en este ciclo")
                     time.sleep(ESPERA_ENTRE_CICLOS)
                     continue
 
                 listado = ", ".join(pair.name for pair in pairs)
-                logging.debug("Pares OTC ciclo %s: %s", cycle, listado)
+                logging.debug("Pares ciclo %s: %s", cycle, listado)
 
                 if self._failures:
                     for nombre, valor in list(self._failures.items()):
@@ -569,7 +587,7 @@ class BotWorker(QObject):
 class BotGUI(QWidget):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("IQ Option Bot - OTC Monitor")
+        self.setWindowTitle("IQ Option Bot - Binary & OTC Monitor")
         self.resize(1000, 520)
 
         layout = QVBoxLayout(self)
@@ -737,13 +755,13 @@ def create_splash() -> QSplashScreen:
 
     painter.setPen(QColor("#F5F5F5"))
     painter.setFont(QFont("Segoe UI", 26, QFont.Bold))
-    painter.drawText(pixmap.rect(), Qt.AlignHCenter | Qt.AlignTop, "\nIQ Option OTC Bot")
+    painter.drawText(pixmap.rect(), Qt.AlignHCenter | Qt.AlignTop, "\nIQ Option Binary/OTC Bot")
 
     painter.setFont(QFont("Segoe UI", 14))
     painter.drawText(
         pixmap.rect().adjusted(0, 90, 0, -140),
         Qt.AlignHCenter | Qt.AlignTop,
-        "Escáner y monitor de operaciones OTC",
+        "Escáner y monitor de operaciones",
     )
 
     painter.setFont(QFont("Consolas", 11))
