@@ -164,6 +164,26 @@ class TradePair:
     is_otc: bool
 
 
+@dataclass
+class TradeResult:
+    ticket: str
+    pnl: float
+    outcome: str
+
+
+@dataclass
+class PendingTrade:
+    pair: str
+    signal: str
+    ticket: str
+    placed_at: float
+    expiry_minutes: int
+
+    @property
+    def deadline(self) -> float:
+        return self.placed_at + self.expiry_minutes * 60 + 120
+
+
 def _fmt(value: float, precision: int) -> str:
     if math.isnan(value):
         return "-"
@@ -416,32 +436,22 @@ def _compute_signal(df: pd.DataFrame) -> Tuple[Optional[str], IndicatorSnapshot]
     return signal, snapshot
 
 
-def _wait_result(api: SafeIQOption, ticket: str) -> TradeResult:
-    timeout = EXPIRACION * 60 + 120
-    waited = 0
-    while waited < timeout:
-        try:
-            result, pnl = api.check_win_v3(ticket)
-        except Exception as exc:
-            message = str(exc).lower()
-            if "need reconnect" in message and api.ensure_connection():
-                time.sleep(1)
-                waited += 1
-                continue
-            logging.warning("Error consultando resultado %s: %s", ticket, exc)
-            time.sleep(1)
-            waited += 1
-            continue
-        if result is not None:
-            try:
-                pnl_value = float(pnl)
-            except (TypeError, ValueError):
-                pnl_value = 0.0
-            return TradeResult(ticket, pnl_value, result)
-        time.sleep(1)
-        waited += 1
-    logging.warning("Timeout esperando resultado para %s", ticket)
-    return TradeResult(ticket, 0.0, "unknown")
+def _check_result_once(api: SafeIQOption, ticket: str) -> Optional[TradeResult]:
+    try:
+        result, pnl = api.check_win_v3(ticket)
+    except Exception as exc:
+        message = str(exc).lower()
+        if "need reconnect" in message and api.ensure_connection():
+            return None
+        logging.warning("Error consultando resultado %s: %s", ticket, exc)
+        return None
+    if result is None:
+        return None
+    try:
+        pnl_value = float(pnl)
+    except (TypeError, ValueError):
+        pnl_value = 0.0
+    return TradeResult(ticket, pnl_value, result)
 
 
 class BotWorker(QObject):
@@ -455,9 +465,57 @@ class BotWorker(QObject):
         self._stop = False
         self._pnl = 0.0
         self._failures: Dict[str, int] = {}
+        self._pending: Dict[str, PendingTrade] = {}
 
     def stop(self) -> None:
         self._stop = True
+
+    def _poll_pending(self, api: SafeIQOption) -> None:
+        if not self._pending:
+            return
+        now = time.time()
+        for ticket, pending in list(self._pending.items()):
+            result = _check_result_once(api, ticket)
+            if result is None:
+                if now >= pending.deadline:
+                    logging.warning("Timeout esperando resultado para %s", ticket)
+                    timeout_result = TradeResult(ticket, 0.0, "unknown")
+                    self._pending.pop(ticket, None)
+                    self._finalize_trade(pending, timeout_result)
+                continue
+            self._pending.pop(ticket, None)
+            self._finalize_trade(pending, result)
+
+    def _finalize_trade(self, pending: PendingTrade, result: TradeResult) -> None:
+        outcome = result.outcome.upper() if result.outcome else "UNKNOWN"
+        pnl = result.pnl
+
+        if outcome == "WIN":
+            self._pnl += pnl
+        elif outcome in {"LOSS", "LOOSE", "LOST"}:
+            self._pnl += pnl
+            outcome = "LOST"
+        elif outcome == "EQUAL":
+            self._pnl += pnl
+        else:
+            logging.warning("Resultado desconocido para %s: %s", pending.pair, outcome)
+
+        mensaje = (
+            f"{outcome} en {pending.pair} | PnL operación: {pnl:.2f} | PnL acumulado: {self._pnl:.2f}"
+        )
+        logging.info(mensaje)
+        self.status_changed.emit(mensaje)
+        self.trade_completed.emit(pending.pair, outcome, pnl, self._pnl)
+
+    def _sleep_with_pending(self, api: SafeIQOption, duration: float) -> None:
+        deadline = time.time() + max(duration, 0)
+        while not self._stop and time.time() < deadline:
+            self._poll_pending(api)
+            remaining = deadline - time.time()
+            if remaining <= 0:
+                break
+            time.sleep(min(1.0, remaining))
+        self._poll_pending(api)
 
     def run(self) -> None:
         self.status_changed.emit("🔌 Conectando a IQ Option...")
@@ -490,7 +548,7 @@ class BotWorker(QObject):
                 pairs = _discover_pairs(api)
                 if not pairs:
                     self.status_changed.emit("⚠️ No se detectaron pares disponibles en este ciclo")
-                    time.sleep(ESPERA_ENTRE_CICLOS)
+                    self._sleep_with_pending(api, ESPERA_ENTRE_CICLOS)
                     continue
 
                 for name in list(self._failures.keys()):
@@ -501,6 +559,8 @@ class BotWorker(QObject):
                 for pair in pairs:
                     if self._stop:
                         break
+
+                    self._poll_pending(api)
 
                     failures = self._failures.get(pair.name, 0)
                     if failures >= 3:
@@ -528,32 +588,20 @@ class BotWorker(QObject):
                         continue
 
                     logging.info("[OK] %s en %s (ticket=%s)", signal.upper(), pair.name, ticket)
-                    result = _wait_result(api, ticket)
-                    outcome = result.outcome.upper() if result.outcome else "UNKNOWN"
-                    pnl = result.pnl
-
-                    if outcome == "WIN":
-                        self._pnl += pnl
-                    elif outcome in {"LOSS", "LOOSE", "LOST"}:
-                        self._pnl += pnl
-                        outcome = "LOST"
-                    elif outcome == "EQUAL":
-                        self._pnl += pnl
-                    else:
-                        logging.warning("Resultado desconocido para %s: %s", pair.name, outcome)
-
-                    mensaje = (
-                        f"{outcome} en {pair.name} | PnL operación: {pnl:.2f} | PnL acumulado: {self._pnl:.2f}"
+                    self._pending[ticket] = PendingTrade(
+                        pair=pair.name,
+                        signal=signal,
+                        ticket=ticket,
+                        placed_at=time.time(),
+                        expiry_minutes=EXPIRACION,
                     )
-                    logging.info(mensaje)
-                    self.status_changed.emit(mensaje)
-                    self.trade_completed.emit(pair.name, outcome, pnl, self._pnl)
                     time.sleep(1)
+                    self._poll_pending(api)
 
                 if self._stop:
                     break
 
-                time.sleep(ESPERA_ENTRE_CICLOS)
+                self._sleep_with_pending(api, ESPERA_ENTRE_CICLOS)
         finally:
             try:
                 api.close()
