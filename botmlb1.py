@@ -13,7 +13,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(mes
 def _ensure_dependency(module: str, pip_name: Optional[str] = None) -> None:
     try:
         __import__(module)
-    except ImportError:
+    except ImportError:  # pragma: no cover - runtime guard
         package = pip_name or module
         message = dedent(
             f"""
@@ -54,6 +54,43 @@ from iqoptionapi import constants as iq_constants  # noqa: E402
 from iqoptionapi.stable_api import IQ_Option  # noqa: E402
 
 
+EMAIL = "fornerinoalejandro031@gmail.com"
+PASSWORD = "484572ale"
+MODO = "PRACTICE"
+MONTO = 1.0
+EXPIRACION = 1
+ESPERA_ENTRE_CICLOS = 3
+CICLOS = 50
+
+BINARY_FALLBACK = (
+    "EURUSD",
+    "GBPUSD",
+    "USDJPY",
+    "AUDUSD",
+    "USDCHF",
+    "USDCAD",
+    "EURJPY",
+    "EURGBP",
+    "GBPJPY",
+    "AUDCAD",
+)
+
+OTC_FALLBACK = (
+    "EURUSD-OTC",
+    "GBPUSD-OTC",
+    "USDJPY-OTC",
+    "AUDUSD-OTC",
+    "USDCHF-OTC",
+    "USDCAD-OTC",
+    "EURJPY-OTC",
+    "EURGBP-OTC",
+    "GBPJPY-OTC",
+    "AUDCAD-OTC",
+    "NZDUSD-OTC",
+    "CADJPY-OTC",
+)
+
+
 def _patch_digital_underlying() -> None:
     original = IQ_Option.get_digital_underlying_list_data
 
@@ -81,53 +118,19 @@ def _patch_digital_underlying() -> None:
 
 _patch_digital_underlying()
 
-EMAIL = "fornerinoalejandro031@gmail.com"
-PASSWORD = "484572ale"
-MODO = "PRACTICE"
-MONTO = 1.0
-EXPIRACION = 1
-ESPERA_ENTRE_CICLOS = 3
-CICLOS = 50
-
-OTC_FALLBACK = (
-    "EURUSD-OTC",
-    "GBPUSD-OTC",
-    "USDJPY-OTC",
-    "AUDUSD-OTC",
-    "USDCHF-OTC",
-    "USDCAD-OTC",
-    "EURJPY-OTC",
-    "EURGBP-OTC",
-    "GBPJPY-OTC",
-    "AUDCAD-OTC",
-    "NZDUSD-OTC",
-    "CADJPY-OTC",
-)
-
-BINARY_FALLBACK = (
-    "EURUSD",
-    "GBPUSD",
-    "USDJPY",
-    "AUDUSD",
-    "USDCHF",
-    "USDCAD",
-    "EURJPY",
-    "EURGBP",
-    "GBPJPY",
-    "AUDCAD",
-)
-
-
-def _sanitize(symbol: Optional[str]) -> Optional[str]:
-    if not symbol or not isinstance(symbol, str):
-        return None
-    cleaned = symbol.strip().upper()
-    return cleaned or None
-
 
 class SafeIQOption(IQ_Option):
-    def get_candles(self, *args, **kwargs):  # pragma: no cover
-        return super().get_candles(*args, **kwargs)
+    def ensure_connection(self) -> bool:
+        try:
+            status, reason = self.connect()
+        except Exception as exc:  # pragma: no cover
+            logging.error("Error reconectando con el broker: %s", exc)
+            return False
+        if not status:
+            logging.error("No fue posible reconectar: %s", reason)
+            return False
+        self.change_balance(MODO)
+        return True
 
 
 @dataclass
@@ -142,73 +145,55 @@ class IndicatorSnapshot:
 
     def to_row(self, signal: Optional[str]) -> Dict[str, str]:
         return {
-            "rsi": _format(self.rsi, 1),
-            "ema_fast": _format(self.ema_fast, 5),
-            "ema_slow": _format(self.ema_slow, 5),
-            "macd": _format(self.macd, 5),
-            "macd_signal": _format(self.macd_signal, 5),
-            "stoch_k": _format(self.stoch_k, 1),
-            "stoch_d": _format(self.stoch_d, 1),
+            "rsi": _fmt(self.rsi, 1),
+            "ema_fast": _fmt(self.ema_fast, 5),
+            "ema_slow": _fmt(self.ema_slow, 5),
+            "macd": _fmt(self.macd, 5),
+            "macd_signal": _fmt(self.macd_signal, 5),
+            "stoch_k": _fmt(self.stoch_k, 1),
+            "stoch_d": _fmt(self.stoch_d, 1),
             "signal": signal or "-",
         }
-
-
-@dataclass
-class TradeResult:
-    ticket: str
-    pnl: float
-    outcome: str
 
 
 @dataclass
 class TradePair:
     name: str
     active_id: Optional[int]
-    instrument_type: str
     aliases: Tuple[str, ...]
+    is_otc: bool
 
 
-def _format(value: float, precision: int) -> str:
+def _fmt(value: float, precision: int) -> str:
     if math.isnan(value):
         return "-"
     return f"{value:.{precision}f}"
+
+
+def _sanitize(symbol: Optional[str]) -> Optional[str]:
+    if not symbol or not isinstance(symbol, str):
+        return None
+    cleaned = symbol.strip().upper()
+    if not cleaned:
+        return None
+    return cleaned
+
+
+def _is_otc(symbol: str) -> bool:
+    return "OTC" in symbol.upper()
 
 
 def _alias_variations(symbol: str) -> List[str]:
     base = symbol.strip()
     if not base:
         return []
-    variants: List[str] = []
-    for candidate in {base.upper(), base.lower()}:
-        if candidate and candidate not in variants:
-            variants.append(candidate)
-        compact_slash = candidate.replace("/", "")
-        if compact_slash and compact_slash not in variants:
-            variants.append(compact_slash)
-        compact_dash = candidate.replace("-", "")
-        if compact_dash and compact_dash not in variants:
-            variants.append(compact_dash)
-    return variants
-
-
-def _build_aliases(symbol: str, info: Optional[Dict]) -> Tuple[str, ...]:
-    aliases: List[str] = []
-    base = _sanitize(symbol)
-    if base:
-        aliases.extend(_alias_variations(base))
-    if isinstance(info, dict):
-        for key in ("symbol", "active", "underlying", "asset_name", "name", "ticker"):
-            value = info.get(key)
-            normalized = _sanitize(value)
-            if normalized:
-                for variant in _alias_variations(normalized):
-                    if variant not in aliases:
-                        aliases.append(variant)
-    deduped: List[str] = []
-    for alias in aliases:
-        if alias not in deduped:
-            deduped.append(alias)
-    return tuple(deduped or ([symbol.upper()]))
+    variants = {base, base.upper(), base.lower()}
+    variants.update({base.replace("/", ""), base.replace("-", "")})
+    upper = base.upper()
+    variants.update({upper.replace("/", ""), upper.replace("-", "")})
+    lower = base.lower()
+    variants.update({lower.replace("/", ""), lower.replace("-", "")})
+    return [variant for variant in variants if variant]
 
 
 def _tables_to_update(api: SafeIQOption) -> List[Dict]:
@@ -227,18 +212,18 @@ def _tables_to_update(api: SafeIQOption) -> List[Dict]:
 def _register_symbol(api: SafeIQOption, alias: str, active_id: Optional[int]) -> None:
     if not active_id:
         return
-    for candidate in {alias.upper(), alias.lower()}:
+    for candidate in _alias_variations(alias):
         for table in _tables_to_update(api):
             if not table:
-                table[candidate] = {"id": active_id, "name": candidate}
+                table[candidate.upper()] = {"id": active_id, "name": candidate.upper()}
                 continue
             sample_key = next(iter(table.keys()))
             if isinstance(sample_key, str):
-                value = table.get(candidate)
-                if isinstance(value, dict):
-                    value["id"] = active_id
-                    value.setdefault("name", candidate)
-                elif isinstance(value, int):
+                entry = table.get(candidate)
+                if isinstance(entry, dict):
+                    entry["id"] = active_id
+                    entry.setdefault("name", candidate)
+                elif isinstance(entry, int):
                     table[candidate] = active_id
                 else:
                     table[candidate] = {"id": active_id, "name": candidate}
@@ -247,34 +232,19 @@ def _register_symbol(api: SafeIQOption, alias: str, active_id: Optional[int]) ->
 
 
 def _lookup_active_id(api: SafeIQOption, alias: str) -> Optional[int]:
-    alias_upper = alias.upper()
-    for table in _tables_to_update(api):
-        if isinstance(table, dict):
-            value = table.get(alias_upper)
+    for candidate in _alias_variations(alias):
+        candidate_upper = candidate.upper()
+        for table in _tables_to_update(api):
+            if not isinstance(table, dict):
+                continue
+            value = table.get(candidate_upper) or table.get(candidate)
             if isinstance(value, dict):
-                candidate = value.get("id")
-                if isinstance(candidate, int):
-                    return candidate
+                candidate_id = value.get("id")
+                if isinstance(candidate_id, int):
+                    return candidate_id
             elif isinstance(value, int):
                 return value
     return None
-
-
-def _iter_open_pairs(payload: Dict) -> Iterable[Tuple[str, Dict, str]]:
-    for category in ("turbo", "binary"):
-        entries = payload.get(category, {})
-        if not isinstance(entries, dict):
-            continue
-        for symbol, info in entries.items():
-            if not isinstance(info, dict):
-                continue
-            if info.get("open") is False or info.get("enabled") is False:
-                continue
-            normalized = _sanitize(symbol)
-            if not normalized:
-                continue
-            instrument_type = "otc" if "OTC" in normalized else "binary"
-            yield normalized, info, instrument_type
 
 
 def _discover_pairs(api: SafeIQOption) -> List[TradePair]:
@@ -283,27 +253,53 @@ def _discover_pairs(api: SafeIQOption) -> List[TradePair]:
     except Exception:
         logging.exception("No se pudieron obtener los horarios de activos")
         schedule = {}
-    pairs: Dict[Tuple[str, str], TradePair] = {}
-    for symbol, info, instrument_type in _iter_open_pairs(schedule):
-        active_id = info.get("id") or info.get("active_id")
-        try:
-            active_id_int = int(active_id) if active_id is not None else None
-        except (TypeError, ValueError):
-            active_id_int = None
-        aliases = _build_aliases(symbol, info)
-        key = (symbol, instrument_type)
-        pairs[key] = TradePair(symbol, active_id_int, instrument_type, aliases)
-    if not pairs:
-        logging.warning("No se detectaron pares abiertos en la API; se usan respaldos")
-        for symbol in OTC_FALLBACK:
-            aliases = _build_aliases(symbol, None)
-            active_id = _lookup_active_id(api, symbol)
-            pairs[(symbol, "otc")] = TradePair(symbol, active_id, "otc", aliases)
+
+    discovered: Dict[str, TradePair] = {}
+
+    def register(symbol: str, info: Optional[Dict], default_otc: Optional[bool] = None) -> None:
+        normalized = _sanitize(symbol)
+        if not normalized:
+            return
+        is_otc = _is_otc(normalized) if default_otc is None else default_otc
+        aliases = tuple(_alias_variations(normalized))
+        active_id = None
+        if isinstance(info, dict):
+            raw_id = info.get("id") or info.get("active_id")
+            try:
+                active_id = int(raw_id) if raw_id is not None else None
+            except (TypeError, ValueError):
+                active_id = None
+        if active_id is None:
+            active_id = _lookup_active_id(api, normalized)
+        discovered.setdefault(normalized, TradePair(normalized, active_id, aliases, is_otc))
+
+    if isinstance(schedule, dict):
+        for category in ("turbo", "binary"):
+            entries = schedule.get(category, {})
+            if not isinstance(entries, dict):
+                continue
+            for symbol, info in entries.items():
+                if not isinstance(info, dict):
+                    continue
+                if info.get("open") is False or info.get("enabled") is False:
+                    continue
+                register(symbol, info)
+
+    if isinstance(schedule, dict):
+        for symbol, info in schedule.get("digital", {}).items():
+            if not isinstance(info, dict):
+                continue
+            if info.get("open") is False or info.get("enabled") is False:
+                continue
+            register(symbol, info)
+
+    if not discovered:
         for symbol in BINARY_FALLBACK:
-            aliases = _build_aliases(symbol, None)
-            active_id = _lookup_active_id(api, symbol)
-            pairs[(symbol, "binary")] = TradePair(symbol, active_id, "binary", aliases)
-    return list(pairs.values())
+            register(symbol, None, default_otc=False)
+        for symbol in OTC_FALLBACK:
+            register(symbol, None, default_otc=True)
+
+    return list(discovered.values())
 
 
 def _build_dataframe(candles: Sequence[Dict]) -> pd.DataFrame:
@@ -319,52 +315,53 @@ def _build_dataframe(candles: Sequence[Dict]) -> pd.DataFrame:
             mapping = dict(zip(columns, ("open", "high", "low", "close")))
             frame = df[list(columns)].rename(columns=mapping)
             frame = frame.apply(pd.to_numeric, errors="coerce").dropna()
-            return frame
+            if not frame.empty:
+                return frame
     return pd.DataFrame()
 
 
 def _fetch_candles(api: SafeIQOption, pair: TradePair, count: int = 120) -> pd.DataFrame:
-    active_id = _ensure_active_id(api, pair)
-    for alias in pair.aliases[:3]:
-        _register_symbol(api, alias, active_id)
-
+    active_id = pair.active_id
     if active_id is not None:
         try:
             payload = api.get_candles(active_id, 60, count, time.time())
         except Exception as exc:
-            logging.debug("Error obteniendo velas por id %s (%s): %s", pair.name, active_id, exc)
-        else:
-            candles = payload.get("candles") if isinstance(payload, dict) else payload
-            if isinstance(candles, list):
-                df = _build_dataframe(candles)
-                if not df.empty:
-                    return df
+            message = str(exc).lower()
+            if "need reconnect" in message and api.ensure_connection():
+                payload = api.get_candles(active_id, 60, count, time.time())
+            else:
+                payload = None
+        if isinstance(payload, dict):
+            payload = payload.get("candles") or payload.get("data")
+        if isinstance(payload, list):
+            df = _build_dataframe(payload)
+            if not df.empty:
+                return df
 
     for alias in pair.aliases[:3]:
+        _register_symbol(api, alias, pair.active_id)
         try:
             payload = api.get_candles(alias, 60, count, time.time())
         except Exception as exc:
             message = str(exc).lower()
             if "not found on consts" in message:
-                active_id = _ensure_active_id(api, pair)
-                _register_symbol(api, alias, active_id)
-            elif "need reconnect" in message:
-                logging.warning("Se requiere reconexión al solicitar velas de %s", alias)
+                candidate_id = _lookup_active_id(api, alias)
+                if candidate_id:
+                    pair.active_id = candidate_id
+                    _register_symbol(api, alias, candidate_id)
+            elif "need reconnect" in message and api.ensure_connection():
+                try:
+                    payload = api.get_candles(alias, 60, count, time.time())
+                except Exception:
+                    continue
             else:
-                logging.debug("Error obteniendo velas %s: %s", alias, exc)
-            continue
-
-        candles = payload.get("candles") if isinstance(payload, dict) else payload
-        if not isinstance(candles, list):
-            logging.debug("Respuesta de velas inesperada para %s", alias)
-            continue
-
-        df = _build_dataframe(candles)
-        if not df.empty:
-            return df
-
-        logging.debug("Velas vacías para %s", alias)
-
+                continue
+        if isinstance(payload, dict):
+            payload = payload.get("candles") or payload.get("data")
+        if isinstance(payload, list):
+            df = _build_dataframe(payload)
+            if not df.empty:
+                return df
     return pd.DataFrame()
 
 
@@ -419,35 +416,30 @@ def _compute_signal(df: pd.DataFrame) -> Tuple[Optional[str], IndicatorSnapshot]
     return signal, snapshot
 
 
-def _ensure_active_id(api: SafeIQOption, pair: TradePair) -> Optional[int]:
-    if pair.active_id is None:
-        for alias in pair.aliases:
-            candidate = _lookup_active_id(api, alias)
-            if candidate is not None:
-                pair.active_id = candidate
-                break
-    return pair.active_id
-
-
-def _wait_binary_result(api: SafeIQOption, ticket: str) -> TradeResult:
+def _wait_result(api: SafeIQOption, ticket: str) -> TradeResult:
     timeout = EXPIRACION * 60 + 120
-    elapsed = 0
-    while elapsed < timeout:
+    waited = 0
+    while waited < timeout:
         try:
-            outcome, pnl = api.check_win_v3(ticket)
+            result, pnl = api.check_win_v3(ticket)
         except Exception as exc:
+            message = str(exc).lower()
+            if "need reconnect" in message and api.ensure_connection():
+                time.sleep(1)
+                waited += 1
+                continue
             logging.warning("Error consultando resultado %s: %s", ticket, exc)
             time.sleep(1)
-            elapsed += 1
+            waited += 1
             continue
-        if outcome is not None:
+        if result is not None:
             try:
                 pnl_value = float(pnl)
             except (TypeError, ValueError):
                 pnl_value = 0.0
-            return TradeResult(ticket, pnl_value, outcome)
+            return TradeResult(ticket, pnl_value, result)
         time.sleep(1)
-        elapsed += 1
+        waited += 1
     logging.warning("Timeout esperando resultado para %s", ticket)
     return TradeResult(ticket, 0.0, "unknown")
 
@@ -501,30 +493,22 @@ class BotWorker(QObject):
                     time.sleep(ESPERA_ENTRE_CICLOS)
                     continue
 
-                listado = ", ".join(pair.name for pair in pairs)
-                logging.debug("Pares ciclo %s: %s", cycle, listado)
-
-                if self._failures:
-                    for nombre, valor in list(self._failures.items()):
-                        actualizado = max(valor - 1, 0)
-                        if actualizado:
-                            self._failures[nombre] = actualizado
-                        else:
-                            self._failures.pop(nombre, None)
+                for name in list(self._failures.keys()):
+                    self._failures[name] = max(self._failures[name] - 1, 0)
+                    if self._failures[name] == 0:
+                        self._failures.pop(name, None)
 
                 for pair in pairs:
                     if self._stop:
                         break
 
-                    fails = self._failures.get(pair.name, 0)
-                    if fails >= 3:
-                        logging.debug("%s omitido temporalmente por fallos previos", pair.name)
+                    failures = self._failures.get(pair.name, 0)
+                    if failures >= 3:
                         continue
 
                     df = _fetch_candles(api, pair)
                     if df.empty:
-                        self._failures[pair.name] = fails + 1
-                        logging.debug("%s sin velas válidas (intento %s)", pair.name, fails + 1)
+                        self._failures[pair.name] = failures + 1
                         continue
 
                     self._failures[pair.name] = 0
@@ -533,23 +517,18 @@ class BotWorker(QObject):
                     if not signal:
                         continue
 
-                    active_id = _ensure_active_id(api, pair)
-                    if active_id is None:
-                        logging.debug("%s sin identificador activo tras registro", pair.name)
-                        self._failures[pair.name] = self._failures.get(pair.name, 0) + 1
-                        continue
-
-                    _register_symbol(api, pair.name, active_id)
+                    active_id = _lookup_active_id(api, pair.name)
+                    if active_id is not None:
+                        pair.active_id = active_id
+                    _register_symbol(api, pair.name, pair.active_id)
 
                     ok, ticket = api.buy(MONTO, pair.name, signal, EXPIRACION)
                     if not ok or not ticket:
-                        logging.warning("[FAIL] Broker rechazó %s en %s", signal.upper(), pair.name)
-                        self._failures[pair.name] = fails + 1
-                        time.sleep(1)
+                        self._failures[pair.name] = failures + 1
                         continue
 
                     logging.info("[OK] %s en %s (ticket=%s)", signal.upper(), pair.name, ticket)
-                    result = _wait_binary_result(api, ticket)
+                    result = _wait_result(api, ticket)
                     outcome = result.outcome.upper() if result.outcome else "UNKNOWN"
                     pnl = result.pnl
 
@@ -569,7 +548,6 @@ class BotWorker(QObject):
                     logging.info(mensaje)
                     self.status_changed.emit(mensaje)
                     self.trade_completed.emit(pair.name, outcome, pnl, self._pnl)
-
                     time.sleep(1)
 
                 if self._stop:
@@ -657,8 +635,7 @@ class BotGUI(QWidget):
             ("stoch_d", 7),
         ]
         for key, column in mapping:
-            value = data.get(key, "-")
-            self.table.setItem(row, column, QTableWidgetItem(value))
+            self.table.setItem(row, column, QTableWidgetItem(data.get(key, "-")))
         signal_item = QTableWidgetItem(data.get("signal", "-"))
         if signal_item.text() == "call":
             signal_item.setForeground(Qt.green)
@@ -678,6 +655,7 @@ class BotGUI(QWidget):
         elif outcome == "LOST":
             result_item.setForeground(Qt.red)
         self.table.setItem(row, 9, result_item)
+
         pnl_item = QTableWidgetItem(f"{pnl:.2f}")
         if pnl > 0:
             pnl_item.setForeground(Qt.green)
@@ -695,6 +673,7 @@ class BotGUI(QWidget):
     def _start_bot(self) -> None:
         if self._thread and self._thread.isRunning():
             return
+
         self.table.setRowCount(0)
         self.label_pnl.setText("💰 PnL acumulado: 0.00")
         self.button_toggle.setEnabled(False)
@@ -761,7 +740,7 @@ def create_splash() -> QSplashScreen:
     painter.drawText(
         pixmap.rect().adjusted(0, 90, 0, -140),
         Qt.AlignHCenter | Qt.AlignTop,
-        "Escáner y monitor de operaciones",
+        "Escáner y monitor de operaciones binarias/OTC",
     )
 
     painter.setFont(QFont("Consolas", 11))
