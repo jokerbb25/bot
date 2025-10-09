@@ -306,16 +306,18 @@ def _build_dataframe(candles: Sequence[Dict]) -> pd.DataFrame:
 
 
 def _fetch_candles(api: SafeIQOption, pair: OtcPair, count: int = 120) -> pd.DataFrame:
+    active_id = _ensure_active_id(api, pair)
     for alias in pair.aliases[:3]:
-        _register_symbol(api, alias, pair.active_id)
+        _register_symbol(api, alias, active_id)
 
     for alias in pair.aliases[:3]:
         try:
             payload = api.get_candles(alias, 60, count, time.time())
         except Exception as exc:
             message = str(exc).lower()
-            if "not found on consts" in message and pair.active_id:
-                _register_symbol(api, alias, pair.active_id)
+            if "not found on consts" in message:
+                active_id = _ensure_active_id(api, pair)
+                _register_symbol(api, alias, active_id)
             elif "need reconnect" in message:
                 logging.warning("Se requiere reconexión al solicitar velas de %s", alias)
             else:
@@ -385,6 +387,16 @@ def _compute_signal(df: pd.DataFrame) -> Tuple[Optional[str], IndicatorSnapshot]
 
     snapshot = IndicatorSnapshot(rsi, ema_fast, ema_slow, macd, macd_signal, stoch_k, stoch_d)
     return signal, snapshot
+
+
+def _ensure_active_id(api: SafeIQOption, pair: OtcPair) -> Optional[int]:
+    if pair.active_id is None:
+        for alias in pair.aliases:
+            candidate = _lookup_active_id(api, alias)
+            if candidate is not None:
+                pair.active_id = candidate
+                break
+    return pair.active_id
 
 
 def _wait_binary_result(api: SafeIQOption, ticket: str) -> TradeResult:
@@ -482,6 +494,11 @@ class BotWorker(QObject):
                     self.row_ready.emit(pair.name, snapshot.to_row(signal))
                     if not signal:
                         continue
+                    active_id = _ensure_active_id(api, pair)
+                    if active_id is None:
+                        logging.warning("%s sin identificador activo; se omite", pair.name)
+                        continue
+                    _register_symbol(api, pair.name, active_id)
                     ok, ticket = api.buy(MONTO, pair.name, signal, EXPIRACION)
                     if not ok or not ticket:
                         logging.warning("[FAIL] Broker rechazó %s en %s", signal.upper(), pair.name)
