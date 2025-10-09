@@ -1413,6 +1413,13 @@ class BotWorker(QObject):
                     if par.instrument_type == "digital":
                         ok, op_id = iq.buy_digital_spot(alias, MONTO, senal, EXPIRACION)
                         tipo = "digital"
+                        if not ok or op_id in (None, ""):
+                            logging.debug(
+                                "Digital rechazado en %s con alias %s; se intentará versión binaria.",
+                                par.display,
+                                alias,
+                            )
+                            ok, op_id, tipo = self._intentar_operacion_binaria(iq, alias, senal)
                     else:
                         ok, op_id = iq.buy(MONTO, alias, senal, EXPIRACION)
                         tipo = "binary"
@@ -1482,6 +1489,35 @@ class BotWorker(QObject):
             "El broker rechazó la operación en todos los alias disponibles.",
         )
         return False, None
+
+    @staticmethod
+    def _intentar_operacion_binaria(
+        iq, alias: str, senal: str
+    ) -> Tuple[bool, Optional[Union[int, str]], str]:
+        try:
+            ok_bin, op_id_bin = iq.buy(MONTO, alias, senal, EXPIRACION)
+        except Exception as exc:
+            logging.debug(
+                "Fallo en intento binario para alias %s: %s",
+                alias,
+                exc,
+            )
+            return False, None, "binary"
+
+        if ok_bin and op_id_bin not in (None, ""):
+            logging.debug(
+                "Operación binaria ejecutada correctamente usando alias %s.",
+                alias,
+            )
+            return True, op_id_bin, "binary"
+
+        logging.debug(
+            "El broker devolvió estado negativo en fallback binario (alias %s, ok=%s, id=%s).",
+            alias,
+            ok_bin,
+            op_id_bin,
+        )
+        return ok_bin, op_id_bin, "binary"
 
     def _esperar_resultado(
         self, iq, par: TradePair, ticket: Tuple[str, Union[int, str]]
