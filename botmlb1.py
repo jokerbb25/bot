@@ -962,8 +962,57 @@ class BotWorker(QObject):
         agregar_variantes(resolved_symbol)
 
         if isinstance(info, dict):
-            for clave in ("symbol", "underlying", "active", "asset_name", "name", "ticker"):
+            for clave in (
+                "symbol",
+                "underlying",
+                "active",
+                "asset_name",
+                "name",
+                "ticker",
+                "pair",
+            ):
                 agregar_variantes(info.get(clave))
+            for clave in ("instrument_id", "instrumentId", "symbol_id", "symbolId"):
+                valor = info.get(clave)
+                if isinstance(valor, str):
+                    agregar_variantes(valor)
+
+        if instrument_type == "digital":
+            candidatos_do: List[str] = []
+            if isinstance(info, dict):
+                for clave in ("instrument_id", "instrumentId"):
+                    valor = info.get(clave)
+                    if isinstance(valor, str):
+                        valor_limpio = valor.strip()
+                        if valor_limpio and valor_limpio not in candidatos_do:
+                            candidatos_do.append(valor_limpio)
+
+            base_principal = _sanitize_symbol_name(resolved_symbol or raw_symbol or "")
+            if base_principal:
+                variantes_base: List[str] = []
+                for variante in (
+                    base_principal,
+                    base_principal.upper(),
+                    base_principal.lower(),
+                    base_principal.replace("/", ""),
+                    base_principal.replace("/", "").upper(),
+                    base_principal.replace("/", "").lower(),
+                    base_principal.replace("-", ""),
+                    base_principal.replace("-", "").upper(),
+                    base_principal.replace("-", "").lower(),
+                ):
+                    if variante and variante not in variantes_base:
+                        variantes_base.append(variante)
+
+                sufijos_extra = ("", "-OTC", "-otc", "-OP", "-op")
+                for variante in variantes_base:
+                    for sufijo in sufijos_extra:
+                        candidato_generado = f"do{variante}{sufijo}"
+                        if candidato_generado and candidato_generado not in candidatos_do:
+                            candidatos_do.append(candidato_generado)
+
+            for candidato_do in candidatos_do:
+                agregar(candidato_do)
 
         agregar(active_id)
 
@@ -1491,33 +1540,61 @@ class BotWorker(QObject):
         return False, None
 
     @staticmethod
+    def _preparar_alias_binario(alias: str) -> str:
+        if not isinstance(alias, str):
+            return ""
+        candidato = alias.strip()
+        if not candidato:
+            return ""
+        if ":" in candidato:
+            candidato = candidato.split(":")[-1].strip()
+        if candidato.lower().startswith("do") and len(candidato) > 2:
+            candidato = candidato[2:]
+        if candidato.lower().startswith("digital-option"):
+            partes = candidato.split(":")
+            candidato = partes[-1] if partes else candidato
+        return candidato
+
+    @staticmethod
     def _intentar_operacion_binaria(
         iq, alias: str, senal: str
     ) -> Tuple[bool, Optional[Union[int, str]], str]:
-        try:
-            ok_bin, op_id_bin = iq.buy(MONTO, alias, senal, EXPIRACION)
-        except Exception as exc:
-            logging.debug(
-                "Fallo en intento binario para alias %s: %s",
-                alias,
-                exc,
-            )
-            return False, None, "binary"
+        alias_binario = BotWorker._preparar_alias_binario(alias)
+        candidatos = []
+        if alias_binario:
+            candidatos.append(alias_binario)
+        if alias and alias not in candidatos:
+            candidatos.append(alias)
+        alias_sanitizado = _sanitize_symbol_name(alias_binario or alias)
+        if alias_sanitizado and alias_sanitizado not in candidatos:
+            candidatos.append(alias_sanitizado)
 
-        if ok_bin and op_id_bin not in (None, ""):
-            logging.debug(
-                "Operación binaria ejecutada correctamente usando alias %s.",
-                alias,
-            )
-            return True, op_id_bin, "binary"
+        for objetivo in candidatos:
+            try:
+                ok_bin, op_id_bin = iq.buy(MONTO, objetivo, senal, EXPIRACION)
+            except Exception as exc:
+                logging.debug(
+                    "Fallo en intento binario para alias %s: %s",
+                    objetivo,
+                    exc,
+                )
+                continue
 
-        logging.debug(
-            "El broker devolvió estado negativo en fallback binario (alias %s, ok=%s, id=%s).",
-            alias,
-            ok_bin,
-            op_id_bin,
-        )
-        return ok_bin, op_id_bin, "binary"
+            if ok_bin and op_id_bin not in (None, ""):
+                logging.debug(
+                    "Operación binaria ejecutada correctamente usando alias %s.",
+                    objetivo,
+                )
+                return True, op_id_bin, "binary"
+
+            logging.debug(
+                "El broker devolvió estado negativo en fallback binario (alias %s, ok=%s, id=%s).",
+                objetivo,
+                ok_bin,
+                op_id_bin,
+            )
+
+        return False, None, "binary"
 
     def _esperar_resultado(
         self, iq, par: TradePair, ticket: Tuple[str, Union[int, str]]
