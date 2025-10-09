@@ -475,38 +475,55 @@ class BotWorker(QObject):
                 self.status_changed.emit(
                     f"🔁 Ciclo {cycle}/{CICLOS} | PnL acumulado: {self._pnl:.2f}"
                 )
+
+                if not pairs:
+                    pairs = _discover_otc_pairs(api)
+                    if not pairs:
+                        logging.warning("No hay pares OTC disponibles en este ciclo")
+                        time.sleep(ESPERA_ENTRE_CICLOS)
+                        continue
+
                 for pair in list(pairs):
                     if self._stop:
                         break
+
                     df = _fetch_candles(api, pair)
                     if df.empty:
                         failures = self._failures.get(pair.name, 0) + 1
-                        self._failures[pair.name] = failures
                         if failures >= 2:
-                            logging.info("%s eliminado tras intentos fallidos de velas", pair.name)
-                            pairs.remove(pair)
+                            failures = 2
+                            logging.info("%s descartado temporalmente tras fallos de velas", pair.name)
                         else:
                             logging.debug("%s sin velas válidas", pair.name)
+                        self._failures[pair.name] = failures
                         continue
+
                     if pair.name in self._failures:
                         self._failures.pop(pair.name, None)
+
                     signal, snapshot = _compute_signal(df)
                     self.row_ready.emit(pair.name, snapshot.to_row(signal))
                     if not signal:
                         continue
+
                     active_id = _ensure_active_id(api, pair)
                     if active_id is None:
                         logging.warning("%s sin identificador activo; se omite", pair.name)
                         continue
+
                     _register_symbol(api, pair.name, active_id)
+
                     ok, ticket = api.buy(MONTO, pair.name, signal, EXPIRACION)
                     if not ok or not ticket:
                         logging.warning("[FAIL] Broker rechazó %s en %s", signal.upper(), pair.name)
+                        time.sleep(1)
                         continue
+
                     logging.info("[OK] %s en %s (ticket=%s)", signal.upper(), pair.name, ticket)
                     result = _wait_binary_result(api, ticket)
                     outcome = result.outcome.upper() if result.outcome else "UNKNOWN"
                     pnl = result.pnl
+
                     if outcome == "WIN":
                         self._pnl += pnl
                     elif outcome in {"LOSS", "LOOSE", "LOST"}:
@@ -516,13 +533,17 @@ class BotWorker(QObject):
                         self._pnl += pnl
                     else:
                         logging.warning("Resultado desconocido para %s: %s", pair.name, outcome)
+
                     message = (
                         f"{outcome} en {pair.name} | PnL operación: {pnl:.2f} | PnL acumulado: {self._pnl:.2f}"
                     )
                     logging.info(message)
                     self.status_changed.emit(message)
                     self.trade_completed.emit(pair.name, outcome, pnl, self._pnl)
-                    time.sleep(0.5)
+
+                    time.sleep(1)
+
+                pairs = _discover_otc_pairs(api)
                 time.sleep(ESPERA_ENTRE_CICLOS)
         finally:
             try:
