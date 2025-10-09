@@ -13,7 +13,7 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(mes
 def _ensure_dependency(module: str, pip_name: Optional[str] = None) -> None:
     try:
         __import__(module)
-    except ImportError:  # pragma: no cover - friendly runtime guard
+    except ImportError:
         package = pip_name or module
         message = dedent(
             f"""
@@ -70,8 +70,7 @@ def _patch_digital_underlying() -> None:
         if not isinstance(payload, dict):
             return {"underlying": {}}
 
-        underlying = payload.get("underlying")
-        if not isinstance(underlying, dict):
+        if not isinstance(payload.get("underlying"), dict):
             payload["underlying"] = {}
 
         return payload
@@ -89,7 +88,6 @@ MONTO = 1.0
 EXPIRACION = 1
 ESPERA_ENTRE_CICLOS = 3
 CICLOS = 50
-
 
 OTC_FALLBACK = (
     "EURUSD-OTC",
@@ -111,7 +109,7 @@ def _sanitize(symbol: Optional[str]) -> Optional[str]:
     if not symbol or not isinstance(symbol, str):
         return None
     cleaned = symbol.strip().upper()
-    if not cleaned or "OTC" not in cleaned:
+    if "OTC" not in cleaned:
         return None
     if not cleaned.endswith("-OTC"):
         cleaned = f"{cleaned}-OTC"
@@ -119,7 +117,7 @@ def _sanitize(symbol: Optional[str]) -> Optional[str]:
 
 
 class SafeIQOption(IQ_Option):
-    def get_candles(self, *args, **kwargs):  # pragma: no cover - thin wrapper
+    def get_candles(self, *args, **kwargs):  # pragma: no cover
         return super().get_candles(*args, **kwargs)
 
 
@@ -156,7 +154,8 @@ class TradeResult:
 @dataclass
 class OtcPair:
     name: str
-    active_id: int
+    active_id: Optional[int]
+    aliases: Tuple[str, ...]
 
 
 def _format(value: float, precision: int) -> str:
@@ -165,7 +164,99 @@ def _format(value: float, precision: int) -> str:
     return f"{value:.{precision}f}"
 
 
-def _iter_open_otc(payload: Dict) -> Iterable[Tuple[str, int]]:
+def _alias_variations(symbol: str) -> List[str]:
+    variants = []
+    base = symbol.strip()
+    if not base:
+        return variants
+    candidates = {
+        base,
+        base.upper(),
+        base.lower(),
+        base.replace("/", ""),
+        base.replace("/", "").upper(),
+        base.replace("/", "").lower(),
+        base.replace("-", ""),
+        base.replace("-", "").upper(),
+        base.replace("-", "").lower(),
+    }
+    for candidate in candidates:
+        cleaned = candidate.strip()
+        if cleaned and cleaned not in variants:
+            variants.append(cleaned)
+    return variants
+
+
+def _build_aliases(symbol: str, info: Optional[Dict]) -> Tuple[str, ...]:
+    aliases: List[str] = []
+    base = _sanitize(symbol)
+    if base:
+        aliases.extend(_alias_variations(base))
+    if isinstance(info, dict):
+        for key in ("symbol", "active", "underlying", "asset_name", "name", "ticker"):
+            value = info.get(key)
+            normalized = _sanitize(value)
+            if normalized:
+                for variant in _alias_variations(normalized):
+                    if variant not in aliases:
+                        aliases.append(variant)
+    deduped = []
+    for alias in aliases:
+        if alias not in deduped:
+            deduped.append(alias)
+    return tuple(deduped or ([symbol.upper()]))
+
+
+def _tables_to_update(api: SafeIQOption) -> List[Dict]:
+    tables: List[Dict] = []
+    for name in ("ACTIVES", "ACTIVES_ID", "assets", "assets_name"):
+        table = getattr(iq_constants, name, None)
+        if isinstance(table, dict):
+            tables.append(table)
+    for attr in ("ACTIVES", "ACTIVES_ID", "assets", "assets_name"):
+        table = getattr(api, attr, None)
+        if isinstance(table, dict):
+            tables.append(table)
+    return tables
+
+
+def _register_symbol(api: SafeIQOption, alias: str, active_id: Optional[int]) -> None:
+    if not active_id:
+        return
+    alias_upper = alias.upper()
+    for table in _tables_to_update(api):
+        if not table:
+            table[alias_upper] = {"id": active_id, "name": alias_upper}
+            continue
+        sample_key = next(iter(table.keys()))
+        if isinstance(sample_key, str):
+            value = table.get(alias_upper)
+            if isinstance(value, dict):
+                value["id"] = active_id
+                value.setdefault("name", alias_upper)
+            elif isinstance(value, int):
+                table[alias_upper] = active_id
+            else:
+                table[alias_upper] = {"id": active_id, "name": alias_upper}
+        elif isinstance(sample_key, int):
+            table[active_id] = alias_upper
+
+
+def _lookup_active_id(api: SafeIQOption, alias: str) -> Optional[int]:
+    alias_upper = alias.upper()
+    for table in _tables_to_update(api):
+        if isinstance(table, dict):
+            value = table.get(alias_upper)
+            if isinstance(value, dict):
+                candidate = value.get("id")
+                if isinstance(candidate, int):
+                    return candidate
+            elif isinstance(value, int):
+                return value
+    return None
+
+
+def _iter_open_otc(payload: Dict) -> Iterable[Tuple[str, Dict]]:
     for category in ("turbo", "binary", "digital"):
         entries = payload.get(category, {})
         if not isinstance(entries, dict):
@@ -175,17 +266,10 @@ def _iter_open_otc(payload: Dict) -> Iterable[Tuple[str, int]]:
                 continue
             if info.get("open") is False or info.get("enabled") is False:
                 continue
-            candidate = _sanitize(symbol)
-            if not candidate:
+            normalized = _sanitize(symbol)
+            if not normalized:
                 continue
-            active_id = info.get("id") or info.get("active_id")
-            try:
-                active_id = int(active_id)
-            except (TypeError, ValueError):
-                active_id = None
-            if active_id is None:
-                continue
-            yield candidate, active_id
+            yield normalized, info
 
 
 def _discover_otc_pairs(api: SafeIQOption) -> List[OtcPair]:
@@ -194,17 +278,22 @@ def _discover_otc_pairs(api: SafeIQOption) -> List[OtcPair]:
     except Exception:
         logging.exception("No se pudieron obtener los horarios de activos")
         schedule = {}
-    seen: Dict[str, OtcPair] = {}
-    for symbol, active_id in _iter_open_otc(schedule):
-        seen.setdefault(symbol, OtcPair(symbol, active_id))
-    if not seen:
+    pairs: Dict[str, OtcPair] = {}
+    for symbol, info in _iter_open_otc(schedule):
+        active_id = info.get("id") or info.get("active_id")
+        try:
+            active_id_int = int(active_id) if active_id is not None else None
+        except (TypeError, ValueError):
+            active_id_int = None
+        aliases = _build_aliases(symbol, info)
+        pairs.setdefault(symbol, OtcPair(symbol, active_id_int, aliases))
+    if not pairs:
         logging.warning("No se detectaron pares OTC abiertos; se usa respaldo estático")
         for symbol in OTC_FALLBACK:
-            active_id = iq_constants.ACTIVES.get(symbol)
-            if active_id is None:
-                continue
-            seen.setdefault(symbol, OtcPair(symbol, int(active_id)))
-    return list(seen.values())
+            aliases = _build_aliases(symbol, None)
+            active_id = _lookup_active_id(api, symbol)
+            pairs.setdefault(symbol, OtcPair(symbol, active_id, aliases))
+    return list(pairs.values())
 
 
 def _build_dataframe(candles: Sequence[Dict]) -> pd.DataFrame:
@@ -225,29 +314,35 @@ def _build_dataframe(candles: Sequence[Dict]) -> pd.DataFrame:
 
 
 def _fetch_candles(api: SafeIQOption, pair: OtcPair, count: int = 120) -> pd.DataFrame:
-    for attempt in range(3):
-        try:
-            payload = api.get_candles(pair.active_id, 60, count, time.time())
-        except Exception as exc:
-            logging.warning(
-                "Error obteniendo velas %s (intento %s/3): %s",
-                pair.name,
-                attempt + 1,
-                exc,
-            )
+    for alias in pair.aliases:
+        _register_symbol(api, alias, pair.active_id)
+    for alias in pair.aliases:
+        for attempt in range(3):
+            try:
+                payload = api.get_candles(alias, 60, count, time.time())
+            except Exception as exc:
+                message = str(exc).lower()
+                if "need reconnect" in message:
+                    logging.warning("Se requiere reconexión para %s; reintentando", alias)
+                    time.sleep(1)
+                    continue
+                if "not found on consts" in message and pair.active_id:
+                    logging.debug("Registrando %s con id %s y reintentando", alias, pair.active_id)
+                    _register_symbol(api, alias, pair.active_id)
+                    time.sleep(1)
+                    continue
+                logging.debug("Error obteniendo velas %s: %s", alias, exc)
+                break
+            candles = payload.get("candles") if isinstance(payload, dict) else payload
+            if not isinstance(candles, list):
+                logging.debug("Respuesta de velas inesperada para %s", alias)
+                time.sleep(1)
+                continue
+            df = _build_dataframe(candles)
+            if not df.empty:
+                return df
+            logging.debug("Velas vacías para %s (intento %s/3)", alias, attempt + 1)
             time.sleep(1)
-            continue
-        if isinstance(payload, dict):
-            payload = payload.get("candles") or payload.get("data") or []
-        if not isinstance(payload, list):
-            logging.debug("Respuesta de velas inesperada para %s: %s", pair.name, type(payload))
-            time.sleep(1)
-            continue
-        df = _build_dataframe(payload)
-        if not df.empty:
-            return df
-        logging.debug("Velas vacías para %s (intento %s/3)", pair.name, attempt + 1)
-        time.sleep(1)
     return pd.DataFrame()
 
 
@@ -359,48 +454,48 @@ class BotWorker(QObject):
         balance = api.get_balance()
         self.status_changed.emit(f"✅ Conectado a {MODO} | Saldo: {balance:.2f}")
 
-        pares = _discover_otc_pairs(api)
-        if not pares:
+        pairs = _discover_otc_pairs(api)
+        if not pairs:
             self.status_changed.emit("⚠️ No se detectaron pares OTC disponibles")
             self.finished.emit()
             api.close()
             return
 
         self.status_changed.emit(
-            "📈 Pares OTC cargados: " + ", ".join(par.name for par in pares)
+            "📈 Pares OTC cargados: " + ", ".join(pair.name for pair in pairs)
         )
 
         try:
-            for ciclo in range(1, CICLOS + 1):
+            for cycle in range(1, CICLOS + 1):
                 if self._stop:
                     break
-                logging.info("=== Ciclo %s/%s ===", ciclo, CICLOS)
+                logging.info("=== Ciclo %s/%s ===", cycle, CICLOS)
                 self.status_changed.emit(
-                    f"🔁 Ciclo {ciclo}/{CICLOS} | PnL acumulado: {self._pnl:.2f}"
+                    f"🔁 Ciclo {cycle}/{CICLOS} | PnL acumulado: {self._pnl:.2f}"
                 )
-                for par in list(pares):
+                for pair in list(pairs):
                     if self._stop:
                         break
-                    df = _fetch_candles(api, par)
+                    df = _fetch_candles(api, pair)
                     if df.empty:
-                        logging.warning("%s sin velas válidas", par.name)
-                        fails = self._failures.get(par.name, 0) + 1
-                        self._failures[par.name] = fails
-                        if fails >= 3:
-                            logging.warning("%s eliminado tras %s fallos de velas", par.name, fails)
-                            pares.remove(par)
+                        logging.warning("%s sin velas válidas", pair.name)
+                        failures = self._failures.get(pair.name, 0) + 1
+                        self._failures[pair.name] = failures
+                        if failures >= 3:
+                            logging.warning("%s eliminado tras %s fallos de velas", pair.name, failures)
+                            pairs.remove(pair)
                         continue
-                    if par.name in self._failures:
-                        self._failures.pop(par.name, None)
+                    if pair.name in self._failures:
+                        self._failures.pop(pair.name, None)
                     signal, snapshot = _compute_signal(df)
-                    self.row_ready.emit(par.name, snapshot.to_row(signal))
+                    self.row_ready.emit(pair.name, snapshot.to_row(signal))
                     if not signal:
                         continue
-                    ok, ticket = api.buy(MONTO, par.name, signal, EXPIRACION)
+                    ok, ticket = api.buy(MONTO, pair.name, signal, EXPIRACION)
                     if not ok or not ticket:
-                        logging.warning("[FAIL] Broker rechazó %s en %s", signal.upper(), par.name)
+                        logging.warning("[FAIL] Broker rechazó %s en %s", signal.upper(), pair.name)
                         continue
-                    logging.info("[OK] %s en %s (ticket=%s)", signal.upper(), par.name, ticket)
+                    logging.info("[OK] %s en %s (ticket=%s)", signal.upper(), pair.name, ticket)
                     result = _wait_binary_result(api, ticket)
                     outcome = result.outcome.upper() if result.outcome else "UNKNOWN"
                     pnl = result.pnl
@@ -412,13 +507,13 @@ class BotWorker(QObject):
                     elif outcome == "EQUAL":
                         self._pnl += pnl
                     else:
-                        logging.warning("Resultado desconocido para %s: %s", par.name, outcome)
-                    mensaje = (
-                        f"{outcome} en {par.name} | PnL operación: {pnl:.2f} | PnL acumulado: {self._pnl:.2f}"
+                        logging.warning("Resultado desconocido para %s: %s", pair.name, outcome)
+                    message = (
+                        f"{outcome} en {pair.name} | PnL operación: {pnl:.2f} | PnL acumulado: {self._pnl:.2f}"
                     )
-                    logging.info(mensaje)
-                    self.status_changed.emit(mensaje)
-                    self.trade_completed.emit(par.name, outcome, pnl, self._pnl)
+                    logging.info(message)
+                    self.status_changed.emit(message)
+                    self.trade_completed.emit(pair.name, outcome, pnl, self._pnl)
                     time.sleep(0.5)
                 time.sleep(ESPERA_ENTRE_CICLOS)
         finally:
@@ -578,7 +673,7 @@ class BotGUI(QWidget):
         self._worker = None
         self._thread = None
 
-    def closeEvent(self, event) -> None:  # noqa: N802 - Qt override
+    def closeEvent(self, event) -> None:  # noqa: N802
         if self._worker is not None:
             self._worker.stop()
         if self._thread is not None and self._thread.isRunning():
