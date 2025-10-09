@@ -468,17 +468,6 @@ class BotWorker(QObject):
         balance = api.get_balance()
         self.status_changed.emit(f"✅ Conectado a {MODO} | Saldo: {balance:.2f}")
 
-        pairs = _discover_otc_pairs(api)
-        if not pairs:
-            self.status_changed.emit("⚠️ No se detectaron pares OTC disponibles")
-            self.finished.emit()
-            api.close()
-            return
-
-        self.status_changed.emit(
-            "📈 Pares OTC cargados: " + ", ".join(pair.name for pair in pairs)
-        )
-
         try:
             for cycle in range(1, CICLOS + 1):
                 if self._stop:
@@ -488,31 +477,39 @@ class BotWorker(QObject):
                     f"🔁 Ciclo {cycle}/{CICLOS} | PnL acumulado: {self._pnl:.2f}"
                 )
 
-                if not pairs:
-                    pairs = _discover_otc_pairs(api)
-                    if not pairs:
-                        logging.warning("No hay pares OTC disponibles en este ciclo")
-                        time.sleep(ESPERA_ENTRE_CICLOS)
-                        continue
+                if self._failures:
+                    for nombre in list(self._failures.keys()):
+                        valor = self._failures[nombre]
+                        if valor <= 0:
+                            self._failures.pop(nombre, None)
+                        else:
+                            self._failures[nombre] = valor - 1
 
-                for pair in list(pairs):
+                pairs = _discover_otc_pairs(api)
+                if not pairs:
+                    self.status_changed.emit("⚠️ No se detectaron pares OTC disponibles en este ciclo")
+                    time.sleep(ESPERA_ENTRE_CICLOS)
+                    continue
+
+                listado = ", ".join(pair.name for pair in pairs)
+                logging.debug("Pares OTC ciclo %s: %s", cycle, listado)
+
+                for pair in pairs:
                     if self._stop:
                         break
 
-                    df = _fetch_candles(api, pair)
-                    if df.empty:
-                        failures = self._failures.get(pair.name, 0) + 1
-                        if failures >= 2:
-                            logging.info("%s descartado temporalmente tras fallos de velas", pair.name)
-                            pairs.remove(pair)
-                        else:
-                            logging.debug("%s sin velas válidas", pair.name)
-                        self._failures[pair.name] = failures
+                    if self._failures.get(pair.name, 0) >= 3:
+                        logging.debug("%s omitido temporalmente por fallos previos", pair.name)
                         continue
 
-                    if pair.name in self._failures:
-                        self._failures.pop(pair.name, None)
+                    df = _fetch_candles(api, pair)
+                    if df.empty:
+                        intentos = self._failures.get(pair.name, 0) + 1
+                        self._failures[pair.name] = intentos
+                        logging.debug("%s sin velas válidas (intento %s)", pair.name, intentos)
+                        continue
 
+                    self._failures[pair.name] = 0
                     signal, snapshot = _compute_signal(df)
                     self.row_ready.emit(pair.name, snapshot.to_row(signal))
                     if not signal:
@@ -520,7 +517,8 @@ class BotWorker(QObject):
 
                     active_id = _ensure_active_id(api, pair)
                     if active_id is None:
-                        logging.warning("%s sin identificador activo; se omite", pair.name)
+                        logging.debug("%s sin identificador activo tras registro", pair.name)
+                        self._failures[pair.name] = self._failures.get(pair.name, 0) + 1
                         continue
 
                     _register_symbol(api, pair.name, active_id)
@@ -546,16 +544,18 @@ class BotWorker(QObject):
                     else:
                         logging.warning("Resultado desconocido para %s: %s", pair.name, outcome)
 
-                    message = (
+                    mensaje = (
                         f"{outcome} en {pair.name} | PnL operación: {pnl:.2f} | PnL acumulado: {self._pnl:.2f}"
                     )
-                    logging.info(message)
-                    self.status_changed.emit(message)
+                    logging.info(mensaje)
+                    self.status_changed.emit(mensaje)
                     self.trade_completed.emit(pair.name, outcome, pnl, self._pnl)
 
                     time.sleep(1)
 
-                pairs = _discover_otc_pairs(api)
+                if self._stop:
+                    break
+
                 time.sleep(ESPERA_ENTRE_CICLOS)
         finally:
             try:
