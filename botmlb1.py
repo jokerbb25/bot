@@ -4,7 +4,7 @@ import math
 import logging
 import threading
 from dataclasses import dataclass, asdict, field
-from typing import Dict, Optional, Tuple, Union, List
+from typing import Dict, Optional, Tuple, Union, List, Set
 from datetime import datetime
 from textwrap import dedent
 
@@ -61,23 +61,32 @@ ESPERA_ENTRE_CICLOS = 3
 CICLOS = 50
 MODO = "PRACTICE"
 
-OTC_FALLBACK = (
-    "EURUSD-OTC",
-    "GBPUSD-OTC",
-    "USDJPY-OTC",
-    "AUDUSD-OTC",
-    "USDCHF-OTC",
-    "USDCAD-OTC",
-    "EURJPY-OTC",
-    "EURGBP-OTC",
-    "GBPJPY-OTC",
-    "AUDCAD-OTC",
-    "NZDUSD-OTC",
-    "CADJPY-OTC",
-    "GBPCHF-OTC",
-    "GBPAUD-OTC",
-    "AUDCHF-OTC",
-    "NZDJPY-OTC",
+FALLBACK_DIGITAL = (
+    "EURUSD",
+    "GBPUSD",
+    "USDJPY",
+    "AUDUSD",
+    "USDCHF",
+    "USDCAD",
+    "EURJPY",
+    "EURGBP",
+    "GBPJPY",
+    "AUDCAD",
+    "NZDUSD",
+    "CADJPY",
+)
+
+FALLBACK_BINARY = (
+    "EURUSD",
+    "GBPUSD",
+    "USDJPY",
+    "AUDUSD",
+    "USDCHF",
+    "USDCAD",
+    "EURJPY",
+    "EURGBP",
+    "GBPJPY",
+    "AUDCAD",
 )
 
 
@@ -85,11 +94,16 @@ def _sanitize(symbol: Optional[str]) -> Optional[str]:
     if not symbol or not isinstance(symbol, str):
         return None
     cleaned = symbol.strip().upper()
-    if cleaned.endswith("-OTC"):
-        return cleaned
-    if cleaned:
-        return f"{cleaned}-OTC"
-    return None
+    if not cleaned:
+        return None
+    if "OTC" in cleaned:
+        return None
+    for suffix in ("-OP", "-F", "-FX", "-INDEX", "-DIGITAL", "-BINARY"):
+        if cleaned.endswith(suffix):
+            cleaned = cleaned[: -len(suffix)]
+            break
+    cleaned = cleaned.replace(" ", "")
+    return cleaned or None
 
 
 def _ensure_underlying_patch() -> None:
@@ -151,35 +165,46 @@ class IndicatorSnapshot:
 @dataclass
 class TradePair:
     name: str
+    instrument_type: str
     candle_aliases: Tuple[str, ...] = field(default_factory=tuple)
     trade_aliases: Tuple[str, ...] = field(default_factory=tuple)
 
     @classmethod
-    def build(cls, symbol: str) -> "TradePair":
-        primary = symbol.upper()
-        base = primary[:-4] if primary.endswith("-OTC") else primary
-        aliases = []
-        trade_aliases = []
-        for candidate in {
-            primary,
-            base,
-            base.replace("/", ""),
-            primary.replace("/", ""),
-            primary.replace("-", ""),
-            base.replace("-", ""),
-        }:
-            if candidate and candidate not in aliases:
-                aliases.append(candidate)
-        for alias in aliases:
-            if alias not in trade_aliases:
-                trade_aliases.append(alias)
-            if not alias.endswith("-OTC"):
-                otc = f"{alias}-OTC"
-                if otc not in trade_aliases:
-                    trade_aliases.append(otc)
+    def build(cls, base_symbol: str, instrument_type: str, raw_symbol: Optional[str] = None) -> "TradePair":
+        base = base_symbol.upper()
+        aliases: List[str] = []
+        trade_aliases: List[str] = []
+
+        candidates: Set[str] = {base}
+        if raw_symbol:
+            raw_clean = raw_symbol.strip().upper()
+            if raw_clean and "OTC" not in raw_clean:
+                candidates.add(raw_clean)
+
+        more = set()
+        for candidate in list(candidates):
+            more.add(candidate.replace("/", ""))
+            more.add(candidate.replace("-", ""))
+        candidates.update({item for item in more if item})
+
+        if instrument_type == "digital":
+            digital_candidates = set()
+            for candidate in candidates:
+                digital_candidates.add(f"{candidate}-OP")
+            candidates.update(digital_candidates)
+
+        for candidate in candidates:
+            clean = candidate.strip()
+            if not clean:
+                continue
+            if clean not in aliases:
+                aliases.append(clean)
+            if clean not in trade_aliases:
+                trade_aliases.append(clean)
+
         candle_aliases = tuple(alias for alias in aliases if alias)
         trade_aliases = tuple(alias for alias in trade_aliases if alias)
-        return cls(primary, candle_aliases, trade_aliases)
+        return cls(base, instrument_type, candle_aliases, trade_aliases)
 
 
 class BotWorker(QObject):
@@ -216,13 +241,13 @@ class BotWorker(QObject):
 
         pares = self._discover_pairs(api)
         if not pares:
-            self.status_changed.emit("⚠️ No hay pares OTC disponibles")
+            self.status_changed.emit("⚠️ No hay pares digitales/binarias disponibles")
             self.finished.emit()
             api.close()
             return
 
         self.status_changed.emit(
-            f"📈 {len(pares)} pares OTC listos para operar"
+            f"📈 {len(pares)} pares digitales/binarios listos para operar"
         )
 
         try:
@@ -269,30 +294,50 @@ class BotWorker(QObject):
             self.finished.emit()
 
     def _discover_pairs(self, api: SafeIQOption) -> List[TradePair]:
-        logging.info("♻️ Escaneando pares OTC...")
+        logging.info("♻️ Escaneando pares digitales y binarias disponibles...")
         payload = api.get_all_open_time()
-        symbols: List[str] = []
+        candidates: List[TradePair] = []
+        seen: Set[Tuple[str, str]] = set()
         if isinstance(payload, dict):
-            for category in ("binary", "turbo", "digital"):
+            for category in ("digital", "binary", "turbo"):
                 entries = payload.get(category, {})
                 if not isinstance(entries, dict):
                     continue
+                instrument_type = "digital" if category == "digital" else "binary"
                 for symbol, info in entries.items():
                     if not isinstance(info, dict):
                         continue
                     if not info.get("open", True):
                         continue
+                    if "OTC" in str(symbol).upper():
+                        continue
                     normalized = _sanitize(symbol)
-                    if normalized and normalized not in symbols:
-                        symbols.append(normalized)
-        if not symbols:
-            logging.warning("No se encontraron pares en la API, usando respaldo manual")
-            symbols = list(OTC_FALLBACK)
+                    if not normalized:
+                        continue
+                    key = (normalized, instrument_type)
+                    if key in seen:
+                        continue
+                    par = TradePair.build(normalized, instrument_type, str(symbol))
+                    if not par.candle_aliases or not par.trade_aliases:
+                        continue
+                    candidates.append(par)
+                    seen.add(key)
+        if not candidates:
+            logging.warning("No se encontraron pares activos; usando respaldo estándar digital/binario")
+            for symbol in FALLBACK_DIGITAL:
+                par = TradePair.build(symbol, "digital", symbol)
+                key = (par.name, par.instrument_type)
+                if par.candle_aliases and par.trade_aliases and key not in seen:
+                    candidates.append(par)
+                    seen.add(key)
+            for symbol in FALLBACK_BINARY:
+                par = TradePair.build(symbol, "binary", symbol)
+                key = (par.name, par.instrument_type)
+                if par.candle_aliases and par.trade_aliases and key not in seen:
+                    candidates.append(par)
+                    seen.add(key)
         pares: List[TradePair] = []
-        for symbol in symbols:
-            par = TradePair.build(symbol)
-            if not par.candle_aliases or not par.trade_aliases:
-                continue
+        for par in candidates:
             df = self._fetch_candles(api, par, sample=True)
             if df.empty:
                 continue
@@ -388,25 +433,38 @@ class BotWorker(QObject):
                 signal = "put"
         return signal, snapshot.as_payload(signal)
 
-    def _execute_trade(self, api: SafeIQOption, par: TradePair, signal: str) -> Tuple[bool, Optional[str]]:
+    def _execute_trade(
+        self, api: SafeIQOption, par: TradePair, signal: str
+    ) -> Tuple[bool, Optional[Tuple[str, str]]]:
         for alias in par.trade_aliases:
             try:
-                ok, trade_id = api.buy(MONTO, alias, signal, EXPIRACION)
+                if par.instrument_type == "digital":
+                    ok, trade_id = api.buy_digital_spot(alias, MONTO, signal, EXPIRACION)
+                    trade_kind = "digital"
+                else:
+                    ok, trade_id = api.buy(MONTO, alias, signal, EXPIRACION)
+                    trade_kind = "binary"
             except Exception as exc:
                 logging.debug("Error lanzando operación %s (%s)", alias, exc)
                 continue
             if ok and trade_id:
                 logging.info("[OK] %s en %s (alias %s)", signal.upper(), par.name, alias)
-                return True, str(trade_id)
+                return True, (trade_kind, str(trade_id))
         logging.warning("[FAIL] Broker rechazó %s en %s", signal.upper(), par.name)
         return False, None
 
-    def _wait_result(self, api: SafeIQOption, trade_id: str) -> Tuple[Optional[str], float]:
+    def _wait_result(
+        self, api: SafeIQOption, ticket: Tuple[str, str]
+    ) -> Tuple[Optional[str], float]:
+        trade_type, trade_id = ticket
         timeout = EXPIRACION * 60 + 120
         waited = 0
         while waited < timeout and not self._stop.is_set():
             try:
-                result, pnl = api.check_win_v4(trade_id)
+                if trade_type == "digital":
+                    result, pnl = api.check_win_digital_v2(trade_id)
+                else:
+                    result, pnl = api.check_win_v4(trade_id)
             except Exception as exc:
                 logging.debug("Error consultando resultado %s", exc)
                 return None, 0.0
@@ -436,7 +494,7 @@ class BotWorker(QObject):
 class BotGUI(QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("IQ Option OTC Bot")
+        self.setWindowTitle("IQ Option Digital/Binary Bot")
         self.resize(1000, 520)
 
         layout = QVBoxLayout(self)
@@ -605,12 +663,12 @@ def create_splash() -> QSplashScreen:
     painter.fillRect(pixmap.rect(), gradient)
     painter.setPen(QColor("#F5F5F5"))
     painter.setFont(QFont("Segoe UI", 26, QFont.Bold))
-    painter.drawText(pixmap.rect(), Qt.AlignHCenter | Qt.AlignTop, "\nIQ Option OTC Bot")
+    painter.drawText(pixmap.rect(), Qt.AlignHCenter | Qt.AlignTop, "\nIQ Option Digital/Binary Bot")
     painter.setFont(QFont("Segoe UI", 14))
     painter.drawText(
         pixmap.rect().adjusted(0, 90, 0, -120),
         Qt.AlignHCenter | Qt.AlignTop,
-        "Escáner de pares OTC con panel de PnL",
+        "Escáner de pares digitales/binarias con panel de PnL",
     )
     painter.setFont(QFont("Consolas", 11))
     painter.drawText(
