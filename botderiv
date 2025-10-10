@@ -1,0 +1,355 @@
+import sys, time, json, threading, logging, queue, requests
+import numpy as np
+import websocket
+from datetime import datetime
+from PyQt5 import QtWidgets, QtCore, QtGui
+
+# ================== CONFIG ==================
+APP_ID = "1089"
+API_TOKEN = "dK57Ark9QreDexO"
+GRANULARITY = 60          # velas 1m
+STAKE = 1.0               # USD
+DURATION_MIN = 1          # contrato 1m
+MAX_OPEN_TIME_BUFFER = 90 # margen de cierre
+MAX_CONCURRENT_SYMBOLS = 2
+IA_TIMEOUT_S = 12         # tiempo máx. para que IA decida
+IA_MODEL = "llama3"
+
+logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
+
+# ================== TÉCNICO ==================
+def ema(series, period):
+    arr = np.array(series, dtype=float)
+    if len(arr) < period: return None
+    k = 2/(period+1)
+    out = arr[0]
+    for p in arr[1:]:
+        out = p*k + out*(1-k)
+    return out
+
+def ema_cross(close, s=9, l=21):
+    if len(close) < l+2: return "NEUTRAL"
+    es_prev, el_prev = ema(close[:-1], s), ema(close[:-1], l)
+    es_now,  el_now  = ema(close, s), ema(close, l)
+    if es_prev is None or el_prev is None or es_now is None or el_now is None:
+        return "NEUTRAL"
+    if es_prev <= el_prev and es_now > el_now:  return "CALL"
+    if es_prev >= el_prev and es_now < el_now:  return "PUT"
+    return "NEUTRAL"
+
+def rsi(close, period=14):
+    arr = np.array(close, dtype=float)
+    if len(arr) < period+1: return 50.0
+    delta = np.diff(arr)
+    up = np.where(delta>0, delta, 0.0)
+    dn = np.where(delta<0, -delta, 0.0)
+    ag, al = np.mean(up[-period:]), np.mean(dn[-period:])
+    if al == 0: return 100.0
+    rs = ag/al
+    return 100 - (100/(1+rs))
+
+def technical_signal(candles):
+    if not candles: return "NULL", {"ema":"NEUTRAL","rsi":50,"rsi_sig":"NEUTRAL"}
+    close = [c["close"] for c in candles]
+    sig_ema = ema_cross(close)
+    r = rsi(close)
+    sig_rsi = "CALL" if r < 30 else "PUT" if r > 70 else "NEUTRAL"
+    # voto simple técnico
+    votes = {"CALL":0,"PUT":0}
+    if sig_ema in votes: votes[sig_ema]+=1
+    if sig_rsi in votes: votes[sig_rsi]+=1
+    tech = "CALL" if votes["CALL"]>votes["PUT"] else "PUT" if votes["PUT"]>votes["CALL"] else "NULL"
+    return tech, {"ema":sig_ema, "rsi":r, "rsi_sig":sig_rsi}
+
+# ================== IA (no bloqueante) ==================
+def ia_evaluate_async(close, rsi_val, out_q, idx):
+    """Llama a Ollama en streaming y coloca la decisión en la cola."""
+    prompt = (
+        "Actúa como juez de entrada de trading binario 1m.\n"
+        f"Cierres recientes: {close[-25:]}\n"
+        f"RSI(14): {rsi_val:.2f}\n"
+        "Devuelve SOLO una de: CONFIRMAR | RECHAZAR | INVERSA.\n"
+        "No escribas más texto."
+    )
+    try:
+        r = requests.post(
+            "http://localhost:11434/api/generate",
+            json={"model": IA_MODEL, "prompt": prompt, "stream": True},
+            stream=True, timeout=IA_TIMEOUT_S
+        )
+        acc = ""
+        for line in r.iter_lines():
+            if not line: continue
+            j = json.loads(line.decode("utf-8"))
+            if "response" in j: acc += j["response"]
+        text = acc.strip().upper()
+        if "CONFIRMAR" in text: out_q.put((idx, "CONFIRMAR")); return
+        if "INVERSA"   in text: out_q.put((idx, "INVERSA"));   return
+        if "RECHAZAR"  in text: out_q.put((idx, "RECHAZAR"));  return
+    except Exception as e:
+        logging.warning(f"IA no disponible: {e}")
+    out_q.put((idx, "SIN_IA"))
+
+# ================== API DERIV ==================
+class Deriv:
+    def __init__(self, app_id, token):
+        self.app_id, self.token = app_id, token
+        self.ws = None
+        self.req_id = 1
+        self.lock = threading.Lock()
+
+    def connect(self):
+        self.ws = websocket.create_connection(f"wss://ws.derivws.com/websockets/v3?app_id={self.app_id}", timeout=15)
+        self._send({"authorize": self.token})
+        resp = self._recv()
+        if "error" in resp: raise RuntimeError(resp["error"]["message"])
+        logging.info(f"✅ Conectado ({resp['authorize'].get('loginid')})")
+
+    def _send(self, data):
+        with self.lock:
+            data["req_id"] = self.req_id; self.req_id += 1
+            self.ws.send(json.dumps(data))
+            return data["req_id"]
+
+    def _recv(self):
+        return json.loads(self.ws.recv())
+
+    def valid_symbols(self):
+        req = self._send({"active_symbols": "brief"})
+        syms=[]
+        while True:
+            m = self._recv()
+            if m.get("msg_type")=="active_symbols":
+                for s in m["active_symbols"]:
+                    sym = s.get("symbol","")
+                    if s.get("market")=="synthetic_index" and sym in ["R_10","R_25","R_50","R_75","R_100"]:
+                        syms.append(sym)
+                break
+        return syms
+
+    def candles(self, symbol, count=60, granularity=GRANULARITY):
+        req = self._send({"ticks_history":symbol,"count":count,"end":"latest","style":"candles","granularity":granularity})
+        while True:
+            m = self._recv()
+            if m.get("req_id")==req:
+                if "error" in m:
+                    logging.warning(f"[{symbol}] velas error: {m['error']['message']}")
+                    return []
+                return m.get("candles",[])
+
+    def buy(self, symbol, direction):
+        req1 = self._send({"proposal":1,"amount":float(STAKE),"basis":"stake","contract_type":direction,
+                           "currency":"USD","duration":int(DURATION_MIN),"duration_unit":"m","symbol":symbol})
+        while True:
+            m = self._recv()
+            if m.get("req_id")==req1:
+                if "error" in m: raise RuntimeError(m["error"]["message"])
+                prop = m["proposal"]; break
+        req2 = self._send({"buy":prop["id"], "price":prop["ask_price"]})
+        while True:
+            m2 = self._recv()
+            if m2.get("req_id")==req2:
+                if "error" in m2: raise RuntimeError(m2["error"]["message"])
+                return m2["buy"]["contract_id"], float(prop["ask_price"])
+
+    def monitor(self, contract_id, timeout_s):
+        req = self._send({"proposal_open_contract":1,"subscribe":1,"contract_id":contract_id})
+        t0=time.time(); last_pnl=0.0
+        while True:
+            m = self._recv()
+            if m.get("msg_type")!="proposal_open_contract": continue
+            poc = m["proposal_open_contract"]
+            if poc.get("contract_id")!=contract_id: continue
+            last_pnl = float(poc.get("profit", last_pnl))
+            if poc.get("is_sold"):
+                return ("WIN" if last_pnl>0 else "LOSS", last_pnl)
+            if time.time()-t0 > timeout_s:
+                return ("TIMEOUT", last_pnl)
+
+# ================== SEÑALES QT ==================
+class Sig(QtCore.QObject):
+    status = QtCore.pyqtSignal(str)
+    row_add = QtCore.pyqtSignal(list)
+    row_upd = QtCore.pyqtSignal(int,str,str)
+    stats  = QtCore.pyqtSignal(int,int,int,float,float)
+
+# ================== WORKER POR SÍMBOLO ==================
+class SymbolWorker(QtCore.QThread):
+    def __init__(self, sym, api: Deriv, sig: Sig, idx_offset=0):
+        super().__init__()
+        self.sym, self.api, self.sig = sym, api, sig
+        self.idx_offset = idx_offset
+        self.run_flag = True
+        self.ops = self.win = self.loss = 0
+        self.pnl_total = 0.0
+        self.row_idx = -1
+
+    def stop(self): self.run_flag = False
+
+    def run(self):
+        while self.run_flag:
+            try:
+                candles = self.api.candles(self.sym, 60)
+                tech, diag = technical_signal(candles)
+                if tech == "NULL":
+                    time.sleep(1); continue
+
+                # fila preliminar
+                hora = datetime.now().strftime("%H:%M:%S")
+                self.row_idx += 1
+                global_row = self.idx_offset + self.row_idx
+                self.sig.row_add.emit([hora, self.sym, f"{tech} (Técnico)", "IA evaluando...", "$0.00"])
+
+                # lanzar IA en paralelo
+                close = [c["close"] for c in candles]
+                q = queue.Queue()
+                th = threading.Thread(target=ia_evaluate_async, args=(close, diag["rsi"], q, 0), daemon=True)
+                th.start()
+
+                # esperar IA hasta timeout sin bloquear flujo total
+                decision = None
+                t0 = time.time()
+                while time.time()-t0 < IA_TIMEOUT_S:
+                    try:
+                        _, decision = q.get_nowait()
+                        break
+                    except queue.Empty:
+                        time.sleep(0.2)
+
+                # fusionar decisión
+                final_dir = tech
+                note = ""
+                if decision == "CONFIRMAR":
+                    final_dir = tech; note = "IA: CONFIRMADA ✅"
+                elif decision == "INVERSA":
+                    final_dir = "PUT" if tech=="CALL" else "CALL"
+                    note = "IA: INVERSA 🔁"
+                elif decision == "RECHAZAR":
+                    self.sig.row_upd.emit(global_row, "CANCELADA (IA)", "$0.00")
+                    continue
+                else:
+                    note = "IA no respondió ⏱️"
+
+                # comprar y monitorear
+                try:
+                    cid, price = self.api.buy(self.sym, final_dir)
+                    self.sig.row_upd.emit(global_row, f"Abierta ({note})", "$0.00")
+                    result, pnl = self.api.monitor(cid, DURATION_MIN*60 + MAX_OPEN_TIME_BUFFER)
+                except Exception as e:
+                    result, pnl = f"ERROR: {e}", 0.0
+
+                # stats
+                self.ops += 1
+                if result.startswith("WIN"): self.win += 1
+                elif result.startswith("LOSS"): self.loss += 1
+                self.pnl_total += pnl
+                acc = (self.win/self.ops*100) if self.ops else 0.0
+
+                self.sig.row_upd.emit(global_row, result, f"${pnl:.2f}")
+                self.sig.stats.emit(self.ops, self.win, self.loss, self.pnl_total, acc)
+                time.sleep(1)
+
+            except Exception as e:
+                self.sig.status.emit(f"❌ {self.sym}: {e}")
+                time.sleep(2)
+
+# ================== ORQUESTADOR ==================
+class Bot(QtCore.QThread):
+    def __init__(self, sig: Sig):
+        super().__init__()
+        self.sig = sig
+        self.api = Deriv(APP_ID, API_TOKEN)
+        self.workers = []
+        self.run_flag = True
+
+    def stop(self):
+        self.run_flag = False
+        for w in self.workers:
+            w.stop()
+            w.wait(500)
+
+    def run(self):
+        try:
+            self.sig.status.emit("🔌 Conectando…")
+            self.api.connect()
+            syms = self.api.valid_symbols()
+            if not syms: self.sig.status.emit("⚠️ Sin símbolos válidos"); return
+            # limitar a modo fluido
+            syms = syms[:MAX_CONCURRENT_SYMBOLS]
+            self.sig.status.emit("🚀 Operando en: " + ", ".join(syms))
+
+            offset = 0
+            for s in syms:
+                w = SymbolWorker(s, self.api, self.sig, idx_offset=offset)
+                w.start()
+                self.workers.append(w)
+                offset += 2000  # reservar espacio de filas por símbolo
+            while self.run_flag:
+                time.sleep(0.2)
+        except Exception as e:
+            self.sig.status.emit(f"❌ Error: {e}")
+
+# ================== GUI ==================
+class UI(QtWidgets.QWidget):
+    def __init__(self):
+        super().__init__()
+        self.setWindowTitle("💹 Deriv Bot v7 — IA paralela + EMA + RSI + PnL (Demo)")
+        self.resize(1320, 780)
+        self.setStyleSheet("""
+            QWidget { background:#0a0f1a; color:#b3e5ff; font:11pt 'Consolas'; }
+            QPushButton { background:#2196f3; color:white; border-radius:6px; padding:8px 14px; }
+            QPushButton:hover { background:#64b5f6; }
+            QTableWidget { background:#101820; color:#b3e5ff; gridline-color:#25455e; }
+            QHeaderView::section { background:#1976d2; color:white; padding:6px; border:none; }
+        """)
+        v = QtWidgets.QVBoxLayout(self)
+        top = QtWidgets.QHBoxLayout()
+        self.btn = QtWidgets.QPushButton("▶️ Iniciar (Demo)")
+        self.btn.clicked.connect(self.toggle)
+        self.lbl = QtWidgets.QLabel("🟡 Inactivo")
+        top.addWidget(self.btn); top.addWidget(self.lbl); top.addStretch(1)
+        v.addLayout(top)
+        self.tbl = QtWidgets.QTableWidget(0,5)
+        self.tbl.setHorizontalHeaderLabels(["Hora","Símbolo","Señal","Resultado","PnL"])
+        self.tbl.horizontalHeader().setStretchLastSection(True)
+        v.addWidget(self.tbl)
+        stats = QtWidgets.QHBoxLayout()
+        self.l_ops=QtWidgets.QLabel("Ops: 0"); self.l_win=QtWidgets.QLabel("Win: 0")
+        self.l_loss=QtWidgets.QLabel("Loss: 0"); self.l_pnl=QtWidgets.QLabel("PnL: $0.00")
+        self.l_acc=QtWidgets.QLabel("Precisión: 0.0%")
+        for w in [self.l_ops,self.l_win,self.l_loss,self.l_pnl,self.l_acc]: stats.addWidget(w)
+        stats.addStretch(1); v.addLayout(stats)
+
+        self.sig = Sig()
+        self.sig.status.connect(self.lbl.setText)
+        self.sig.row_add.connect(self.add_row)
+        self.sig.row_upd.connect(self.upd_row)
+        self.sig.stats.connect(self.set_stats)
+        self.bot = None
+
+    def add_row(self, data):
+        r = self.tbl.rowCount(); self.tbl.insertRow(r)
+        for c,val in enumerate(data): self.tbl.setItem(r,c,QtWidgets.QTableWidgetItem(val))
+
+    def upd_row(self, i, res, pnl):
+        if i < self.tbl.rowCount():
+            self.tbl.setItem(i,3,QtWidgets.QTableWidgetItem(res))
+            self.tbl.setItem(i,4,QtWidgets.QTableWidgetItem(pnl))
+
+    def set_stats(self, ops,w,l,pnl,acc):
+        self.l_ops.setText(f"Ops: {ops}"); self.l_win.setText(f"Win: {w}")
+        self.l_loss.setText(f"Loss: {l}"); self.l_pnl.setText(f"PnL: ${pnl:.2f}")
+        self.l_acc.setText(f"Precisión: {acc:.1f}%")
+
+    def toggle(self):
+        if self.bot and self.bot.isRunning():
+            self.bot.stop(); self.bot.wait(1000)
+            self.bot = None; self.btn.setText("▶️ Iniciar (Demo)"); self.lbl.setText("🟡 Inactivo"); return
+        self.bot = Bot(self.sig); self.bot.start()
+        self.btn.setText("⏹ Detener")
+
+# ================== MAIN ==================
+if __name__ == "__main__":
+    app = QtWidgets.QApplication(sys.argv)
+    ui = UI(); ui.show()
+    sys.exit(app.exec_())
