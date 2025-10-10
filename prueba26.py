@@ -374,6 +374,7 @@ class BotWorker(QObject):
         self._stop_event = threading.Event()
         self._pnl_acumulado = 0.0
         self._pares_descartados: Set[str] = set()
+        self._instrument_cache: Dict[Tuple[str, str, int], Optional[str]] = {}
 
     def stop(self):
         self._stop_event.set()
@@ -689,6 +690,8 @@ class BotWorker(QObject):
                     cast = int(valor)
                 except (TypeError, ValueError):
                     return
+                if cast <= 0:
+                    return
                 if cast not in seen:
                     seen.append(cast)
                 return
@@ -744,7 +747,8 @@ class BotWorker(QObject):
             for clave in ("symbol", "underlying", "active", "asset_name", "name", "ticker"):
                 agregar_variantes(info.get(clave))
 
-        agregar(active_id)
+        if isinstance(active_id, int) and active_id > 0:
+            agregar(active_id)
 
         if seen:
             return tuple(seen)
@@ -754,6 +758,149 @@ class BotWorker(QObject):
             return (fallback,)
 
         return tuple()
+
+    def _generar_aliases_operacion(self, par: TradePair) -> Tuple[str, ...]:
+        candidatos: List[str] = []
+
+        def agregar(valor: Optional[str]) -> None:
+            if not isinstance(valor, str):
+                return
+            texto = valor.strip()
+            if not texto or texto in candidatos:
+                return
+            candidatos.append(texto)
+
+        bases: List[str] = []
+        if isinstance(par.api_symbol, str) and par.api_symbol.strip():
+            bases.append(par.api_symbol.strip())
+
+        sanitizado = _sanitize_symbol_name(par.api_symbol)
+        if sanitizado and sanitizado not in bases:
+            bases.append(sanitizado)
+
+        for alias in par.candle_aliases:
+            if isinstance(alias, str) and alias.strip() and alias not in bases:
+                bases.append(alias.strip())
+
+        for base in bases:
+            agregar(base)
+            agregar(base.upper())
+            agregar(base.lower())
+            if "/" in base:
+                agregar(base.replace("/", ""))
+            if "-" in base:
+                agregar(base.replace("-", ""))
+            normalizado = _sanitize_symbol_name(base)
+            if normalizado and normalizado != base:
+                agregar(normalizado)
+                agregar(normalizado.upper())
+                agregar(normalizado.lower())
+                if "/" in normalizado:
+                    agregar(normalizado.replace("/", ""))
+                if "-" in normalizado:
+                    agregar(normalizado.replace("-", ""))
+            if not base.upper().endswith("-OTC"):
+                agregar(f"{base}-OTC")
+                agregar(f"{base.upper()}-OTC")
+
+        if par.instrument_type == "digital":
+            extras: List[str] = []
+            for texto in list(candidatos):
+                if texto.lower().startswith("do") and len(texto) > 2:
+                    extras.append(texto[2:])
+                else:
+                    extras.append(f"do{texto}")
+                    extras.append(f"do{texto.upper()}")
+                    extras.append(f"do{texto.lower()}")
+            for valor in extras:
+                agregar(valor)
+
+        return tuple(candidatos)
+
+    @staticmethod
+    def _extraer_instrumento_id(payload) -> Optional[str]:
+        if payload is None:
+            return None
+        if isinstance(payload, str):
+            texto = payload.strip()
+            return texto or None
+        if isinstance(payload, dict):
+            for clave in ("instrument_id", "instrumentId", "id", "value"):
+                valor = payload.get(clave)
+                if isinstance(valor, str) and valor.strip():
+                    return valor.strip()
+            for clave in ("result", "instrument", "data", "payload", "info"):
+                if clave in payload:
+                    encontrado = BotWorker._extraer_instrumento_id(payload.get(clave))
+                    if encontrado:
+                        return encontrado
+            for valor in payload.values():
+                encontrado = BotWorker._extraer_instrumento_id(valor)
+                if encontrado:
+                    return encontrado
+            return None
+        if isinstance(payload, (list, tuple, set)):
+            for item in payload:
+                encontrado = BotWorker._extraer_instrumento_id(item)
+                if encontrado:
+                    return encontrado
+        return None
+
+    def _resolver_instrumento_digital(self, iq, par: TradePair, alias: Optional[str]) -> Optional[str]:
+        if not isinstance(alias, str):
+            return None
+        candidato = alias.strip()
+        if not candidato:
+            return None
+
+        cache_key = (par.display, candidato.upper(), EXPIRACION)
+        if cache_key in self._instrument_cache:
+            return self._instrument_cache[cache_key]
+
+        posibles: List[str] = []
+
+        def agregar(valor: Optional[str]) -> None:
+            if not isinstance(valor, str):
+                return
+            texto = valor.strip()
+            if texto and texto not in posibles:
+                posibles.append(texto)
+
+        agregar(candidato)
+        if candidato.lower().startswith("do") and len(candidato) > 2:
+            agregar(candidato[2:])
+
+        normalizado = _sanitize_symbol_name(candidato)
+        agregar(normalizado)
+
+        if normalizado and not normalizado.endswith("-OTC"):
+            agregar(f"{normalizado}-OTC")
+
+        if candidato.endswith("-OTC"):
+            agregar(candidato[:-4])
+
+        for posible in posibles:
+            try:
+                payload = iq.get_digital_spot_instrument(posible, EXPIRACION)
+            except AttributeError:
+                self._instrument_cache[cache_key] = None
+                return None
+            except Exception as exc:
+                logging.debug(
+                    "Instrumento digital no disponible para %s con alias %s: %s",
+                    par.display,
+                    posible,
+                    exc,
+                )
+                continue
+
+            instrument_id = self._extraer_instrumento_id(payload)
+            if instrument_id:
+                self._instrument_cache[cache_key] = instrument_id
+                return instrument_id
+
+        self._instrument_cache[cache_key] = None
+        return None
 
     def _descubrir_pares(self, iq) -> List[TradePair]:
         try:
@@ -839,6 +986,12 @@ class BotWorker(QObject):
                     par, "No devolvió velas durante el filtrado inicial."
                 )
                 continue
+            if not self._verificar_operabilidad_broker(iq, par):
+                self._descartar_par(
+                    par,
+                    "El broker no reconoce el instrumento o no entrega instrument_id válido.",
+                )
+                continue
             pares_operables.append(par)
 
         if pares and not pares_operables:
@@ -852,6 +1005,32 @@ class BotWorker(QObject):
             )
 
         return pares_operables
+
+    def _verificar_operabilidad_broker(self, iq, par: TradePair) -> bool:
+        if par.instrument_type == "digital":
+            for alias in self._generar_aliases_operacion(par):
+                instrument_id = self._resolver_instrumento_digital(iq, par, alias)
+                if instrument_id:
+                    return True
+
+            logging.debug(
+                "El broker no devolvió instrument_id para %s (%s).",
+                par.display,
+                par.instrument_type,
+            )
+            return False
+
+        if par.active_id:
+            symbol = iq.resolve_active_symbol(par.active_id)
+            if symbol:
+                return True
+
+        logging.debug(
+            "El broker no reconoce alias válidos para %s (%s).",
+            par.display,
+            par.instrument_type,
+        )
+        return False
 
     @staticmethod
     def _normalizar_candles(raw) -> List[Dict]:
@@ -1010,27 +1189,82 @@ class BotWorker(QObject):
     def _ejecutar_operacion(
         self, iq, par: TradePair, senal: str
     ) -> Tuple[bool, Optional[Tuple[str, Union[int, str]]]]:
-        try:
-            if par.instrument_type == "digital":
-                ok, op_id = iq.buy_digital_spot(par.api_symbol, MONTO, senal, EXPIRACION)
-                tipo = "digital"
-            else:
-                ok, op_id = iq.buy(MONTO, par.api_symbol, senal, EXPIRACION)
-                tipo = "binary"
-        except Exception:
-            logging.exception(
-                "Error al ejecutar operacion %s en %s", senal, par.display
-            )
-            self._descartar_par(
-                par,
-                "Error de red al ejecutar operación, se descarta el par.",
+        if par.instrument_type == "digital":
+            for alias in self._generar_aliases_operacion(par):
+                instrument_id = self._resolver_instrumento_digital(iq, par, alias)
+                if not instrument_id:
+                    continue
+                try:
+                    ok, op_id = iq.buy_digital_spot(
+                        instrument_id,
+                        MONTO,
+                        senal,
+                        EXPIRACION,
+                    )
+                except Exception as exc:
+                    logging.debug(
+                        "Fallo al ejecutar digital en %s con instrument_id %s: %s",
+                        par.display,
+                        instrument_id,
+                        exc,
+                    )
+                    continue
+                if ok and op_id not in (None, ""):
+                    return True, ("digital", op_id)
+
+            logging.debug(
+                "El broker rechazó la operación digital para %s con todas las variantes.",
+                par.display,
             )
             return False, None
 
-        if not ok or op_id in (None, ""):
-            return False, None
+        admite_parametro_option = True
+        for alias in self._generar_aliases_operacion(par):
+            try:
+                ok, op_id = iq.buy(MONTO, alias, senal, EXPIRACION)
+            except TypeError:
+                admite_parametro_option = False
+                try:
+                    ok, op_id = iq.buy(MONTO, alias, senal, EXPIRACION, option="turbo")
+                except Exception as exc:
+                    logging.debug(
+                        "Fallo al ejecutar binaria en %s con alias %s: %s",
+                        par.display,
+                        alias,
+                        exc,
+                    )
+                    continue
+            except Exception as exc:
+                logging.debug(
+                    "Fallo al ejecutar binaria en %s con alias %s: %s",
+                    par.display,
+                    alias,
+                    exc,
+                )
+                continue
 
-        return True, (tipo, op_id)
+            if ok and op_id not in (None, ""):
+                return True, ("binary", op_id)
+
+            if admite_parametro_option:
+                try:
+                    ok, op_id = iq.buy(
+                        MONTO,
+                        alias,
+                        senal,
+                        EXPIRACION,
+                        option="binary",
+                    )
+                except Exception:
+                    continue
+                if ok and op_id not in (None, ""):
+                    return True, ("binary", op_id)
+
+        logging.debug(
+            "El broker rechazó la operación binaria para %s con todas las variantes.",
+            par.display,
+        )
+        return False, None
 
     def _esperar_resultado(
         self, iq, par: TradePair, ticket: Tuple[str, Union[int, str]]
