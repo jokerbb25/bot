@@ -64,6 +64,19 @@ ESPERA_ENTRE_CICLOS = 3
 CICLOS = 50
 MODO = "PRACTICE"
 
+MANUAL_FALLBACK_INSTRUMENTS: Tuple[str, ...] = (
+    "EURUSD",
+    "EURUSD-OTC",
+    "GBPUSD",
+    "GBPUSD-OTC",
+    "USDJPY",
+    "AUDUSD",
+    "USDCHF",
+    "USDCAD",
+    "EURJPY",
+    "EURGBP",
+)
+
 
 def _normalize_underlying_payload(data: Optional[Dict]) -> Dict:
     """Ensure the IQ Option response always exposes the ``underlying`` key."""
@@ -361,6 +374,8 @@ class TradePair:
     active_id: int
     instrument_type: str  # "digital" or "binary"
     candle_aliases: Tuple[Union[str, int], ...] = field(default_factory=tuple)
+    trade_aliases: Tuple[str, ...] = field(default_factory=tuple)
+    digital_instrument_ids: Tuple[str, ...] = field(default_factory=tuple)
 
 
 class BotWorker(QObject):
@@ -760,6 +775,9 @@ class BotWorker(QObject):
         return tuple()
 
     def _generar_aliases_operacion(self, par: TradePair) -> Tuple[str, ...]:
+        if par.trade_aliases:
+            return par.trade_aliases
+
         candidatos: List[str] = []
 
         def agregar(valor: Optional[str]) -> None:
@@ -770,50 +788,100 @@ class BotWorker(QObject):
                 return
             candidatos.append(texto)
 
-        bases: List[str] = []
-        if isinstance(par.api_symbol, str) and par.api_symbol.strip():
-            bases.append(par.api_symbol.strip())
-
-        sanitizado = _sanitize_symbol_name(par.api_symbol)
-        if sanitizado and sanitizado not in bases:
-            bases.append(sanitizado)
+        base_principal = par.api_symbol.strip() if isinstance(par.api_symbol, str) else ""
+        if base_principal:
+            agregar(base_principal)
+        normalizado_principal = _sanitize_symbol_name(base_principal)
+        if normalizado_principal and normalizado_principal != base_principal:
+            agregar(normalizado_principal)
 
         for alias in par.candle_aliases:
-            if isinstance(alias, str) and alias.strip() and alias not in bases:
-                bases.append(alias.strip())
+            if isinstance(alias, str):
+                agregar(alias)
 
-        for base in bases:
-            agregar(base)
-            agregar(base.upper())
-            agregar(base.lower())
-            if "/" in base:
-                agregar(base.replace("/", ""))
-            if "-" in base:
-                agregar(base.replace("-", ""))
-            normalizado = _sanitize_symbol_name(base)
-            if normalizado and normalizado != base:
-                agregar(normalizado)
-                agregar(normalizado.upper())
-                agregar(normalizado.lower())
-                if "/" in normalizado:
-                    agregar(normalizado.replace("/", ""))
-                if "-" in normalizado:
-                    agregar(normalizado.replace("-", ""))
-            if not base.upper().endswith("-OTC"):
-                agregar(f"{base}-OTC")
-                agregar(f"{base.upper()}-OTC")
+        adicionales: List[str] = []
+        for texto in list(candidatos):
+            if "/" in texto:
+                adicionales.append(texto.replace("/", ""))
+            if "-" in texto:
+                adicionales.append(texto.replace("-", ""))
+            agregar(texto.upper())
+            agregar(texto.lower())
+            normalizado = _sanitize_symbol_name(texto)
+            if normalizado and normalizado not in candidatos:
+                adicionales.append(normalizado)
+        for item in adicionales:
+            agregar(item)
 
         if par.instrument_type == "digital":
-            extras: List[str] = []
+            digitales: List[str] = []
             for texto in list(candidatos):
                 if texto.lower().startswith("do") and len(texto) > 2:
-                    extras.append(texto[2:])
+                    digitales.append(texto[2:])
                 else:
-                    extras.append(f"do{texto}")
-                    extras.append(f"do{texto.upper()}")
-                    extras.append(f"do{texto.lower()}")
-            for valor in extras:
-                agregar(valor)
+                    digitales.append(f"do{texto}")
+            for item in digitales:
+                agregar(item)
+
+        if not candidatos and base_principal:
+            candidatos.append(base_principal)
+
+        return tuple(candidatos)
+
+    @staticmethod
+    def _build_trade_aliases(
+        raw_symbol: Optional[str],
+        resolved_symbol: Optional[str],
+        info: Optional[Dict],
+        instrument_type: str,
+    ) -> Tuple[str, ...]:
+        candidatos: List[str] = []
+
+        def agregar(valor: Optional[str]) -> None:
+            if not isinstance(valor, str):
+                return
+            texto = valor.strip()
+            if not texto or texto in candidatos:
+                return
+            candidatos.append(texto)
+
+        for base in (resolved_symbol, raw_symbol):
+            if isinstance(base, str):
+                agregar(base)
+                normalizado = _sanitize_symbol_name(base)
+                if normalizado:
+                    agregar(normalizado)
+
+        if isinstance(info, dict):
+            for clave in ("symbol", "underlying", "active", "asset_name", "name", "ticker"):
+                agregar(info.get(clave))
+
+        adicionales: List[str] = []
+        for texto in list(candidatos):
+            agregar(texto.upper())
+            agregar(texto.lower())
+            if "/" in texto:
+                adicionales.append(texto.replace("/", ""))
+            if "-" in texto:
+                adicionales.append(texto.replace("-", ""))
+            normalizado = _sanitize_symbol_name(texto)
+            if normalizado and normalizado not in candidatos:
+                adicionales.append(normalizado)
+
+        for extra in adicionales:
+            agregar(extra)
+
+        if instrument_type == "digital":
+            variantes: List[str] = []
+            for texto in list(candidatos):
+                if texto.lower().startswith("do") and len(texto) > 2:
+                    variantes.append(texto[2:])
+                else:
+                    variantes.append(f"do{texto}")
+                    variantes.append(f"do{texto.upper()}")
+                    variantes.append(f"do{texto.lower()}")
+            for texto in variantes:
+                agregar(texto)
 
         return tuple(candidatos)
 
@@ -845,6 +913,46 @@ class BotWorker(QObject):
                 if encontrado:
                     return encontrado
         return None
+
+    @staticmethod
+    def _extraer_instrument_ids(info: Optional[Dict], instrument_type: str) -> Tuple[str, ...]:
+        if instrument_type != "digital" or not isinstance(info, dict):
+            return tuple()
+
+        encontrados: List[str] = []
+
+        def registrar(valor: Optional[Union[str, Iterable]]):
+            if isinstance(valor, str):
+                texto = valor.strip()
+                if texto and texto not in encontrados:
+                    encontrados.append(texto)
+            elif isinstance(valor, (list, tuple, set)):
+                for item in valor:
+                    registrar(item)
+            elif isinstance(valor, dict):
+                for clave in ("instrument_id", "instrumentId", "id", "value", "spot_id"):
+                    if clave in valor:
+                        registrar(valor.get(clave))
+
+        for clave in (
+            "instrument_id",
+            "instrumentId",
+            "id",
+            "value",
+            "spot_id",
+        ):
+            registrar(info.get(clave))
+
+        for clave in (
+            "instruments",
+            "available_instruments",
+            "instrument_ids",
+            "items",
+            "list",
+        ):
+            registrar(info.get(clave))
+
+        return tuple(encontrados)
 
     def _resolver_instrumento_digital(self, iq, par: TradePair, alias: Optional[str]) -> Optional[str]:
         if not isinstance(alias, str):
@@ -957,12 +1065,33 @@ class BotWorker(QObject):
                 tipo,
                 active_id,
             )
+            trade_aliases = self._build_trade_aliases(
+                simbolo_original,
+                api_symbol,
+                info,
+                tipo,
+            )
+            instrument_ids = self._extraer_instrument_ids(info, tipo)
+            if tipo == "digital" and not instrument_ids:
+                instrument_ids = tuple(
+                    alias
+                    for alias in trade_aliases
+                    if isinstance(alias, str) and alias.lower().startswith("do")
+                )
+            if tipo != "digital" and active_id <= 0:
+                logging.debug(
+                    "Se omite %s por falta de active_id válido para operaciones binarias.",
+                    display,
+                )
+                continue
             candidates[display] = TradePair(
                 display=display,
                 api_symbol=api_symbol,
                 active_id=active_id,
                 instrument_type=tipo,
                 candle_aliases=aliases,
+                trade_aliases=trade_aliases,
+                digital_instrument_ids=instrument_ids,
             )
 
         activos_validos = list(candidates.values())
@@ -970,8 +1099,57 @@ class BotWorker(QObject):
             logging.warning(
                 "No se encontraron pares operables tras analizar horarios y metadatos digitales."
             )
+            manuales = self._construir_pares_manuales(iq)
+            if manuales:
+                logging.info(
+                    "Se utilizará un catálogo manual de respaldo con %s pares digitales.",
+                    len(manuales),
+                )
+                return manuales
 
         return activos_validos[:20]
+
+    def _construir_pares_manuales(self, iq) -> List[TradePair]:
+        pares: List[TradePair] = []
+        for simbolo in MANUAL_FALLBACK_INSTRUMENTS:
+            tipo = "digital"
+            base = _sanitize_symbol_name(simbolo) or simbolo.strip()
+            if not base:
+                continue
+            display = base
+            trade_aliases = self._build_trade_aliases(simbolo, base, {}, tipo)
+            candle_aliases = self._generar_aliases_candles(simbolo, base, {}, tipo, 0)
+            dummy = TradePair(
+                display=display,
+                api_symbol=base,
+                active_id=0,
+                instrument_type=tipo,
+                candle_aliases=candle_aliases,
+                trade_aliases=trade_aliases,
+                digital_instrument_ids=tuple(),
+            )
+            instrumentos: List[str] = []
+            for alias in trade_aliases:
+                instrumento = self._resolver_instrumento_digital(iq, dummy, alias)
+                if instrumento and instrumento not in instrumentos:
+                    instrumentos.append(instrumento)
+            if not instrumentos:
+                continue
+            pares.append(
+                TradePair(
+                    display=display,
+                    api_symbol=base,
+                    active_id=0,
+                    instrument_type=tipo,
+                    candle_aliases=candle_aliases,
+                    trade_aliases=trade_aliases,
+                    digital_instrument_ids=tuple(instrumentos),
+                )
+            )
+            if len(pares) >= 20:
+                break
+
+        return pares
 
     def _filtrar_activos_operables(
         self, iq, pares: List[TradePair]
@@ -1008,6 +1186,9 @@ class BotWorker(QObject):
 
     def _verificar_operabilidad_broker(self, iq, par: TradePair) -> bool:
         if par.instrument_type == "digital":
+            for instrument_id in par.digital_instrument_ids:
+                if isinstance(instrument_id, str) and instrument_id.strip():
+                    return True
             for alias in self._generar_aliases_operacion(par):
                 instrument_id = self._resolver_instrumento_digital(iq, par, alias)
                 if instrument_id:
@@ -1020,7 +1201,7 @@ class BotWorker(QObject):
             )
             return False
 
-        if par.active_id:
+        if par.active_id and par.active_id > 0:
             symbol = iq.resolve_active_symbol(par.active_id)
             if symbol:
                 return True
@@ -1190,10 +1371,17 @@ class BotWorker(QObject):
         self, iq, par: TradePair, senal: str
     ) -> Tuple[bool, Optional[Tuple[str, Union[int, str]]]]:
         if par.instrument_type == "digital":
-            for alias in self._generar_aliases_operacion(par):
-                instrument_id = self._resolver_instrumento_digital(iq, par, alias)
-                if not instrument_id:
-                    continue
+            candidatos_instrumento: List[str] = [
+                instrumento.strip()
+                for instrumento in par.digital_instrument_ids
+                if isinstance(instrumento, str) and instrumento.strip()
+            ]
+            if not candidatos_instrumento:
+                for alias in self._generar_aliases_operacion(par):
+                    instrument_id = self._resolver_instrumento_digital(iq, par, alias)
+                    if instrument_id:
+                        candidatos_instrumento.append(instrument_id)
+            for instrument_id in candidatos_instrumento:
                 try:
                     ok, op_id = iq.buy_digital_spot(
                         instrument_id,
