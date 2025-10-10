@@ -512,6 +512,8 @@ class BotWorker(QObject):
             return False
         if info.get("open") is False or info.get("is_open") is False:
             return False
+        if info.get("open") is True or info.get("is_open") is True:
+            return True
         claves = ("id", "active_id", "instrument_id", "asset_id", "underlying_id")
         if any(info.get(clave) not in (None, {}, []) for clave in claves):
             return True
@@ -779,15 +781,15 @@ class BotWorker(QObject):
             if info.get("open") is False or info.get("is_open") is False:
                 continue
             active_id = self._extraer_active_id(info)
-            if active_id is None:
-                continue
-            resolved = iq.resolve_active_symbol(active_id)
+            if not active_id:
+                active_id = 0
+            resolved = iq.resolve_active_symbol(active_id) if active_id else None
             if not resolved:
-                resolved = _sanitize_symbol_name(simbolo_original)
+                resolved = _sanitize_symbol_name(simbolo_original) or simbolo_original
             if not resolved:
                 continue
             tipo = self._tipo_desde_categoria(categoria)
-            clave_vista = (active_id, tipo)
+            clave_vista = (resolved, tipo)
             if clave_vista in vistos:
                 continue
             vistos.add(clave_vista)
