@@ -22,12 +22,14 @@ STAKE = 1.0
 DURATION_MIN = 1
 MAX_RETRIES = 3
 MAX_CONCURRENT_SYMBOLS = 2
-IA_TIMEOUT_S = 10
-IA_TIMEOUT_INCREMENT = 5
+IA_TIMEOUT_S = 12
+IA_TIMEOUT_BACKOFF_FACTOR = 1.6
 IA_MAX_RETRIES = 3
 IA_MODEL = "llama3"
+SMART_MODE_DEFAULT = True
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
+
 
 # ========== INDICADORES ==========
 def ema(arr, p):
@@ -141,16 +143,42 @@ def _refine_confidence(signal, confidence, ctx):
         conf += 0.02
         reasons.append("Volatilidad contenida")
 
-    return max(0.0, min(conf, 0.99)), reasons
+    conf = max(0.0, min(conf, 0.99))
+    return conf, reasons
+
+
+def adjust_confidence_with_history(history, signal, confidence):
+    conf = confidence
+    notes = []
+    if not history or signal not in {"CALL", "PUT"}:
+        return max(0.05, min(conf, 0.95)), notes
+
+    recent_results = [h for h in history if h.get("result") in {"WIN", "LOSS"}]
+    last_five = recent_results[-5:]
+    if len(last_five) == 5 and all(item.get("result") == "LOSS" for item in last_five):
+        conf *= 0.85
+        notes.append("5 pérdidas recientes → confianza reducida")
+
+    streak = 0
+    for trade in reversed(recent_results):
+        if trade.get("result") == "WIN":
+            streak += 1
+        else:
+            break
+    if streak >= 3:
+        conf += 0.04
+        notes.append("Racha de 3 ganancias → confianza incrementada")
+
+    conf = max(0.05, min(conf, 0.95))
+    return conf, notes
 
 
 def _fallback_decision(base_signal, base_conf, ctx):
     conf, reasons = _refine_confidence(base_signal, base_conf, ctx)
-    final_signal = base_signal
-    if conf < 0.5:
-        reasons.append("Confianza insuficiente")
-        final_signal = "SKIP"
-    return final_signal, conf, "; ".join(reasons)
+    if conf < 0.35:
+        reasons.append("Confianza insuficiente (<0.35)")
+        return "SKIP", conf, "; ".join(reasons)
+    return base_signal, conf, "; ".join(reasons)
 
 
 def technical_signal(candles):
@@ -267,7 +295,7 @@ def technical_signal(candles):
     else:
         market_state = "mixed"
 
-    confidence = 0.4 + min(abs(diff), 5.0) * 0.1
+    confidence = 0.42 + min(abs(diff), 5.0) * 0.1
     if alignment:
         confidence += 0.15
     if divergence != "none":
@@ -347,7 +375,6 @@ def ia_eval_async(symbol, close, rsi_val, out_q, idx, candles_ctx=None, rsi_tren
                   market_state="mixed", alignment=False, volatility=0.0, trade_history=None):
     candles_ctx = candles_ctx or []
     trade_history = trade_history or []
-    slope_label = "alcista" if ema_slope > 0 else "bajista" if ema_slope < 0 else "plana"
     alignment_label = "alineados" if alignment else "divergentes"
     summary = {
         "symbol": symbol,
@@ -360,35 +387,35 @@ def ia_eval_async(symbol, close, rsi_val, out_q, idx, candles_ctx=None, rsi_tren
         "market_state": market_state,
         "volatility": round(volatility, 4),
         "alignment": alignment_label,
-        "recent_trades": trade_history,
+        "recent_trades": trade_history[-5:],
         "recent_closes": close[-10:],
-        "last_30_candles": [
+        "recent_candles": [
             {
                 "open": c["open"],
                 "high": c["high"],
                 "low": c["low"],
                 "close": c["close"],
             }
-            for c in candles_ctx
+            for c in candles_ctx[-15:]
         ],
     }
     prompt = (
-        "Eres una IA analista de trading binario a 1 minuto. Usa EMA, RSI, patrones de velas y resultados recientes para tomar una decisión.\n"
-        "Evalúa si conviene ejecutar la operación propuesta.\n"
-        "A continuación tienes un resumen estructurado en JSON:\n"
+        "Tu objetivo es mejorar la tasa de aciertos usando el contexto de EMA y RSI.\n"
+        "Eres una IA analista de trading binario a 1 minuto y debes decidir si ejecutamos la operación.\n"
+        "Evalúa la alineación entre EMA y RSI, el tipo de mercado y la volatilidad.\n"
+        "A continuación tienes un resumen en JSON:\n"
         f"{json.dumps(summary, ensure_ascii=False)}\n"
-        "Analiza la alineación entre EMA y RSI, el tipo de mercado y la presencia de divergencias.\n"
-        "Responde ÚNICAMENTE con un JSON que contenga las claves decision, confidence (0-1) y rationale (máx 140 caracteres).\n"
-        "Las decisiones válidas son CONFIRMAR, INVERSA o RECHAZAR.\n"
-        "Considera el sesgo actual: CONFIRMAR = mantener la señal técnica, INVERSA = cambiarla al lado opuesto, RECHAZAR = no operar.\n"
+        "Responde SOLO con un JSON que contenga decision, confidence (0-1) y rationale (máx 140 caracteres).\n"
+        "Las decisiones válidas: CONFIRMAR (mantenemos), INVERSA (cambiamos lado) o RECHAZAR (no operar).\n"
     )
 
     session = requests.Session()
     for attempt in range(1, IA_MAX_RETRIES + 1):
-        timeout = IA_TIMEOUT_S + IA_TIMEOUT_INCREMENT * (attempt - 1)
+        timeout = IA_TIMEOUT_S * (IA_TIMEOUT_BACKOFF_FACTOR ** (attempt - 1))
         logging.info(
-            f"[{symbol}] ⏳ Intento IA {attempt}/{IA_MAX_RETRIES} (timeout {timeout}s) a las {datetime.now().strftime('%H:%M:%S')}"
+            f"[{symbol}] ⏳ Intento IA {attempt}/{IA_MAX_RETRIES} (timeout {timeout:.1f}s) a las {datetime.now().strftime('%H:%M:%S')}"
         )
+        start_time = time.time()
         try:
             response = session.post(
                 "http://localhost:11434/api/generate",
@@ -407,18 +434,24 @@ def ia_eval_async(symbol, close, rsi_val, out_q, idx, candles_ctx=None, rsi_tren
                 if payload.get("done"):
                     break
                 acc += payload.get("response", "")
+            elapsed = time.time() - start_time
+            if elapsed > timeout * 0.8:
+                logging.warning(f"[{symbol}] ⚠️ Respuesta IA lenta ({elapsed:.2f}s)")
             parsed = _parse_ai_response(acc)
             if parsed:
-                parsed.update({"source": "AI", "attempts": attempt})
+                parsed.update({"source": "AI", "attempts": attempt, "latency": elapsed})
                 out_q.put((idx, parsed))
                 session.close()
                 return
             logging.warning(f"[{symbol}] Respuesta IA no válida: {acc.strip()[:150]}")
         except requests.exceptions.Timeout:
-            logging.warning(f"[{symbol}] IA timeout en intento {attempt} tras {timeout}s")
+            logging.warning(f"[{symbol}] ❌ Timeout IA intento {attempt} tras {timeout:.1f}s")
+        except requests.exceptions.ConnectionError:
+            logging.error(f"[{symbol}] ❌ Conexión con Ollama rechazada, reintentando")
+            session = requests.Session()
         except Exception as exc:
             logging.warning(f"[{symbol}] IA error intento {attempt}: {exc}")
-        time.sleep(0.5)
+        time.sleep(0.5 * attempt)
     session.close()
     out_q.put((idx, {
         "decision": "SIN_IA",
@@ -458,11 +491,21 @@ class Deriv:
         with self.lock:
             data["req_id"] = self.req_id
             self.req_id += 1
-            self.ws.send(json.dumps(data))
+            try:
+                self.ws.send(json.dumps(data))
+            except Exception:
+                logging.warning("WebSocket roto, intentando reconexión automática")
+                self.connect()
+                self.ws.send(json.dumps(data))
             return data["req_id"]
 
     def _recv(self):
-        return json.loads(self.ws.recv())
+        while True:
+            try:
+                return json.loads(self.ws.recv())
+            except Exception:
+                logging.warning("Recepción fallida, restableciendo conexión WebSocket")
+                self.connect()
 
     def candles(self, symbol, count=60, retries=MAX_RETRIES):
         for attempt in range(retries):
@@ -537,22 +580,37 @@ class Sig(QtCore.QObject):
 
 
 class Worker(QtCore.QThread):
-    def __init__(self, sym, api, sig, offset):
+    def __init__(self, sym, api, sig, offset, smart_mode=True):
         super().__init__()
         self.sym = sym
         self.api = api
         self.sig = sig
         self.offset = offset
+        self.smart_mode = smart_mode
         self.run_flag = True
         self.ops = 0
         self.win = 0
         self.loss = 0
         self.pnl = 0.0
         self.row_counter = 0
-        self.trade_history = deque(maxlen=5)
+        self.trade_history = deque(maxlen=20)
+        self.trade_archive = []
 
     def stop(self):
         self.run_flag = False
+
+    def _log_preanalysis(self, signal, confidence, ctx):
+        logging.info(
+            f"[{self.sym}] Preanálisis → Señal: {signal} ({confidence:.2f}) | EMA: {ctx['ema_slope']:+.4f} | "
+            f"RSI: {ctx['rsi']:.2f} ({ctx['rsi_trend']}) | Divergencia: {ctx['divergence']} | Velas: {ctx['candle_bias']} | "
+            f"Mercado: {ctx['market_state']}"
+        )
+
+    def _log_final(self, confidence, decision, ctx, source, marker, rationale):
+        logging.info(
+            f"[{self.sym}] Confidence: {confidence:.2f} | Decision: {decision} | EMA: {ctx['ema_slope']:+.4f} | "
+            f"RSI: {ctx['rsi']:.2f} ({ctx['rsi_trend']}) | Divergence: {ctx['divergence']} | Fuente: {source} {marker} {rationale}"
+        )
 
     def run(self):
         while self.run_flag:
@@ -563,11 +621,7 @@ class Worker(QtCore.QThread):
                 ctx = tech_data["context"]
                 base_conf = tech_data["confidence"]
 
-                logging.info(
-                    f"[{self.sym}] Preanálisis técnico → Señal: {tech_signal} ({base_conf:.2f}) | EMA: {ctx['ema_slope']:+.4f} | "
-                    f"RSI: {ctx['rsi']:.2f} ({ctx['rsi_trend']}) | Divergencia: {ctx['divergence']} | Velas: {ctx['candle_bias']} | "
-                    f"Mercado: {ctx['market_state']}"
-                )
+                self._log_preanalysis(tech_signal, base_conf, ctx)
 
                 if tech_signal == "NULL":
                     time.sleep(2)
@@ -583,54 +637,65 @@ class Worker(QtCore.QThread):
                     f"{tech_signal} ({base_conf:.2f})",
                     "Pendiente",
                     "$0.00",
-                    "Analizando",
+                    "—",
                     "Analizando",
                 ])
 
                 close = [c["close"] for c in candles]
-                last_30 = candles[-30:]
-                trade_summary = [dict(item) for item in self.trade_history]
-                q = queue.Queue()
-                th = threading.Thread(
-                    target=ia_eval_async,
-                    args=(
-                        self.sym,
-                        close,
-                        ctx["rsi"],
-                        q,
-                        0,
-                        last_30,
-                        ctx["rsi_trend"],
-                        ctx["ema_slope"],
-                        tech_signal,
-                        base_conf,
-                        ctx["candle_bias"],
-                        ctx["divergence"],
-                        ctx["market_state"],
-                        ctx["alignment"],
-                        ctx["volatility"],
-                        trade_summary,
-                    ),
-                )
-                th.daemon = True
-                th.start()
-
-                max_wait = IA_TIMEOUT_S + IA_TIMEOUT_INCREMENT * (IA_MAX_RETRIES - 1) + 3
-                try:
-                    _, ai_data = q.get(timeout=max_wait)
-                except queue.Empty:
-                    ai_data = {
-                        "decision": "SIN_IA",
-                        "confidence": None,
-                        "rationale": "IA sin respuesta",
-                        "source": "TECHNICAL",
+                recent_candles = candles[-20:]
+                trade_summary = [
+                    {
+                        "time": item.get("time"),
+                        "decision": item.get("decision"),
+                        "result": item.get("result"),
+                        "confidence": item.get("confidence"),
+                        "source": item.get("source"),
                     }
+                    for item in list(self.trade_history)[-5:]
+                ]
+
+                ai_data = {"decision": "SIN_IA", "confidence": None, "rationale": "Modo técnico", "source": "TECH"}
+                if self.smart_mode:
+                    q = queue.Queue()
+                    th = threading.Thread(
+                        target=ia_eval_async,
+                        args=(
+                            self.sym,
+                            close,
+                            ctx["rsi"],
+                            q,
+                            0,
+                            recent_candles,
+                            ctx["rsi_trend"],
+                            ctx["ema_slope"],
+                            tech_signal,
+                            base_conf,
+                            ctx["candle_bias"],
+                            ctx["divergence"],
+                            ctx["market_state"],
+                            ctx["alignment"],
+                            ctx["volatility"],
+                            trade_summary,
+                        ),
+                    )
+                    th.daemon = True
+                    th.start()
+
+                    max_wait = sum(IA_TIMEOUT_S * (IA_TIMEOUT_BACKOFF_FACTOR ** i) for i in range(IA_MAX_RETRIES)) + 2
+                    try:
+                        _, ai_data = q.get(timeout=max_wait)
+                    except queue.Empty:
+                        ai_data = {
+                            "decision": "SIN_IA",
+                            "confidence": None,
+                            "rationale": "IA sin respuesta",
+                            "source": "TECHNICAL",
+                        }
 
                 decision = ai_data.get("decision", "SIN_IA").upper()
                 ai_conf = ai_data.get("confidence")
                 ai_reason = ai_data.get("rationale", "").strip()
-                source = ai_data.get("source", "TECHNICAL")
-                attempts = ai_data.get("attempts", 0)
+                source = ai_data.get("source", "TECH")
 
                 marker = ""
                 final_signal = tech_signal
@@ -641,23 +706,22 @@ class Worker(QtCore.QThread):
                     marker = "❌"
                     final_signal = "SKIP"
                     final_conf = ai_conf if ai_conf is not None else base_conf
-                    logging.info(
-                        f"[{self.sym}] Confidence: {final_conf:.2f} | Decision: SKIP | EMA: {ctx['ema_slope']:+.4f} | "
-                        f"RSI: {ctx['rsi']:.2f} ({ctx['rsi_trend']}) | Divergence: {ctx['divergence']} | Fuente: AI {marker} {ai_reason}"
-                    )
+                    rationale = ai_reason or "IA rechazó la operación"
+                    self._log_final(final_conf, "SKIP", ctx, source, marker, rationale)
                     self.trade_history.append({
                         "time": hora,
                         "decision": "SKIP",
-                        "result": "REJECTED",
+                        "result": "RECHAZADA",
                         "confidence": round(final_conf, 2),
                         "source": "AI",
                     })
+                    self.trade_archive.append(self.trade_history[-1])
                     payload = {
                         "final_decision": "SKIP",
                         "trade_result": "RECHAZADA",
-                        "source": "AI",
+                        "source": source,
                         "ai_confidence": ai_conf,
-                        "ai_rationale": ai_reason,
+                        "ai_rationale": rationale,
                         "final_confidence": final_conf,
                         "context_reason": "",
                     }
@@ -668,10 +732,7 @@ class Worker(QtCore.QThread):
                 if decision == "INVERSA":
                     marker = "⚠️"
                     final_signal = "PUT" if tech_signal == "CALL" else "CALL"
-                    if ai_conf is not None:
-                        final_conf = ai_conf
-                    else:
-                        final_conf = max(0.5, 1 - base_conf * 0.5)
+                    final_conf = ai_conf if ai_conf is not None else max(0.45, base_conf * 0.9)
                     final_conf, context_reasons = _refine_confidence(final_signal, final_conf, ctx)
                     context_reason = "; ".join(context_reasons)
                     source = "AI inversa"
@@ -685,45 +746,45 @@ class Worker(QtCore.QThread):
                 else:
                     final_signal, final_conf, context_reason = _fallback_decision(tech_signal, base_conf, ctx)
                     source = "Technical fallback"
-                    if final_signal == "SKIP":
-                        marker = "⚠️"
-                        log_message = (
-                            f"[{self.sym}] IA fallback: confianza {final_conf:.2f} | Decision: SKIP | EMA: {ctx['ema_slope']:+.4f} | "
-                            f"RSI: {ctx['rsi']:.2f} ({ctx['rsi_trend']}) | Divergence: {ctx['divergence']} | Fuente: Technical"
-                        )
-                        logging.info(log_message)
-                        self.trade_history.append({
-                            "time": hora,
-                            "decision": "SKIP",
-                            "result": "OMITIDO",
-                            "confidence": round(final_conf, 2),
-                            "source": "TECH",
-                        })
-                        payload = {
-                            "final_decision": "SKIP",
-                            "trade_result": "OMITIDO",
-                            "source": "Technical",
-                            "ai_confidence": ai_conf,
-                            "ai_rationale": ai_reason,
-                            "final_confidence": final_conf,
-                            "context_reason": context_reason,
-                        }
-                        self.sig.upd.emit(row_id, json.dumps(payload), "0.0")
-                        time.sleep(2)
-                        continue
-                    logging.info(
-                        f"[{self.sym}] AI unavailable after {attempts if attempts else IA_MAX_RETRIES} retries → fallback técnico"
-                    )
+                    marker = "⚠️"
+                    logging.info(f"[{self.sym}] AI no disponible → aplicando análisis técnico inmediato")
 
-                final_conf = max(0.05, min(final_conf, 0.99))
+                final_conf, history_notes = adjust_confidence_with_history(self.trade_history, final_signal, final_conf)
+                if history_notes:
+                    history_reason = " | ".join(history_notes)
+                    context_reason = f"{context_reason} | {history_reason}" if context_reason else history_reason
+
                 combined_reason = ai_reason
                 if context_reason:
                     combined_reason = f"{ai_reason} | {context_reason}" if ai_reason else context_reason
 
-                logging.info(
-                    f"[{self.sym}] Confidence: {final_conf:.2f} | Decision: {final_signal} | EMA: {ctx['ema_slope']:+.4f} | "
-                    f"RSI: {ctx['rsi']:.2f} ({ctx['rsi_trend']}) | Divergence: {ctx['divergence']} | Fuente: {source} {marker} {combined_reason}"
-                )
+                if final_signal != "SKIP" and final_conf < 0.35:
+                    marker = "⚠️"
+                    combined_reason = f"{combined_reason} | Confianza <0.35, operación descartada" if combined_reason else "Confianza <0.35, operación descartada"
+                    self._log_final(final_conf, "SKIP", ctx, source, marker, combined_reason)
+                    self.trade_history.append({
+                        "time": hora,
+                        "decision": "SKIP",
+                        "result": "CONF_BAJA",
+                        "confidence": round(final_conf, 2),
+                        "source": source,
+                    })
+                    self.trade_archive.append(self.trade_history[-1])
+                    payload = {
+                        "final_decision": "SKIP",
+                        "trade_result": "OMITIDO",
+                        "source": source,
+                        "ai_confidence": ai_conf,
+                        "ai_rationale": combined_reason,
+                        "final_confidence": final_conf,
+                        "context_reason": context_reason,
+                    }
+                    self.sig.upd.emit(row_id, json.dumps(payload), "0.0")
+                    time.sleep(2)
+                    continue
+
+                final_conf = max(0.05, min(final_conf, 0.95))
+                self._log_final(final_conf, final_signal, ctx, source, marker, combined_reason)
 
                 cid, price = self.api.buy(self.sym, final_signal)
                 if cid is None:
@@ -762,13 +823,15 @@ class Worker(QtCore.QThread):
                 self.sig.upd.emit(row_id, json.dumps(payload), f"{pnl:.2f}")
                 self.sig.stats.emit(self.ops, self.win, self.loss, self.pnl, acc)
 
-                self.trade_history.append({
+                trade_record = {
                     "time": hora,
                     "decision": final_signal,
                     "result": result,
                     "confidence": round(final_conf, 2),
                     "source": source,
-                })
+                }
+                self.trade_history.append(trade_record)
+                self.trade_archive.append(trade_record)
 
                 time.sleep(2)
             except Exception as e:
@@ -777,11 +840,12 @@ class Worker(QtCore.QThread):
 
 
 class Bot(QtCore.QThread):
-    def __init__(self, sig):
+    def __init__(self, sig, smart_mode=True):
         super().__init__()
         self.sig = sig
         self.api = Deriv(APP_ID, API_TOKEN)
         self.workers = []
+        self.smart_mode = smart_mode
 
     def run(self):
         self.api.connect()
@@ -789,7 +853,7 @@ class Bot(QtCore.QThread):
         self.sig.status.emit("🚀 Operando en: " + ", ".join(syms))
         offset = 0
         for s in syms:
-            w = Worker(s, self.api, self.sig, offset)
+            w = Worker(s, self.api, self.sig, offset, smart_mode=self.smart_mode)
             self.workers.append(w)
             w.start()
             offset += 2000
@@ -798,7 +862,7 @@ class Bot(QtCore.QThread):
 class UI(QtWidgets.QWidget):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("💹 Deriv Bot v7.1 — IA completa + EMA + RSI + Reconexión")
+        self.setWindowTitle("💹 Deriv Bot v7.2 — IA adaptable + EMA + RSI")
         self.resize(1280, 720)
         self.setStyleSheet("""
             QWidget { background:#0a0f1a; color:#b3e5ff; font:11pt 'Consolas'; }
@@ -806,13 +870,17 @@ class UI(QtWidgets.QWidget):
             QPushButton:hover { background:#64b5f6; }
             QTableWidget { background:#101820; color:#b3e5ff; gridline-color:#25455e; }
             QHeaderView::section { background:#1976d2; color:white; padding:6px; border:none; }
+            QCheckBox { color:#b3e5ff; }
         """)
         v = QtWidgets.QVBoxLayout(self)
         h = QtWidgets.QHBoxLayout()
         self.btn = QtWidgets.QPushButton("▶️ Iniciar")
         self.btn.clicked.connect(self.toggle)
         self.lbl = QtWidgets.QLabel("🟡 Inactivo")
+        self.smart_mode_chk = QtWidgets.QCheckBox("Smart Mode (IA)")
+        self.smart_mode_chk.setChecked(SMART_MODE_DEFAULT)
         h.addWidget(self.btn)
+        h.addWidget(self.smart_mode_chk)
         h.addWidget(self.lbl)
         v.addLayout(h)
         self.tbl = QtWidgets.QTableWidget(0, 7)
@@ -852,8 +920,26 @@ class UI(QtWidgets.QWidget):
         r = self.tbl.rowCount()
         self.tbl.insertRow(r)
         for c, v in enumerate(values):
-            self.tbl.setItem(r, c, QtWidgets.QTableWidgetItem(v))
+            item = QtWidgets.QTableWidgetItem(v)
+            if c == 3:
+                item.setBackground(QtGui.QColor("#FFC107"))
+            self.tbl.setItem(r, c, item)
         self.row_map[row_id] = r
+
+    def _color_result_cell(self, row, text):
+        item = self.tbl.item(row, 3)
+        if item is None:
+            item = QtWidgets.QTableWidgetItem(text)
+            self.tbl.setItem(row, 3, item)
+        if "WIN" in text:
+            item.setBackground(QtGui.QColor("#1B5E20"))
+        elif "LOSS" in text:
+            item.setBackground(QtGui.QColor("#B71C1C"))
+        elif "Pendiente" in text or "Analizando" in text:
+            item.setBackground(QtGui.QColor("#FFC107"))
+        else:
+            item.setBackground(QtGui.QColor("#455A64"))
+        item.setText(text)
 
     def upd_row(self, i, res, pnl):
         row = self.row_map.get(i)
@@ -874,7 +960,7 @@ class UI(QtWidgets.QWidget):
         trade_result = data.get("trade_result", "-")
         source = data.get("source")
         result_text = trade_result if not source else f"{trade_result} | {source}"
-        self.tbl.setItem(row, 3, QtWidgets.QTableWidgetItem(result_text))
+        self._color_result_cell(row, result_text)
         try:
             pnl_value = float(pnl)
         except (TypeError, ValueError):
@@ -900,10 +986,12 @@ class UI(QtWidgets.QWidget):
     def toggle(self):
         if self.bot:
             return
-        self.bot = Bot(self.sig)
+        smart_mode = self.smart_mode_chk.isChecked()
+        self.bot = Bot(self.sig, smart_mode=smart_mode)
         self.bot.start()
         self.lbl.setText("✅ Operando")
         self.btn.setDisabled(True)
+        self.smart_mode_chk.setDisabled(True)
 
 
 if __name__ == "__main__":
