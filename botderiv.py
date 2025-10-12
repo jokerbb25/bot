@@ -3,8 +3,9 @@ import time
 import json
 import threading
 import logging
+import warnings
 from dataclasses import dataclass, field
-from datetime import datetime
+from datetime import datetime, timezone, timedelta
 from pathlib import Path
 from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
@@ -28,7 +29,7 @@ except ImportError:  # pragma: no cover
 # ===============================================================
 APP_ID = "1089"
 API_TOKEN = "dK57Ark9QreDexO"
-SYMBOLS = ["R_25", "R_50"]
+SYMBOLS = ["R_25", "R_50", "R_75", "R_100"]
 GRANULARITY = 60
 CANDLE_COUNT = 200
 STAKE = 1.0
@@ -54,6 +55,8 @@ ADAPTIVE_STATE_PATH = Path("adaptive_ai_state.npz")
 ADVISORY_INTERVAL_SEC = 180
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
+warnings.filterwarnings("ignore", category=DeprecationWarning)
+warnings.filterwarnings("ignore", category=RuntimeWarning, message="overflow encountered in exp")
 
 
 # ===============================================================
@@ -279,12 +282,12 @@ def strategy_volatility_filter(df: pd.DataFrame) -> StrategyResult:
     return StrategyResult("NULL", 0.0, [])
 
 
-STRATEGY_FUNCTIONS = [
-    strategy_rsi_ema,
-    strategy_bollinger_rebound,
-    strategy_trend_filter,
-    strategy_pullback,
-    strategy_breakout,
+STRATEGY_FUNCTIONS: List[Tuple[str, Callable[[pd.DataFrame], StrategyResult]]] = [
+    ("RSI+EMA", strategy_rsi_ema),
+    ("Bollinger Rebound", strategy_bollinger_rebound),
+    ("Trend Filter", strategy_trend_filter),
+    ("Pullback", strategy_pullback),
+    ("Breakout", strategy_breakout),
 ]
 
 
@@ -322,10 +325,10 @@ class RiskManager:
         self.total_pnl = 0.0
         self.daily_trades = 0
         self.consecutive_losses = 0
-        self.last_trade_time = datetime.min
+        self.last_trade_time = datetime.now(timezone.utc) - timedelta(seconds=TRADE_DELAY)
 
     def can_trade(self, confidence: float) -> bool:
-        now = datetime.utcnow()
+        now = datetime.now(timezone.utc)
         if self.daily_trades >= MAX_DAILY_TRADES:
             logging.info("Max daily trades reached")
             return False
@@ -350,7 +353,7 @@ class RiskManager:
         self.daily_trades += 1
         self.daily_pnl += pnl
         self.total_pnl += pnl
-        self.last_trade_time = datetime.utcnow()
+        self.last_trade_time = datetime.now(timezone.utc)
         if pnl < 0:
             self.consecutive_losses += 1
         else:
@@ -443,6 +446,7 @@ class AdaptiveAIManager:
                 return 0.5, ["Passive learning"]
             return 0.5, ["Model warming up"]
         logit = float(np.dot(features, weights) + bias)
+        logit = float(np.clip(logit, -50.0, 50.0))
         prob = 1.0 / (1.0 + np.exp(-logit))
         if phase == "semi-active":
             return prob, ["Semi-active advisory"]
@@ -482,6 +486,7 @@ class AdaptiveAIManager:
             if self.weights is None:
                 return
             logit = float(np.dot(features, self.weights) + self.bias)
+            logit = float(np.clip(logit, -50.0, 50.0))
             prob = 1.0 / (1.0 + np.exp(-logit))
             error = float(result) - prob
             self.weights += self.learning_rate * error * features
@@ -735,12 +740,25 @@ class TradingEngine:
         self.loss_count = 0
         self._trade_listeners: List[Callable[[TradeRecord, Dict[str, float]], None]] = []
         self._status_listeners: List[Callable[[str], None]] = []
+        self._strategy_lock = threading.Lock()
+        self.strategy_states: Dict[str, bool] = {name: True for name, _ in STRATEGY_FUNCTIONS}
+        self.strategy_states["Divergence"] = True
+        self.strategy_states["Volatility Filter"] = True
 
     def add_trade_listener(self, callback: Callable[[TradeRecord, Dict[str, float]], None]) -> None:
         self._trade_listeners.append(callback)
 
     def add_status_listener(self, callback: Callable[[str], None]) -> None:
         self._status_listeners.append(callback)
+
+    def set_strategy_state(self, name: str, enabled: bool) -> None:
+        with self._strategy_lock:
+            if name in self.strategy_states:
+                self.strategy_states[name] = enabled
+
+    def get_strategy_states(self) -> Dict[str, bool]:
+        with self._strategy_lock:
+            return dict(self.strategy_states)
 
     def _notify_trade(self, record: TradeRecord) -> None:
         stats = {
@@ -765,9 +783,13 @@ class TradingEngine:
                 logging.debug(f"Status listener error: {exc}")
 
     def _evaluate_strategies(self, df: pd.DataFrame) -> Tuple[str, float, List[str], List[StrategyResult]]:
-        results = [func(df) for func in STRATEGY_FUNCTIONS]
-        divergence_res = strategy_divergence_block(df)
-        volatility_res = strategy_volatility_filter(df)
+        with self._strategy_lock:
+            active_funcs = [func for name, func in STRATEGY_FUNCTIONS if self.strategy_states.get(name, True)]
+            divergence_enabled = self.strategy_states.get("Divergence", True)
+            volatility_enabled = self.strategy_states.get("Volatility Filter", True)
+        results = [func(df) for func in active_funcs]
+        divergence_res = strategy_divergence_block(df) if divergence_enabled else StrategyResult("NULL", 0.0, [])
+        volatility_res = strategy_volatility_filter(df) if volatility_enabled else StrategyResult("NULL", 0.0, [])
         signal, confidence, reasons = combine_signals(results, divergence_res, volatility_res)
         if divergence_res.reasons:
             reasons.extend(divergence_res.reasons)
@@ -817,7 +839,7 @@ class TradingEngine:
         self.risk.register_trade(pnl)
         self.ai.log_trade(features, 1 if result == "WIN" else 0)
         record = TradeRecord(
-            timestamp=datetime.utcnow(),
+            timestamp=datetime.now(timezone.utc),
             symbol=symbol,
             decision=signal,
             confidence=ai_confidence,
@@ -956,6 +978,7 @@ class BotWindow(QtWidgets.QWidget):
             "daily_pnl": 0.0,
             "accuracy": 0.0,
         }
+        self.strategy_checkboxes: Dict[str, QtWidgets.QCheckBox] = {}
 
         self._build_ui()
 
@@ -1035,20 +1058,26 @@ class BotWindow(QtWidgets.QWidget):
         tab = QtWidgets.QWidget()
         self.tabs.addTab(tab, "Strategies")
         layout = QtWidgets.QVBoxLayout(tab)
-        layout.addWidget(QtWidgets.QLabel("Active rule-based strategies:"))
-        list_widget = QtWidgets.QListWidget()
-        list_widget.addItems(
-            [
-                "RSI + EMA crossover → seek oversold/overbought alignment",
-                "Bollinger rebound → fade extremes with RSI confirmation",
-                "Trend filter → align with SMA200 and EMA structure",
-                "Pullback → retrace to EMA21 with confirmation candle",
-                "Donchian breakout → follow fresh highs/lows with RSI filter",
-                "Divergence block → skip trades when RSI disagrees",
-                "Volatility filter → avoid very low/high ATR regimes",
-            ]
-        )
-        layout.addWidget(list_widget)
+        layout.addWidget(QtWidgets.QLabel("Toggle individual strategies:"))
+        strategy_descriptions = {
+            "RSI+EMA": "RSI + EMA crossover → seek oversold/overbought alignment",
+            "Bollinger Rebound": "Bollinger rebound → fade extremes with RSI confirmation",
+            "Trend Filter": "Trend filter → align with SMA200 and EMA structure",
+            "Pullback": "Pullback → retrace to EMA21 with confirmation candle",
+            "Breakout": "Donchian breakout → follow fresh highs/lows with RSI filter",
+            "Divergence": "Divergence block → skip trades when RSI disagrees",
+            "Volatility Filter": "Volatility filter → avoid very low/high ATR regimes",
+        }
+        states = self.engine.get_strategy_states()
+        strategy_names = [name for name, _ in STRATEGY_FUNCTIONS] + ["Divergence", "Volatility Filter"]
+        for name in strategy_names:
+            checkbox = QtWidgets.QCheckBox(name)
+            checkbox.setChecked(states.get(name, True))
+            checkbox.setToolTip(strategy_descriptions.get(name, ""))
+            checkbox.stateChanged.connect(lambda state, n=name: self._handle_strategy_toggle(n, state))
+            layout.addWidget(checkbox)
+            self.strategy_checkboxes[name] = checkbox
+        layout.addStretch(1)
 
     def _build_settings_tab(self) -> None:
         tab = QtWidgets.QWidget()
@@ -1086,6 +1115,10 @@ class BotWindow(QtWidgets.QWidget):
         self.start_button.setEnabled(True)
         self.stop_button.setEnabled(False)
         self.status_label.setText("Status: Stopped")
+
+    def _handle_strategy_toggle(self, name: str, state: int) -> None:
+        enabled = state == QtCore.Qt.Checked
+        self.engine.set_strategy_state(name, enabled)
 
     def _on_trade(self, record: TradeRecord, stats: Dict[str, float]) -> None:
         self.latest_stats = stats
@@ -1144,6 +1177,12 @@ class BotWindow(QtWidgets.QWidget):
         self.ai_phase_value.setText(phase)
         self.ai_accuracy_value.setText(f"{accuracy:.2f}%")
         self.ml_state_label.setText("Adaptive core ready" if self.engine.ai.enabled else "Adaptive core disabled")
+        states = self.engine.get_strategy_states()
+        for name, checkbox in self.strategy_checkboxes.items():
+            desired = states.get(name, True)
+            if checkbox.isChecked() != desired:
+                blocker = QtCore.QSignalBlocker(checkbox)
+                checkbox.setChecked(desired)
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # type: ignore[override]
         if self.thread is not None and self.thread.isRunning():
