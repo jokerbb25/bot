@@ -90,7 +90,8 @@ def build_features(
     returns = returns if returns.size else np.zeros(1)
     short_ema = _ema(closes, 9)
     long_ema = _ema(closes, 21)
-    ema_slope = short_ema - _ema(closes[:-1] or closes, 9)
+    previous_window = closes[:-1] if closes.size > 1 else closes
+    ema_slope = short_ema - _ema(previous_window, 9)
     ema_variance = float(np.var(closes[-10:])) if closes.size >= 10 else 0.0
     rsi_value = float(indicators_ctx.get("rsi", 50.0))
     rsi_trend = 1.0 if indicators_ctx.get("rsi_trend") == "up" else -1.0 if indicators_ctx.get("rsi_trend") == "down" else 0.0

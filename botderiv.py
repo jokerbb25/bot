@@ -47,6 +47,7 @@ AI_AUTONOMOUS_THRESHOLD = 10000
 AI_AUTONOMOUS_ACCURACY = 0.65
 
 TRADES_LOG_PATH = "trades_log.csv"
+ADAPTIVE_STATE_PATH = Path("adaptive_ai_state.npz")
 ADVISORY_INTERVAL_SEC = 180
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
@@ -371,7 +372,13 @@ class AdaptiveAIManager:
         self.lock = threading.Lock()
         self.feature_cache: List[np.ndarray] = []
         self.result_cache: List[int] = []
+        self.state_path = ADAPTIVE_STATE_PATH
+        self.weights: Optional[np.ndarray] = None
+        self.bias: float = 0.0
+        self.learning_rate = 0.05
+        self.learning_decay = 0.999
         self.offline_thread = threading.Thread(target=self._advisory_loop, daemon=True)
+        self._load_state()
         self.offline_thread.start()
 
     def _phase(self) -> str:
@@ -394,6 +401,11 @@ class AdaptiveAIManager:
             if result == 1:
                 self.win_counter += 1
             self.trade_counter += 1
+            if len(self.feature_cache) > 5000:
+                self.feature_cache = self.feature_cache[-5000:]
+                self.result_cache = self.result_cache[-5000:]
+        self._online_update(features, result)
+        self._save_state()
 
     def _train_model(self) -> None:
         with self.lock:
@@ -406,6 +418,10 @@ class AdaptiveAIManager:
             model.fit(X, y)
             with self.lock:
                 self.model = model
+                self.weights = model.coef_[0].astype(float)
+                self.bias = float(model.intercept_[0])
+                self.learning_rate = max(self.learning_rate * 0.9, 0.001)
+            self._save_state()
         except Exception as exc:  # pragma: no cover
             logging.debug(f"Adaptive model train error: {exc}")
 
@@ -413,9 +429,18 @@ class AdaptiveAIManager:
         if not self.enabled:
             return 0.5, []
         phase = self._phase()
-        if phase == "passive" or self.model is None:
-            return 0.5, ["Passive learning"]
-        prob = float(self.model.predict_proba(features.reshape(1, -1))[0][1])
+        weights = None
+        bias = 0.0
+        with self.lock:
+            if self.weights is not None and self.weights.size == features.size:
+                weights = self.weights.copy()
+                bias = self.bias
+        if weights is None:
+            if phase == "passive":
+                return 0.5, ["Passive learning"]
+            return 0.5, ["Model warming up"]
+        logit = float(np.dot(features, weights) + bias)
+        prob = 1.0 / (1.0 + np.exp(-logit))
         if phase == "semi-active":
             return prob, ["Semi-active advisory"]
         return prob, ["Autonomous AI"]
@@ -439,6 +464,68 @@ class AdaptiveAIManager:
             except Exception as exc:  # pragma: no cover
                 logging.debug(f"Advisory loop error: {exc}")
 
+    def _ensure_weight_dim(self, dim: int) -> None:
+        with self.lock:
+            if self.weights is None or self.weights.size != dim:
+                self.weights = np.zeros(dim, dtype=float)
+                self.bias = 0.0
+                self.learning_rate = 0.05
+
+    def _online_update(self, features: np.ndarray, result: int) -> None:
+        if not self.enabled:
+            return
+        self._ensure_weight_dim(features.size)
+        with self.lock:
+            if self.weights is None:
+                return
+            logit = float(np.dot(features, self.weights) + self.bias)
+            prob = 1.0 / (1.0 + np.exp(-logit))
+            error = float(result) - prob
+            self.weights += self.learning_rate * error * features
+            self.bias += self.learning_rate * error
+            self.learning_rate = max(self.learning_rate * self.learning_decay, 0.001)
+
+    def _save_state(self) -> None:
+        if not self.enabled:
+            return
+        try:
+            if self.state_path.parent != Path("."):
+                self.state_path.parent.mkdir(parents=True, exist_ok=True)
+            weights = self.weights if self.weights is not None else np.array([], dtype=float)
+            np.savez(
+                self.state_path,
+                weights=weights,
+                bias=self.bias,
+                trade_counter=self.trade_counter,
+                win_counter=self.win_counter,
+                learning_rate=self.learning_rate,
+            )
+        except Exception as exc:  # pragma: no cover
+            logging.debug(f"Adaptive state save error: {exc}")
+
+    def _load_state(self) -> None:
+        if not self.enabled or not self.state_path.exists():
+            return
+        try:
+            data = np.load(self.state_path, allow_pickle=True)
+            weights = data.get("weights")
+            bias = data.get("bias")
+            trade_counter = data.get("trade_counter")
+            win_counter = data.get("win_counter")
+            learning_rate = data.get("learning_rate")
+            if weights is not None and weights.size:
+                self.weights = weights.astype(float)
+            if bias is not None:
+                self.bias = float(bias)
+            if learning_rate is not None:
+                self.learning_rate = float(learning_rate)
+            if trade_counter is not None:
+                self.trade_counter = int(trade_counter)
+            if win_counter is not None:
+                self.win_counter = int(win_counter)
+        except Exception as exc:  # pragma: no cover
+            logging.debug(f"Adaptive state load error: {exc}")
+
 
 def train_adaptive_model(data_path: str, model_path: str) -> None:
     try:
@@ -461,9 +548,18 @@ def train_adaptive_model(data_path: str, model_path: str) -> None:
 # AI BACKEND
 # ===============================================================
 def query_ai_backend(features: np.ndarray) -> Optional[float]:
+    feature_snapshot = {
+        "latest": float(features[-1]) if features.size else 0.0,
+        "mean": float(np.mean(features)) if features.size else 0.0,
+        "variance": float(np.var(features)) if features.size else 0.0,
+        "vector": features.tolist(),
+    }
     payload = {
         "model": "phi3:mini",
-        "prompt": "Analyze this market data and return only CALL or PUT based on current trend:",
+        "prompt": (
+            "Analyze this market data and return only CALL or PUT based on current trend: "
+            f"{json.dumps(feature_snapshot)}"
+        ),
         "stream": False,
     }
     attempt = 0
@@ -660,10 +756,20 @@ class TradingEngine:
                 ai_prob = api_prob
         ai_confidence = confidence
         ai_notes: List[str] = []
+        internal_prob, internal_notes = self.ai.predict(features)
+        if internal_notes:
+            ai_notes.extend(internal_notes)
         if ai_prob is not None:
+            if internal_prob != 0.5:
+                ai_prob = (ai_prob + internal_prob) / 2
+                ai_notes.append("Adaptive blend applied")
             fused = self.ai.fuse_with_technical(confidence, ai_prob)
             ai_confidence = fused
             ai_notes.append(f"AI blend {ai_prob:.2f}")
+        elif internal_prob != 0.5:
+            fused = self.ai.fuse_with_technical(confidence, internal_prob)
+            ai_confidence = fused
+            ai_notes.append(f"Adaptive core {internal_prob:.2f}")
         if not self.risk.can_trade(ai_confidence):
             return
         contract_id, price = self.api.buy(symbol, signal, STAKE)
