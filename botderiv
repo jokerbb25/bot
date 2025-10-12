@@ -37,6 +37,8 @@ OLLAMA_HEALTH_TIMEOUT = 3
 ML_ENABLED = True
 ML_MODEL_VERSION = "v1"
 ML_TIMEOUT_MS = 80
+ML_USE_API = True
+ML_EXTERNAL_MODEL_URL = "http://localhost:11434/api/generate"
 BACKTEST_MODE = False
 RISK_MAX_DAILY_DRAWDOWN = -30.0
 RISK_DAILY_TAKE_PROFIT = 40.0
@@ -863,7 +865,13 @@ class Bot(QtCore.QThread):
         self.ml_predictor: Optional[MLPredictor] = None
         if ML_ENABLED:
             try:
-                self.ml_predictor = MLPredictor(ML_MODEL_VERSION, ML_TIMEOUT_MS, enabled=True)
+                self.ml_predictor = MLPredictor(
+                    ML_MODEL_VERSION,
+                    ML_TIMEOUT_MS,
+                    enabled=True,
+                    use_api=ML_USE_API,
+                    external_model_url=ML_EXTERNAL_MODEL_URL,
+                )
                 health = ml_healthcheck(self.ml_predictor)
                 if health.get("ready"):
                     self.sig.ml_status.emit(f"🤖 ML Ready ({health.get('model_version')})")
@@ -1050,7 +1058,15 @@ def main() -> None:
                 },
                 data,
                 technical_signal,
-                MLPredictor(ML_MODEL_VERSION, ML_TIMEOUT_MS, enabled=ML_ENABLED) if ML_ENABLED else None,
+                MLPredictor(
+                    ML_MODEL_VERSION,
+                    ML_TIMEOUT_MS,
+                    enabled=ML_ENABLED,
+                    use_api=False,
+                    external_model_url=ML_EXTERNAL_MODEL_URL,
+                )
+                if ML_ENABLED
+                else None,
                 costs=0.0,
             )
             print(json.dumps(metrics, indent=2))

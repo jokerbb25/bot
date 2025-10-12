@@ -11,11 +11,12 @@ import json
 import logging
 import threading
 import time
-from collections import OrderedDict, deque
+from collections import OrderedDict
 from pathlib import Path
 from typing import Any, Deque, Dict, Iterable, List, Optional
 
 import numpy as np
+import requests
 
 try:
     # Optional dependencies: only used if available.
@@ -157,10 +158,19 @@ class _LRFallbackModel:
 class MLPredictor:
     """Lightweight ML predictor with caching and timeout control."""
 
-    def __init__(self, version: str, timeout_ms: int, enabled: bool = True) -> None:
+    def __init__(
+        self,
+        version: str,
+        timeout_ms: int,
+        enabled: bool = True,
+        use_api: bool = False,
+        external_model_url: Optional[str] = None,
+    ) -> None:
         self.version = version
         self.timeout_ms = timeout_ms
         self.enabled = enabled
+        self.use_api = use_api
+        self.external_model_url = external_model_url
         self.model: Any = None
         self.model_backend = "numpy"
         self.cache: "OrderedDict[str, Dict[str, Any]]" = OrderedDict()
@@ -232,17 +242,82 @@ class MLPredictor:
         cached = self._cache_get(key)
         if cached:
             cached["cached"] = True
+            logging.info(
+                f"[{symbol}] AI backend=cache latency={cached['latency_ms']}ms prob_up={cached['prob_up']:.2f}"
+            )
             return cached
 
-        start = time.perf_counter()
+        backend_used = self.model_backend
         prob_up = 0.5
-        if self.model_backend == "tensorflow":  # pragma: no cover - optional path
-            arr = np.expand_dims(features, axis=0)
-            prediction = self.model.predict(arr, verbose=0)[0]
-            prob_up = float(prediction[0]) if prediction.size else 0.5
+        latency_ms = 0
+        timed_out = False
+
+        if self.use_api and self.external_model_url:
+            backend_used = "ollama"
+            start_api = time.perf_counter()
+            response_text = ""
+            api_success = False
+            last_error = ""
+            for attempt in range(3):
+                if attempt:
+                    time.sleep(0.5)
+                try:
+                    payload = {
+                        "model": "phi3:mini",
+                        "prompt": (
+                            "Analyze this market data and return only CALL or PUT based on current trend: "
+                            f"features={features.tolist()}"
+                        ),
+                        "stream": False,
+                    }
+                    resp = requests.post(
+                        self.external_model_url,
+                        json=payload,
+                        timeout=3,
+                    )
+                    resp.raise_for_status()
+                    resp_json = resp.json()
+                    response_text = str(resp_json.get("response", ""))
+                    if response_text:
+                        api_success = True
+                        break
+                    last_error = "missing response"
+                except Exception as exc:  # pragma: no cover - network path
+                    last_error = str(exc)
+                if (time.perf_counter() - start_api) > 3:
+                    break
+            latency_ms = int((time.perf_counter() - start_api) * 1000)
+            if api_success:
+                lowered = response_text.lower()
+                if "call" in lowered and "put" not in lowered:
+                    prob_up = 0.8
+                elif "put" in lowered and "call" not in lowered:
+                    prob_up = 0.2
+                elif "call" in lowered and "put" in lowered:
+                    prob_up = 0.5
+                else:
+                    api_success = False
+                    last_error = "unrecognized response"
+            if not api_success:
+                logging.warning("⚙️ Using technical fallback (AI not responding)")
+                backend_used = self.model_backend
+                if self.model_backend == "tensorflow":  # pragma: no cover - optional path
+                    arr = np.expand_dims(features, axis=0)
+                    prediction = self.model.predict(arr, verbose=0)[0]
+                    prob_up = float(prediction[0]) if prediction.size else 0.5
+                else:
+                    prob_up = float(self.model.predict_proba(features))
+                latency_ms = int((time.perf_counter() - start_api) * 1000)
         else:
-            prob_up = float(self.model.predict_proba(features))
-        latency_ms = int((time.perf_counter() - start) * 1000)
+            start_local = time.perf_counter()
+            if self.model_backend == "tensorflow":  # pragma: no cover - optional path
+                arr = np.expand_dims(features, axis=0)
+                prediction = self.model.predict(arr, verbose=0)[0]
+                prob_up = float(prediction[0]) if prediction.size else 0.5
+            else:
+                prob_up = float(self.model.predict_proba(features))
+            latency_ms = int((time.perf_counter() - start_local) * 1000)
+
         timed_out = latency_ms > self.timeout_ms
         if timed_out:
             logging.warning(f"[{symbol}] ML predictor timeout {latency_ms}ms > {self.timeout_ms}ms")
@@ -254,6 +329,23 @@ class MLPredictor:
                 "status": "timeout",
                 "timed_out": True,
             }
+
+        recent = list(recent_trades)[-50:]
+        if recent:
+            valid = [item for item in recent if item.get("result") in {"WIN", "LOSS"}]
+            wins = sum(1 for item in valid if item.get("result") == "WIN")
+            accuracy = wins / max(1, len(valid))
+            multiplier = 1.0
+            if accuracy > 0.7:
+                multiplier = 1.05
+                logging.info(f"[{symbol}] Adaptive bias applied (+5%) based on recent accuracy")
+            elif accuracy < 0.4:
+                multiplier = 0.95
+                logging.info(f"[{symbol}] Adaptive bias applied (-5%) based on recent accuracy")
+            if multiplier != 1.0:
+                prob_up = 0.5 + (prob_up - 0.5) * multiplier
+                prob_up = min(max(prob_up, 0.0), 1.0)
+
         prob_down = 1.0 - prob_up
         result = {
             "prob_up": prob_up,
@@ -264,6 +356,7 @@ class MLPredictor:
             "timed_out": False,
         }
         self._cache_put(key, result.copy())
+        logging.info(f"[{symbol}] AI backend={backend_used} latency={latency_ms}ms prob_up={prob_up:.2f}")
         return result
 
     def ml_healthcheck(self) -> Dict[str, Any]:
