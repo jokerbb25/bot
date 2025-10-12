@@ -27,10 +27,10 @@ STAKE = 1.0
 DURATION_MIN = 1
 MAX_RETRIES = 3
 MAX_CONCURRENT_SYMBOLS = 2
-IA_TIMEOUT_S = 15
-IA_TIMEOUT_INCREMENT = 8
-IA_MAX_RETRIES = 2
-IA_MODEL = "llama3:8b"
+IA_TIMEOUT_S = 5
+IA_TIMEOUT_INCREMENT = 0
+IA_MAX_RETRIES = 1
+IA_MODEL = "phi3:mini"
 SMART_MODE_DEFAULT = True
 OLLAMA_HEALTH_TIMEOUT = 3
 
@@ -429,47 +429,56 @@ def check_ollama_online() -> bool:
 def ia_eval(symbol: str, payload: Dict[str, Any]) -> Dict[str, Any]:
     summary = json.dumps(payload, ensure_ascii=False)
     prompt = (
-        "You are an AI binary trading analyst. Decide whether to CONFIRM, INVERT, or REJECT the proposed signal using EMA + RSI context. Respond ONLY in JSON.\n"
-        f"Summary: {summary}\n"
-        "Return keys: decision, confidence, rationale."
+        "You are an AI binary trading analyst. Decide whether to CONFIRMAR, INVERSA o RECHAZAR la señal usando EMA y RSI. Responde SOLO en JSON.\n"
+        f"Datos: {summary}"
     )
 
-    with ia_lock:
-        session = requests.Session()
-        base_timeout = IA_TIMEOUT_S
-        for attempt in range(1, IA_MAX_RETRIES + 1):
-            timeout = base_timeout + IA_TIMEOUT_INCREMENT * (attempt - 1)
-            logging.info(f"[{symbol}] ⏳ Intento IA {attempt}/{IA_MAX_RETRIES} (timeout {timeout}s)")
-            start = time.time()
+    result_queue: queue.Queue = queue.Queue()
+
+    def _request() -> None:
+        with ia_lock:
+            session = requests.Session()
             try:
+                start = time.time()
                 response = session.post(
                     "http://localhost:11434/api/generate",
-                    json={"model": IA_MODEL, "prompt": prompt, "stream": True},
-                    stream=True,
-                    timeout=timeout,
+                    json={
+                        "model": IA_MODEL,
+                        "prompt": prompt,
+                        "stream": False,
+                        "options": {"num_predict": 150},
+                    },
+                    timeout=IA_TIMEOUT_S,
                 )
-                collected = ""
-                for line in response.iter_lines():
-                    if not line:
-                        continue
-                    try:
-                        chunk = json.loads(line.decode("utf-8"))
-                    except json.JSONDecodeError:
-                        continue
-                    if chunk.get("done"):
-                        break
-                    collected += chunk.get("response", "")
-                elapsed = time.time() - start
-                parsed = _parse_ai_response(collected)
+                response.raise_for_status()
+                payload_json = response.json()
+                text = payload_json.get("response", "")
+                parsed = _parse_ai_response(text)
                 if parsed:
-                    logging.info(f"[{symbol}] ✅ IA decision: {parsed['decision']} (confidence {parsed['confidence']:.2f}) en {elapsed:.2f}s")
-                    parsed["source"] = "AI"
-                    return parsed
-                logging.warning(f"[{symbol}] Respuesta IA inválida, reintento")
+                    elapsed = time.time() - start
+                    result_queue.put(("ok", (parsed, elapsed)))
+                else:
+                    result_queue.put(("error", "Respuesta IA inválida"))
             except Exception as exc:
-                logging.warning(f"[{symbol}] Error IA intento {attempt}: {exc}")
-            time.sleep(1)
-    logging.warning(f"[{symbol}] ⚠️ IA unavailable — using technical fallback")
+                result_queue.put(("error", str(exc)))
+
+    threading.Thread(target=_request, daemon=True).start()
+
+    try:
+        status, data = result_queue.get(timeout=IA_TIMEOUT_S)
+    except queue.Empty:
+        logging.warning("⚠️ AI timeout (5s) — using technical fallback immediately.")
+        logging.info("⚙️ Using technical fallback (AI not responding)")
+        return {"decision": "SIN_IA", "confidence": None, "rationale": "AI fallback"}
+
+    if status == "ok":
+        parsed, elapsed = data
+        logging.info(f"[{symbol}] ✅ IA decision: {parsed['decision']} (confidence {parsed['confidence']:.2f}) en {elapsed:.2f}s")
+        parsed["source"] = "AI"
+        return parsed
+
+    logging.warning(f"[{symbol}] ⚠️ IA unavailable — {data}")
+    logging.info("⚙️ Using technical fallback (AI not responding)")
     return {"decision": "SIN_IA", "confidence": None, "rationale": "AI fallback"}
 
 
@@ -623,15 +632,11 @@ class Worker(QtCore.QThread):
             "symbol": self.symbol,
             "technical_signal": signal,
             "technical_confidence": round(confidence, 4),
-            "rsi": {"value": round(ctx["rsi"], 2), "trend": ctx["rsi_trend"]},
             "ema": {"slope": round(ctx["ema_slope"], 5), "direction": _ema_direction(ctx["ema_slope"])},
-            "candle_bias": ctx["candle_bias"],
+            "rsi": {"value": round(ctx["rsi"], 2), "trend": ctx["rsi_trend"]},
+            "trend": ctx["market_state"],
             "divergence": ctx["divergence"],
-            "market_state": ctx["market_state"],
             "volatility": round(ctx["volatility"], 4),
-            "alignment": ctx["alignment"],
-            "recent_trades": list(self.trade_history)[-5:],
-            "recent_closes": closes[-15:],
         }
 
     def _risk_permits_trade(self, confidence: float) -> bool:
