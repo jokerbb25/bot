@@ -367,7 +367,7 @@ class RiskManager:
 # ===============================================================
 class AdaptiveAIManager:
     def __init__(self) -> None:
-        self.enabled = AI_ENABLED
+        self.enabled = True
         self.passive = AI_PASSIVE_MODE
         self.model: Optional[LogisticRegression] = None
         self.trade_counter = 0
@@ -551,6 +551,10 @@ def train_adaptive_model(data_path: str, model_path: str) -> None:
 # AI BACKEND
 # ===============================================================
 def query_ai_backend(features: np.ndarray) -> Optional[float]:
+    if not AI_ENABLED:
+        return None
+    if not AI_ENDPOINT:
+        return None
     feature_snapshot = {
         "latest": float(features[-1]) if features.size else 0.0,
         "mean": float(np.mean(features)) if features.size else 0.0,
@@ -565,28 +569,26 @@ def query_ai_backend(features: np.ndarray) -> Optional[float]:
         ),
         "stream": False,
     }
-    attempt = 0
     start = time.perf_counter()
-    while attempt < 3:
-        try:
-            response = requests.post(AI_ENDPOINT, json=payload, timeout=AI_TIMEOUT)
-            response.raise_for_status()
-            content = response.json()
-            text = str(content.get("response", "")).lower()
-            if "call" in text and "put" not in text:
-                return 0.8
-            if "put" in text and "call" not in text:
-                return 0.2
-            if text:
-                return 0.5
-            raise ValueError("empty response")
-        except Exception as exc:
-            attempt += 1
-            if attempt >= 3 or (time.perf_counter() - start) > AI_TIMEOUT:
-                logging.warning("⚙️ Using technical fallback (AI not responding)")
-                return None
-            time.sleep(0.5)
-    logging.warning("⚙️ Using technical fallback (AI not responding)")
+    try:
+        response = requests.post(AI_ENDPOINT, json=payload, timeout=AI_TIMEOUT)
+        response.raise_for_status()
+        content = response.json()
+    except Exception as exc:
+        logging.debug(f"External AI request failed: {exc}")
+        return None
+    text = str(content.get("response", "")).lower()
+    latency_ms = int((time.perf_counter() - start) * 1000)
+    if "call" in text and "put" not in text:
+        logging.info(f"AI backend=ollama latency={latency_ms}ms prob_up=0.80")
+        return 0.8
+    if "put" in text and "call" not in text:
+        logging.info(f"AI backend=ollama latency={latency_ms}ms prob_up=0.20")
+        return 0.2
+    if text:
+        logging.info(f"AI backend=ollama latency={latency_ms}ms prob_up=0.50")
+        return 0.5
+    logging.debug("External AI returned empty response")
     return None
 
 
