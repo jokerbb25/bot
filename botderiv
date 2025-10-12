@@ -6,12 +6,16 @@ import logging
 import queue
 import requests
 from collections import deque
-from datetime import datetime
-from typing import Any, Dict, List, Optional, Tuple
+from datetime import datetime, timedelta
+from pathlib import Path
+from typing import Any, Deque, Dict, List, Optional, Tuple
 
 import numpy as np
 import websocket
 from PyQt5 import QtWidgets, QtCore, QtGui
+
+from backtest import run_backtest
+from ml_predictor import MLPredictor, ml_healthcheck
 
 # =====================================
 # CONFIGURACIÓN GENERAL
@@ -29,6 +33,16 @@ IA_MAX_RETRIES = 2
 IA_MODEL = "llama3:8b"
 SMART_MODE_DEFAULT = True
 OLLAMA_HEALTH_TIMEOUT = 3
+
+ML_ENABLED = True
+ML_MODEL_VERSION = "v1"
+ML_TIMEOUT_MS = 80
+BACKTEST_MODE = False
+RISK_MAX_DAILY_DRAWDOWN = -30.0
+RISK_DAILY_TAKE_PROFIT = 40.0
+RISK_MAX_CONSECUTIVE_LOSSES = 5
+RISK_COOLDOWN_MINUTES = 5
+RISK_COOLDOWN_MESSAGE = "⏸️ Cooldown por racha negativa"
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 
@@ -153,7 +167,7 @@ def _refine_confidence(signal: str, confidence: float, ctx: Dict[str, Any]) -> T
     return conf, notes
 
 
-def adjust_confidence_with_history(symbol: str, confidence: float, history: deque) -> Tuple[float, List[str]]:
+def adjust_confidence_with_history(symbol: str, confidence: float, history: Deque[Dict[str, Any]]) -> Tuple[float, List[str]]:
     notes: List[str] = []
     if not history:
         return max(0.05, min(confidence, 0.95)), notes
@@ -180,6 +194,28 @@ def adjust_confidence_with_history(symbol: str, confidence: float, history: dequ
 
     confidence = max(0.05, min(confidence, 0.95))
     return confidence, notes
+
+
+def _apply_ml_adjustments(signal: str, confidence: float, ml_result: Dict[str, Any], notes: List[str]) -> float:
+    if ml_result.get("status") != "ok":
+        return confidence
+    prob_up = ml_result.get("prob_up", 0.5)
+    prob_down = ml_result.get("prob_down", 0.5)
+    if signal == "CALL":
+        if prob_up >= 0.55:
+            confidence = min(0.99, confidence + 0.1)
+            notes.append("ML apoya CALL")
+        elif prob_down >= 0.65:
+            confidence = max(0.05, confidence - 0.15)
+            notes.append("ML detecta presión bajista")
+    elif signal == "PUT":
+        if prob_down >= 0.55:
+            confidence = min(0.99, confidence + 0.1)
+            notes.append("ML apoya PUT")
+        elif prob_up >= 0.65:
+            confidence = max(0.05, confidence - 0.15)
+            notes.append("ML detecta presión alcista")
+    return confidence
 
 
 def _fallback_decision(symbol: str, signal: str, confidence: float, ctx: Dict[str, Any]) -> Tuple[str, float, str]:
@@ -426,9 +462,7 @@ def ia_eval(symbol: str, payload: Dict[str, Any]) -> Dict[str, Any]:
                 elapsed = time.time() - start
                 parsed = _parse_ai_response(collected)
                 if parsed:
-                    logging.info(
-                        f"[{symbol}] ✅ IA decision: {parsed['decision']} (confidence {parsed['confidence']:.2f}) en {elapsed:.2f}s"
-                    )
+                    logging.info(f"[{symbol}] ✅ IA decision: {parsed['decision']} (confidence {parsed['confidence']:.2f}) en {elapsed:.2f}s")
                     parsed["source"] = "AI"
                     return parsed
                 logging.warning(f"[{symbol}] Respuesta IA inválida, reintento")
@@ -460,7 +494,7 @@ class Deriv:
                 res = self._recv()
                 if "error" in res:
                     raise RuntimeError(res["error"]["message"])
-                logging.info(f"✅ Conectado a Deriv ({res['authorize']['loginid']})")
+                logging.info(f"✅ Conectado ({res['authorize']['loginid']})")
                 return
             except Exception as exc:
                 logging.warning(f"Reconectando Deriv... {exc}")
@@ -470,16 +504,13 @@ class Deriv:
         with self.lock:
             data["req_id"] = self.req_id
             self.req_id += 1
-            if self.ws is None:
-                raise RuntimeError("WebSocket no inicializado")
+            assert self.ws is not None
             self.ws.send(json.dumps(data))
             return data["req_id"]
 
     def _recv(self) -> Dict[str, Any]:
-        if self.ws is None:
-            raise RuntimeError("WebSocket no inicializado")
-        raw = self.ws.recv()
-        return json.loads(raw)
+        assert self.ws is not None
+        return json.loads(self.ws.recv())
 
     def candles(self, symbol: str, count: int = 60, retries: int = MAX_RETRIES) -> List[Dict[str, Any]]:
         for attempt in range(retries):
@@ -498,9 +529,8 @@ class Deriv:
                             raise RuntimeError(message["error"]["message"])
                         return message.get("candles", [])
             except Exception as exc:
-                logging.warning(f"[{symbol}] Error al obtener velas (intento {attempt + 1}): {exc}")
+                logging.warning(f"[{symbol}] intento {attempt + 1}: {exc}")
                 time.sleep(2)
-                self.connect()
         return []
 
     def valid_symbols(self) -> List[str]:
@@ -508,10 +538,10 @@ class Deriv:
         symbols: List[str] = []
         while True:
             message = self._recv()
-            if message.get("req_id") == req and message.get("msg_type") == "active_symbols":
-                for item in message.get("active_symbols", []):
-                    if item.get("market") == "synthetic_index" and item.get("symbol", "").startswith("R_"):
-                        symbols.append(item["symbol"])
+            if message.get("req_id") == req:
+                for symbol in message.get("active_symbols", []):
+                    if symbol.get("market") == "synthetic_index" and symbol.get("symbol", "").startswith("R_"):
+                        symbols.append(symbol["symbol"])
                 break
         return symbols
 
@@ -553,26 +583,32 @@ class Deriv:
 class Sig(QtCore.QObject):
     status = QtCore.pyqtSignal(str)
     ai_status = QtCore.pyqtSignal(str)
+    ml_status = QtCore.pyqtSignal(str)
     add = QtCore.pyqtSignal(list)
     upd = QtCore.pyqtSignal(int, str, str)
     stats = QtCore.pyqtSignal(int, int, int, float, float)
 
 
 class Worker(QtCore.QThread):
-    def __init__(self, symbol: str, api: Deriv, sig: Sig, offset: int, smart_mode: bool) -> None:
+    def __init__(self, symbol: str, api: Deriv, sig: Sig, offset: int, smart_mode: bool, ml_predictor: Optional[MLPredictor]) -> None:
         super().__init__()
         self.symbol = symbol
         self.api = api
         self.sig = sig
         self.offset = offset
         self.smart_mode = smart_mode
+        self.ml_predictor = ml_predictor
         self.run_flag = True
         self.ops = 0
         self.win = 0
         self.loss = 0
         self.pnl = 0.0
+        self.daily_pnl = 0.0
+        self.consecutive_losses = 0
+        self.consecutive_wins = 0
+        self.cooldown_until: Optional[datetime] = None
         self.row_counter = 0
-        self.trade_history: deque = deque(maxlen=20)
+        self.trade_history: Deque[Dict[str, Any]] = deque(maxlen=50)
 
     def stop(self) -> None:
         self.run_flag = False
@@ -597,6 +633,28 @@ class Worker(QtCore.QThread):
             "recent_trades": list(self.trade_history)[-5:],
             "recent_closes": closes[-15:],
         }
+
+    def _risk_permits_trade(self, confidence: float) -> bool:
+        now = datetime.now()
+        if self.cooldown_until and now < self.cooldown_until:
+            remaining = (self.cooldown_until - now).seconds // 60 + 1
+            logging.info(f"[{self.symbol}] {RISK_COOLDOWN_MESSAGE} ({remaining} min restantes)")
+            return False
+        if self.daily_pnl <= RISK_MAX_DAILY_DRAWDOWN:
+            logging.warning(f"[{self.symbol}] Daily stop-loss alcanzado ({self.daily_pnl:.2f})")
+            return False
+        if self.daily_pnl >= RISK_DAILY_TAKE_PROFIT:
+            logging.warning(f"[{self.symbol}] Daily take-profit alcanzado ({self.daily_pnl:.2f})")
+            return False
+        if self.consecutive_losses >= RISK_MAX_CONSECUTIVE_LOSSES:
+            self.cooldown_until = now + timedelta(minutes=RISK_COOLDOWN_MINUTES)
+            self.consecutive_losses = 0
+            logging.warning(f"[{self.symbol}] Activando cooldown por pérdidas consecutivas")
+            return False
+        if confidence < 0.35:
+            logging.info(f"[{self.symbol}] Confianza {confidence:.2f} < 0.35 → operación omitida")
+            return False
+        return True
 
     def run(self) -> None:
         while self.run_flag:
@@ -625,6 +683,7 @@ class Worker(QtCore.QThread):
                     "$0.00",
                     "—",
                     "Analizando",
+                    "—",
                 ])
 
                 closes = [candle["close"] for candle in candles]
@@ -676,16 +735,40 @@ class Worker(QtCore.QThread):
                     if fallback_notes:
                         ai_reason = fallback_notes
 
+                ml_result = {"status": "disabled", "prob_up": 0.5, "prob_down": 0.5, "timed_out": False}
+                if ML_ENABLED and self.ml_predictor is not None:
+                    ml_result = self.ml_predictor.predict(self.symbol, candles, ctx, self.trade_history)
+                    health = ml_healthcheck(self.ml_predictor)
+                    if ml_result.get("status") == "ok":
+                        self.sig.ml_status.emit(
+                            f"🤖 ML Ready ({health.get('model_version')}) | {ml_result['prob_up']:.2f}/{ml_result['prob_down']:.2f}"
+                        )
+                    elif ml_result.get("status") == "timeout":
+                        self.sig.ml_status.emit("⏱️ ML Timeout")
+                    else:
+                        if health.get("enabled"):
+                            self.sig.ml_status.emit(f"🤖 ML {health.get('backend')} preparado")
+                        else:
+                            self.sig.ml_status.emit("🤖 ML Deshabilitado")
+                else:
+                    self.sig.ml_status.emit("🤖 ML Deshabilitado")
+
+                ml_notes: List[str] = []
+                final_confidence = _apply_ml_adjustments(final_signal, final_confidence, ml_result, ml_notes)
+
                 final_confidence, history_notes = adjust_confidence_with_history(self.symbol, final_confidence, self.trade_history)
                 if history_notes:
                     extra = " | ".join(history_notes)
                     ai_reason = f"{ai_reason} | {extra}" if ai_reason else extra
+                if ml_notes:
+                    extra = " | ".join(ml_notes)
+                    ai_reason = f"{ai_reason} | {extra}" if ai_reason else extra
 
                 logging.info(
-                    f"[{self.symbol}] Confidence: {final_confidence:.2f} | Decision: {final_signal} | EMA: {ctx['ema_slope']:+.4f} | RSI: {ctx['rsi']:.2f} ({ctx['rsi_trend']}) | Divergence: {ctx['divergence']} | Fuente: {origin} {marker} {ai_reason}"
+                    f"[{self.symbol}] Confidence: {final_confidence:.2f} | Decision: {final_signal} | EMA: {ctx['ema_slope']:+.4f} | RSI: {ctx['rsi']:.2f} ({ctx['rsi_trend']}) | Divergence: {ctx['divergence']} | Fuente: {origin} {marker} {ai_reason} | ML {ml_result.get('prob_up', 0.5):.2f}/{ml_result.get('prob_down', 0.5):.2f}"
                 )
 
-                if final_signal == "SKIP" or final_confidence < 0.35:
+                if final_signal == "SKIP" or not self._risk_permits_trade(final_confidence):
                     payload = {
                         "final_decision": "SKIP",
                         "trade_result": "OMITIDO",
@@ -693,6 +776,7 @@ class Worker(QtCore.QThread):
                         "ai_confidence": ai_conf,
                         "ai_rationale": ai_reason,
                         "final_confidence": final_confidence,
+                        "ml_probs": [ml_result.get("prob_up", 0.5), ml_result.get("prob_down", 0.5)],
                     }
                     self.sig.upd.emit(row_id, json.dumps(payload), "$0.00")
                     self.trade_history.append({
@@ -714,6 +798,7 @@ class Worker(QtCore.QThread):
                         "ai_confidence": ai_conf,
                         "ai_rationale": ai_reason,
                         "final_confidence": final_confidence,
+                        "ml_probs": [ml_result.get("prob_up", 0.5), ml_result.get("prob_down", 0.5)],
                     }
                     self.sig.upd.emit(row_id, json.dumps(payload), "$0.00")
                     time.sleep(2)
@@ -725,9 +810,14 @@ class Worker(QtCore.QThread):
                 self.ops += 1
                 if result == "WIN":
                     self.win += 1
+                    self.consecutive_losses = 0
+                    self.consecutive_wins += 1
                 else:
                     self.loss += 1
+                    self.consecutive_losses += 1
+                    self.consecutive_wins = 0
                 self.pnl += pnl
+                self.daily_pnl += pnl
                 accuracy = (self.win / self.ops * 100) if self.ops else 0.0
 
                 trade_record = {
@@ -746,6 +836,7 @@ class Worker(QtCore.QThread):
                     "ai_confidence": ai_conf,
                     "ai_rationale": ai_reason,
                     "final_confidence": final_confidence,
+                    "ml_probs": [ml_result.get("prob_up", 0.5), ml_result.get("prob_down", 0.5)],
                 }
                 self.sig.upd.emit(row_id, json.dumps(payload), f"${pnl:.2f}")
                 self.sig.stats.emit(self.ops, self.win, self.loss, self.pnl, accuracy)
@@ -761,17 +852,33 @@ class Bot(QtCore.QThread):
     def __init__(self, sig: Sig, smart_mode: bool) -> None:
         super().__init__()
         self.sig = sig
+        self.smart_mode = smart_mode
         self.api = Deriv(APP_ID, API_TOKEN)
         self.workers: List[Worker] = []
-        self.smart_mode = smart_mode
+        self.ml_predictor: Optional[MLPredictor] = None
+        if ML_ENABLED:
+            try:
+                self.ml_predictor = MLPredictor(ML_MODEL_VERSION, ML_TIMEOUT_MS, enabled=True)
+                health = ml_healthcheck(self.ml_predictor)
+                if health.get("ready"):
+                    self.sig.ml_status.emit(f"🤖 ML Ready ({health.get('model_version')})")
+            except Exception as exc:
+                logging.warning(f"MLPredictor init error: {exc}")
+                self.ml_predictor = None
+                self.sig.ml_status.emit("🤖 ML Deshabilitado")
+        else:
+            self.sig.ml_status.emit("🤖 ML Deshabilitado")
 
     def run(self) -> None:
+        if BACKTEST_MODE:
+            logging.info("BACKTEST_MODE activo: ejecute main() desde CLI para resultados.")
+            return
         self.api.connect()
         symbols = self.api.valid_symbols()[:MAX_CONCURRENT_SYMBOLS]
         self.sig.status.emit("🚀 Operando en: " + ", ".join(symbols))
         offset = 0
         for symbol in symbols:
-            worker = Worker(symbol, self.api, self.sig, offset, self.smart_mode)
+            worker = Worker(symbol, self.api, self.sig, offset, self.smart_mode, self.ml_predictor)
             self.workers.append(worker)
             worker.start()
             offset += 2000
@@ -783,8 +890,8 @@ class Bot(QtCore.QThread):
 class UI(QtWidgets.QWidget):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("💹 Deriv Bot v8.0 — IA estable + aprendizaje adaptativo")
-        self.resize(1280, 720)
+        self.setWindowTitle("💹 Deriv Bot Pro Trader")
+        self.resize(1320, 760)
         self.setStyleSheet(
             """
             QWidget { background:#0a0f1a; color:#b3e5ff; font:11pt 'Consolas'; }
@@ -792,28 +899,25 @@ class UI(QtWidgets.QWidget):
             QPushButton:hover { background:#64b5f6; }
             QTableWidget { background:#101820; color:#b3e5ff; gridline-color:#25455e; }
             QHeaderView::section { background:#1976d2; color:white; padding:6px; border:none; }
-            QCheckBox { color:#b3e5ff; }
-            QLabel#aiStatus { font-weight:bold; }
             """
         )
-
         layout = QtWidgets.QVBoxLayout(self)
         header = QtWidgets.QHBoxLayout()
         self.start_btn = QtWidgets.QPushButton("▶️ Iniciar")
         self.start_btn.clicked.connect(self.toggle)
-        self.status_lbl = QtWidgets.QLabel("🟡 Inactivo")
-        self.ai_status_lbl = QtWidgets.QLabel("AI status")
-        self.ai_status_lbl.setObjectName("aiStatus")
-        self.ai_status_lbl.setText("🚫 AI Offline")
         self.smart_mode_chk = QtWidgets.QCheckBox("Smart Mode")
         self.smart_mode_chk.setChecked(SMART_MODE_DEFAULT)
+        self.status_lbl = QtWidgets.QLabel("🟡 Inactivo")
+        self.ai_status_lbl = QtWidgets.QLabel("🚫 AI Offline")
+        self.ml_status_lbl = QtWidgets.QLabel("🤖 ML Deshabilitado")
         header.addWidget(self.start_btn)
         header.addWidget(self.smart_mode_chk)
         header.addWidget(self.status_lbl)
         header.addWidget(self.ai_status_lbl)
+        header.addWidget(self.ml_status_lbl)
         layout.addLayout(header)
 
-        self.table = QtWidgets.QTableWidget(0, 7)
+        self.table = QtWidgets.QTableWidget(0, 8)
         self.table.setHorizontalHeaderLabels([
             "Hora",
             "Símbolo",
@@ -822,6 +926,7 @@ class UI(QtWidgets.QWidget):
             "PnL",
             "Conf. IA",
             "Razon IA",
+            "Prob. ML",
         ])
         self.table.horizontalHeader().setStretchLastSection(True)
         layout.addWidget(self.table)
@@ -839,6 +944,7 @@ class UI(QtWidgets.QWidget):
         self.sig = Sig()
         self.sig.status.connect(self.status_lbl.setText)
         self.sig.ai_status.connect(self.ai_status_lbl.setText)
+        self.sig.ml_status.connect(self.ml_status_lbl.setText)
         self.sig.add.connect(self.add_row)
         self.sig.upd.connect(self.update_row)
         self.sig.stats.connect(self.update_stats)
@@ -871,7 +977,7 @@ class UI(QtWidgets.QWidget):
             item.setBackground(QtGui.QColor("#1B5E20"))
         elif "LOSS" in text:
             item.setBackground(QtGui.QColor("#B71C1C"))
-        elif "Pendiente" in text or "Analizando" in text:
+        elif "Pendiente" in text or "Analizando" in text or "OMITIDO" in text:
             item.setBackground(QtGui.QColor("#FFC107"))
         else:
             item.setBackground(QtGui.QColor("#455A64"))
@@ -900,6 +1006,9 @@ class UI(QtWidgets.QWidget):
         self.table.setItem(row, 5, QtWidgets.QTableWidgetItem(ai_text))
         rationale = data.get("ai_rationale", "")
         self.table.setItem(row, 6, QtWidgets.QTableWidgetItem(rationale))
+        ml_probs = data.get("ml_probs", [0.5, 0.5])
+        ml_text = f"↑{ml_probs[0]:.2f} / ↓{ml_probs[1]:.2f}" if isinstance(ml_probs, list) and len(ml_probs) == 2 else "—"
+        self.table.setItem(row, 7, QtWidgets.QTableWidgetItem(ml_text))
 
     def update_stats(self, ops: int, wins: int, losses: int, pnl: float, accuracy: float) -> None:
         self.ops_lbl.setText(f"Ops: {ops}")
@@ -918,7 +1027,32 @@ class UI(QtWidgets.QWidget):
         self.start_btn.setDisabled(True)
 
 
+# =====================================
+# FUNCIÓN PRINCIPAL
+# =====================================
 def main() -> None:
+    if BACKTEST_MODE:
+        data_path = Path("backtest_data.json")
+        if data_path.exists():
+            with data_path.open("r", encoding="utf-8") as handle:
+                data = json.load(handle)
+            metrics = run_backtest(
+                {
+                    "initial_balance": 100.0,
+                    "stake": STAKE,
+                    "ml_enabled": ML_ENABLED,
+                    "ml_threshold": 0.55,
+                },
+                data,
+                technical_signal,
+                MLPredictor(ML_MODEL_VERSION, ML_TIMEOUT_MS, enabled=ML_ENABLED) if ML_ENABLED else None,
+                costs=0.0,
+            )
+            print(json.dumps(metrics, indent=2))
+        else:
+            logging.warning("BACKTEST_MODE activo pero falta backtest_data.json")
+        return
+
     app = QtWidgets.QApplication(sys.argv)
     ui = UI()
     ui.show()
