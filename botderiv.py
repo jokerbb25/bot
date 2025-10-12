@@ -1,3 +1,4 @@
+import sys
 import time
 import json
 import threading
@@ -5,7 +6,7 @@ import logging
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
 
 import numpy as np
 import pandas as pd
@@ -14,6 +15,8 @@ from ta.momentum import RSIIndicator
 from ta.trend import EMAIndicator, SMAIndicator
 from ta.volatility import BollingerBands, AverageTrueRange
 from sklearn.linear_model import LogisticRegression
+
+from PyQt5 import QtCore, QtGui, QtWidgets
 
 try:
     import websocket  # type: ignore
@@ -725,6 +728,39 @@ class TradingEngine:
         self.ai = AdaptiveAIManager()
         self.trade_history: List[TradeRecord] = []
         self.lock = threading.Lock()
+        self.running = threading.Event()
+        self.win_count = 0
+        self.loss_count = 0
+        self._trade_listeners: List[Callable[[TradeRecord, Dict[str, float]], None]] = []
+        self._status_listeners: List[Callable[[str], None]] = []
+
+    def add_trade_listener(self, callback: Callable[[TradeRecord, Dict[str, float]], None]) -> None:
+        self._trade_listeners.append(callback)
+
+    def add_status_listener(self, callback: Callable[[str], None]) -> None:
+        self._status_listeners.append(callback)
+
+    def _notify_trade(self, record: TradeRecord) -> None:
+        stats = {
+            "operations": float(self.win_count + self.loss_count),
+            "wins": float(self.win_count),
+            "losses": float(self.loss_count),
+            "pnl": float(self.risk.total_pnl),
+            "daily_pnl": float(self.risk.daily_pnl),
+            "accuracy": float((self.win_count / max(1, self.win_count + self.loss_count)) * 100.0),
+        }
+        for callback in list(self._trade_listeners):
+            try:
+                callback(record, stats)
+            except Exception as exc:
+                logging.debug(f"Trade listener error: {exc}")
+
+    def _notify_status(self, status: str) -> None:
+        for callback in list(self._status_listeners):
+            try:
+                callback(status)
+            except Exception as exc:
+                logging.debug(f"Status listener error: {exc}")
 
     def _evaluate_strategies(self, df: pd.DataFrame) -> Tuple[str, float, List[str], List[StrategyResult]]:
         results = [func(df) for func in STRATEGY_FUNCTIONS]
@@ -788,33 +824,341 @@ class TradingEngine:
             reasons=reasons + ai_notes,
         )
         log_trade(record)
+        if result == "WIN":
+            self.win_count += 1
+        else:
+            self.loss_count += 1
         with self.lock:
             self.trade_history.append(record)
-        ema_diff = df['close'].iloc[-1] - df['close'].iloc[-2]
-        latest_rsi = rsi(df['close']).iloc[-1]
+        ema_diff = df["close"].iloc[-1] - df["close"].iloc[-2]
+        latest_rsi = rsi(df["close"]).iloc[-1]
         logging.info(
             f"{record.timestamp:%Y-%m-%d %H:%M:%S} INFO: [{symbol}] {signal} @{ai_confidence:.2f} | EMA:{ema_diff:.2f} RSI:{latest_rsi:.2f} | {'+'.join(reasons)}"
         )
         if ai_notes:
             logging.info(f"📊 AI Advisory → {'; '.join(ai_notes)}")
+        self._notify_trade(record)
 
     def run(self) -> None:
+        self.running.set()
+        self._notify_status("connecting")
         self.api.connect()
-        while True:
-            for symbol in SYMBOLS:
-                try:
-                    self.execute_cycle(symbol)
-                except Exception as exc:
-                    logging.warning(f"Cycle error for {symbol}: {exc}")
-                time.sleep(1)
+        self._notify_status("running")
+        try:
+            while self.running.is_set():
+                for symbol in SYMBOLS:
+                    if not self.running.is_set():
+                        break
+                    try:
+                        self.execute_cycle(symbol)
+                    except Exception as exc:
+                        logging.warning(f"Cycle error for {symbol}: {exc}")
+                    if not self.running.is_set():
+                        break
+                    time.sleep(1)
+        finally:
+            self._notify_status("stopped")
+
+    def stop(self) -> None:
+        self.running.clear()
+        try:
+            if self.api.socket is not None:
+                self.api.socket.close()
+        except Exception:
+            pass
+        self.api.socket = None
+
+
+# ===============================================================
+# GUI LAYER
+# ===============================================================
+
+
+class EngineBridge(QtCore.QObject):
+    trade = QtCore.pyqtSignal(object, dict)
+    status = QtCore.pyqtSignal(str)
+
+
+class LogEmitter(QtCore.QObject):
+    message = QtCore.pyqtSignal(str)
+
+
+class QtLogHandler(logging.Handler):
+    def __init__(self) -> None:
+        super().__init__(level=logging.INFO)
+        self.emitter = LogEmitter()
+        self.setFormatter(logging.Formatter("%(asctime)s %(levelname)s: %(message)s"))
+
+    def emit(self, record: logging.LogRecord) -> None:
+        try:
+            message = self.format(record)
+        except Exception:
+            message = record.getMessage()
+        self.emitter.message.emit(message)
+
+
+class TradingThread(QtCore.QThread):
+    def __init__(self, engine: TradingEngine) -> None:
+        super().__init__()
+        self.engine = engine
+
+    def run(self) -> None:  # type: ignore[override]
+        self.engine.run()
+
+    def stop(self) -> None:
+        self.engine.stop()
+
+
+class BotWindow(QtWidgets.QWidget):
+    def __init__(self) -> None:
+        super().__init__()
+        self.setWindowTitle("Deriv Bot Pro Trader")
+        self.resize(1320, 780)
+        self.setStyleSheet(
+            """
+            QWidget { background: #0a0f1a; color: #b3e5ff; font: 11pt 'Consolas'; }
+            QPushButton { background: #2196f3; color: white; border-radius: 6px; padding: 8px 14px; }
+            QPushButton:disabled { background: #1c3c5d; color: #7aa8c7; }
+            QPushButton:hover:!disabled { background: #64b5f6; }
+            QTabWidget::pane { border: 1px solid #1c3c5d; }
+            QTabBar::tab { background: #102235; padding: 8px 18px; margin: 2px; border-radius: 4px; }
+            QTabBar::tab:selected { background: #1976d2; }
+            QTableWidget { background: #101820; color: #b3e5ff; gridline-color: #25455e; }
+            QHeaderView::section { background: #1976d2; color: white; padding: 6px; border: none; }
+            QGroupBox { border: 1px solid #1c3c5d; border-radius: 4px; margin-top: 12px; }
+            QGroupBox::title { subcontrol-origin: margin; subcontrol-position: top left; padding: 0 8px; }
+            QPlainTextEdit { background: #0f1724; border: 1px solid #1c3c5d; }
+            QListWidget { background: #101820; border: 1px solid #1c3c5d; }
+            QLabel.section-title { font: 12pt 'Consolas'; color: #90caf9; }
+            """
+        )
+
+        self.bridge = EngineBridge()
+        self.bridge.trade.connect(self._on_trade)
+        self.bridge.status.connect(self._on_status)
+
+        self.log_handler = QtLogHandler()
+        self.log_handler.emitter.message.connect(self._append_log)
+        logging.getLogger().addHandler(self.log_handler)
+
+        self.engine = TradingEngine()
+        self.engine.add_trade_listener(lambda record, stats: self.bridge.trade.emit(record, stats))
+        self.engine.add_status_listener(lambda status: self.bridge.status.emit(status))
+
+        self.thread: Optional[TradingThread] = None
+        self.latest_stats: Dict[str, float] = {
+            "operations": 0.0,
+            "wins": 0.0,
+            "losses": 0.0,
+            "pnl": 0.0,
+            "daily_pnl": 0.0,
+            "accuracy": 0.0,
+        }
+
+        self._build_ui()
+
+        self.refresh_timer = QtCore.QTimer(self)
+        self.refresh_timer.setInterval(1500)
+        self.refresh_timer.timeout.connect(self._refresh_phase)
+        self.refresh_timer.start()
+
+    def _build_ui(self) -> None:
+        layout = QtWidgets.QVBoxLayout(self)
+        self.tabs = QtWidgets.QTabWidget()
+        layout.addWidget(self.tabs)
+        self._build_general_tab()
+        self._build_strategies_tab()
+        self._build_settings_tab()
+
+    def _build_general_tab(self) -> None:
+        tab = QtWidgets.QWidget()
+        self.tabs.addTab(tab, "General")
+        vbox = QtWidgets.QVBoxLayout(tab)
+
+        control_layout = QtWidgets.QHBoxLayout()
+        self.start_button = QtWidgets.QPushButton("▶️ Start")
+        self.stop_button = QtWidgets.QPushButton("⏹️ Stop")
+        self.stop_button.setEnabled(False)
+        self.start_button.clicked.connect(self.start_trading)
+        self.stop_button.clicked.connect(self.stop_trading)
+        control_layout.addWidget(self.start_button)
+        control_layout.addWidget(self.stop_button)
+        control_layout.addStretch()
+        self.status_label = QtWidgets.QLabel("Status: Idle")
+        self.ai_mode_label = QtWidgets.QLabel("AI Mode: Passive")
+        control_layout.addWidget(self.status_label)
+        control_layout.addWidget(self.ai_mode_label)
+        vbox.addLayout(control_layout)
+
+        stats_group = QtWidgets.QGroupBox("Performance")
+        stats_layout = QtWidgets.QGridLayout(stats_group)
+        labels = [
+            ("Operations", "0"),
+            ("Wins", "0"),
+            ("Losses", "0"),
+            ("PnL", "$0.00"),
+            ("Daily PnL", "$0.00"),
+            ("Accuracy", "0.0%"),
+        ]
+        self.stats_values: Dict[str, QtWidgets.QLabel] = {}
+        for index, (title, initial) in enumerate(labels):
+            title_label = QtWidgets.QLabel(title)
+            value_label = QtWidgets.QLabel(initial)
+            title_label.setProperty("class", "section-title")
+            stats_layout.addWidget(title_label, index // 3, (index % 3) * 2)
+            stats_layout.addWidget(value_label, index // 3, (index % 3) * 2 + 1)
+            self.stats_values[title] = value_label
+        vbox.addWidget(stats_group)
+
+        self.trade_table = QtWidgets.QTableWidget(0, 7)
+        self.trade_table.setHorizontalHeaderLabels([
+            "Time",
+            "Symbol",
+            "Decision",
+            "Confidence",
+            "Result",
+            "PnL",
+            "Notes",
+        ])
+        self.trade_table.horizontalHeader().setStretchLastSection(True)
+        self.trade_table.verticalHeader().setVisible(False)
+        self.trade_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        vbox.addWidget(self.trade_table, 1)
+
+        self.log_view = QtWidgets.QPlainTextEdit()
+        self.log_view.setReadOnly(True)
+        vbox.addWidget(self.log_view, 1)
+
+    def _build_strategies_tab(self) -> None:
+        tab = QtWidgets.QWidget()
+        self.tabs.addTab(tab, "Strategies")
+        layout = QtWidgets.QVBoxLayout(tab)
+        layout.addWidget(QtWidgets.QLabel("Active rule-based strategies:"))
+        list_widget = QtWidgets.QListWidget()
+        list_widget.addItems(
+            [
+                "RSI + EMA crossover → seek oversold/overbought alignment",
+                "Bollinger rebound → fade extremes with RSI confirmation",
+                "Trend filter → align with SMA200 and EMA structure",
+                "Pullback → retrace to EMA21 with confirmation candle",
+                "Donchian breakout → follow fresh highs/lows with RSI filter",
+                "Divergence block → skip trades when RSI disagrees",
+                "Volatility filter → avoid very low/high ATR regimes",
+            ]
+        )
+        layout.addWidget(list_widget)
+
+    def _build_settings_tab(self) -> None:
+        tab = QtWidgets.QWidget()
+        self.tabs.addTab(tab, "Settings")
+        form = QtWidgets.QFormLayout(tab)
+        self.ai_phase_value = QtWidgets.QLabel("Passive")
+        self.ai_accuracy_value = QtWidgets.QLabel("0.0%")
+        self.daily_limit_value = QtWidgets.QLabel(f"{RISK_MAX_DAILY_LOSS:.2f}")
+        self.take_profit_value = QtWidgets.QLabel(f"{RISK_DAILY_TAKE_PROFIT:.2f}")
+        self.drawdown_value = QtWidgets.QLabel(f"{MAX_DRAWDOWN:.2f}")
+        self.ml_state_label = QtWidgets.QLabel("Adaptive core ready")
+        form.addRow("AI phase", self.ai_phase_value)
+        form.addRow("AI accuracy", self.ai_accuracy_value)
+        form.addRow("Daily loss limit", self.daily_limit_value)
+        form.addRow("Daily take profit", self.take_profit_value)
+        form.addRow("Max drawdown", self.drawdown_value)
+        form.addRow("Learning engine", self.ml_state_label)
+
+    def start_trading(self) -> None:
+        if self.thread is not None and self.thread.isRunning():
+            return
+        self.thread = TradingThread(self.engine)
+        self.thread.finished.connect(self._on_thread_finished)
+        self.thread.start()
+        self.start_button.setEnabled(False)
+        self.stop_button.setEnabled(True)
+        self.status_label.setText("Status: Starting...")
+
+    def stop_trading(self) -> None:
+        if self.thread is None:
+            return
+        self.thread.stop()
+        self.thread.wait(2000)
+        self.thread = None
+        self.start_button.setEnabled(True)
+        self.stop_button.setEnabled(False)
+        self.status_label.setText("Status: Stopped")
+
+    def _on_trade(self, record: TradeRecord, stats: Dict[str, float]) -> None:
+        self.latest_stats = stats
+        self.trade_table.insertRow(0)
+        entries = [
+            record.timestamp.strftime("%H:%M:%S"),
+            record.symbol,
+            record.decision,
+            f"{record.confidence:.2f}",
+            record.result or "-",
+            f"{record.pnl:.2f}",
+            "; ".join(record.reasons),
+        ]
+        for column, text in enumerate(entries):
+            self.trade_table.setItem(0, column, QtWidgets.QTableWidgetItem(text))
+        if self.trade_table.rowCount() > 250:
+            self.trade_table.removeRow(self.trade_table.rowCount() - 1)
+        self._update_stats_labels(stats)
+
+    def _on_status(self, status: str) -> None:
+        mapping = {
+            "connecting": "Status: Connecting...",
+            "running": "Status: Running",
+            "stopped": "Status: Stopped",
+        }
+        self.status_label.setText(mapping.get(status, f"Status: {status}"))
+        if status == "running":
+            self.start_button.setEnabled(False)
+            self.stop_button.setEnabled(True)
+        if status == "stopped":
+            self.start_button.setEnabled(True)
+            self.stop_button.setEnabled(False)
+
+    def _on_thread_finished(self) -> None:
+        self.thread = None
+        self.start_button.setEnabled(True)
+        self.stop_button.setEnabled(False)
+        self.status_label.setText("Status: Stopped")
+
+    def _append_log(self, message: str) -> None:
+        self.log_view.appendPlainText(message)
+        self.log_view.verticalScrollBar().setValue(self.log_view.verticalScrollBar().maximum())
+
+    def _update_stats_labels(self, stats: Dict[str, float]) -> None:
+        self.stats_values["Operations"].setText(str(int(stats.get("operations", 0.0))))
+        self.stats_values["Wins"].setText(str(int(stats.get("wins", 0.0))))
+        self.stats_values["Losses"].setText(str(int(stats.get("losses", 0.0))))
+        self.stats_values["PnL"].setText(f"${stats.get('pnl', 0.0):.2f}")
+        self.stats_values["Daily PnL"].setText(f"${stats.get('daily_pnl', 0.0):.2f}")
+        self.stats_values["Accuracy"].setText(f"{stats.get('accuracy', 0.0):.1f}%")
+
+    def _refresh_phase(self) -> None:
+        phase = self.engine.ai._phase().title()
+        accuracy = self.engine.ai.accuracy() * 100.0
+        self.ai_mode_label.setText(f"AI Mode: {phase}")
+        self.ai_phase_value.setText(phase)
+        self.ai_accuracy_value.setText(f"{accuracy:.2f}%")
+        self.ml_state_label.setText("Adaptive core ready" if self.engine.ai.enabled else "Adaptive core disabled")
+
+    def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # type: ignore[override]
+        if self.thread is not None and self.thread.isRunning():
+            self.thread.stop()
+            self.thread.wait(2000)
+        logging.getLogger().removeHandler(self.log_handler)
+        super().closeEvent(event)
 
 
 # ===============================================================
 # ENTRY POINT
 # ===============================================================
 def main() -> None:
-    engine = TradingEngine()
-    engine.run()
+    app = QtWidgets.QApplication(sys.argv)
+    window = BotWindow()
+    window.show()
+    app.exec_()
 
 
 if __name__ == "__main__":
