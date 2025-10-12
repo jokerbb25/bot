@@ -52,6 +52,7 @@ AI_AUTONOMOUS_ACCURACY = 0.65
 
 TRADES_LOG_PATH = "trades_log.csv"
 ADAPTIVE_STATE_PATH = Path("adaptive_ai_state.npz")
+STRATEGY_CONFIG_PATH = Path("strategies_config.json")
 ADVISORY_INTERVAL_SEC = 180
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
@@ -147,7 +148,7 @@ def log_trade(record: TradeRecord) -> None:
         else:
             df.to_csv(path, mode="a", header=False, index=False)
     except Exception as exc:  # pragma: no cover
-        logging.debug(f"Trade log error: {exc}")
+        logging.debug(f"Error al registrar operación: {exc}")
 
 
 # ===============================================================
@@ -294,26 +295,29 @@ STRATEGY_FUNCTIONS: List[Tuple[str, Callable[[pd.DataFrame], StrategyResult]]] =
 # ===============================================================
 # SIGNAL COMBINER
 # ===============================================================
-def combine_signals(results: List[StrategyResult], divergence_block: StrategyResult, volatility_filter: StrategyResult) -> Tuple[str, float, List[str]]:
-    total_score = 0.0
+def combine_signals(results: List[Tuple[str, StrategyResult]], total_active: int) -> Tuple[str, float, List[str], Dict[str, str], Dict[str, int]]:
     reasons: List[str] = []
-    for res in results:
-        total_score += res.score
+    agreements: Dict[str, str] = {}
+    votes = {"CALL": 0, "PUT": 0}
+    for name, res in results:
         reasons.extend(res.reasons)
-    threshold = 1.2
-    signal = "NULL"
-    if divergence_block.signal in {"CALL", "PUT"}:
-        reasons.append("Divergence detected → skip")
-        return "NULL", 0.0, reasons
-    if volatility_filter.score < 0:
-        reasons.extend(volatility_filter.reasons)
-        return "NULL", 0.0, reasons
-    if total_score > threshold:
-        signal = "CALL"
-    elif total_score < -threshold:
-        signal = "PUT"
-    confidence = min(0.98, 0.4 + 0.1 * abs(total_score)) if signal != "NULL" else 0.0
-    return signal, confidence, reasons
+        if res.signal in {"CALL", "PUT"}:
+            votes[res.signal] += 1
+            agreements[name] = res.signal
+        else:
+            agreements[name] = "NULL"
+    majority_needed = total_active // 2 + 1 if total_active else 0
+    selected_signal = "NULL"
+    if votes["CALL"] >= majority_needed and votes["CALL"] > votes["PUT"]:
+        selected_signal = "CALL"
+    elif votes["PUT"] >= majority_needed and votes["PUT"] > votes["CALL"]:
+        selected_signal = "PUT"
+    if selected_signal == "NULL" or total_active == 0:
+        return "NULL", 0.0, reasons, agreements, votes
+    ratio = votes[selected_signal] / total_active
+    confidence = min(0.98, 0.4 + 0.4 * ratio)
+    reasons.append(f"Consenso de {votes[selected_signal]}/{total_active} estrategias")
+    return selected_signal, confidence, reasons, agreements, votes
 
 
 # ===============================================================
@@ -330,16 +334,16 @@ class RiskManager:
     def can_trade(self, confidence: float) -> bool:
         now = datetime.now(timezone.utc)
         if self.daily_trades >= MAX_DAILY_TRADES:
-            logging.info("Max daily trades reached")
+            logging.info("Se alcanzó el máximo de operaciones diarias")
             return False
         if self.daily_pnl <= MAX_DAILY_LOSS:
-            logging.info("Daily loss limit reached")
+            logging.info("Se alcanzó el límite diario de pérdida")
             return False
         if self.daily_pnl >= MAX_DAILY_PROFIT:
-            logging.info("Daily profit target reached")
+            logging.info("Se alcanzó el objetivo diario de ganancia")
             return False
         if self.total_pnl <= MAX_DRAWDOWN:
-            logging.info("Max drawdown reached")
+            logging.info("Se alcanzó el drawdown máximo")
             return False
         if (now - self.last_trade_time).total_seconds() < TRADE_DELAY:
             return False
@@ -429,7 +433,7 @@ class AdaptiveAIManager:
                 self.learning_rate = max(self.learning_rate * 0.9, 0.001)
             self._save_state()
         except Exception as exc:  # pragma: no cover
-            logging.debug(f"Adaptive model train error: {exc}")
+            logging.debug(f"Error al entrenar modelo adaptativo: {exc}")
 
     def predict(self, features: np.ndarray) -> Tuple[float, List[str]]:
         if not self.enabled:
@@ -443,14 +447,14 @@ class AdaptiveAIManager:
                 bias = self.bias
         if weights is None:
             if phase == "passive":
-                return 0.5, ["Passive learning"]
-            return 0.5, ["Model warming up"]
+                return 0.5, ["Aprendizaje pasivo"]
+            return 0.5, ["Modelo en calentamiento"]
         logit = float(np.dot(features, weights) + bias)
         logit = float(np.clip(logit, -50.0, 50.0))
         prob = 1.0 / (1.0 + np.exp(-logit))
         if phase == "semi-active":
-            return prob, ["Semi-active advisory"]
-        return prob, ["Autonomous AI"]
+            return prob, ["Asesoría semi-activa"]
+        return prob, ["IA autónoma"]
 
     def fuse_with_technical(self, technical_conf: float, ai_prob: float) -> float:
         phase = self._phase()
@@ -466,10 +470,15 @@ class AdaptiveAIManager:
             try:
                 acc = self.accuracy() * 100
                 phase = self._phase()
-                logging.info(f"📊 AI Advisory → phase={phase} accuracy={acc:.2f}% trades={self.trade_counter}")
+                phase_text = {
+                    "passive": "pasiva",
+                    "semi-active": "semi-activa",
+                    "autonomous": "autónoma",
+                }.get(phase, phase)
+                logging.info(f"📊 Aviso IA → fase={phase_text} precisión={acc:.2f}% operaciones={self.trade_counter}")
                 self._train_model()
             except Exception as exc:  # pragma: no cover
-                logging.debug(f"Advisory loop error: {exc}")
+                logging.debug(f"Error en bucle de avisos IA: {exc}")
 
     def _ensure_weight_dim(self, dim: int) -> None:
         with self.lock:
@@ -509,7 +518,7 @@ class AdaptiveAIManager:
                 learning_rate=self.learning_rate,
             )
         except Exception as exc:  # pragma: no cover
-            logging.debug(f"Adaptive state save error: {exc}")
+            logging.debug(f"Error al guardar estado adaptativo: {exc}")
 
     def _load_state(self) -> None:
         if not self.enabled or not self.state_path.exists():
@@ -532,7 +541,7 @@ class AdaptiveAIManager:
             if win_counter is not None:
                 self.win_counter = int(win_counter)
         except Exception as exc:  # pragma: no cover
-            logging.debug(f"Adaptive state load error: {exc}")
+            logging.debug(f"Error al cargar estado adaptativo: {exc}")
 
 
 def train_adaptive_model(data_path: str, model_path: str) -> None:
@@ -580,27 +589,27 @@ def query_ai_backend(features: np.ndarray) -> Optional[float]:
         response.raise_for_status()
         content = response.json()
     except Exception as exc:
-        logging.debug(f"External AI request failed: {exc}")
+        logging.debug(f"Fallo en solicitud IA externa: {exc}")
         return None
     text = str(content.get("response", "")).lower()
     latency_ms = int((time.perf_counter() - start) * 1000)
     if "call" in text and "put" not in text:
-        logging.info(f"AI backend=ollama latency={latency_ms}ms prob_up=0.80")
+        logging.info(f"IA backend=ollama latencia={latency_ms}ms prob_alza=0.80")
         return 0.8
     if "put" in text and "call" not in text:
-        logging.info(f"AI backend=ollama latency={latency_ms}ms prob_up=0.20")
+        logging.info(f"IA backend=ollama latencia={latency_ms}ms prob_alza=0.20")
         return 0.2
     if text:
-        logging.info(f"AI backend=ollama latency={latency_ms}ms prob_up=0.50")
+        logging.info(f"IA backend=ollama latencia={latency_ms}ms prob_alza=0.50")
         return 0.5
-    logging.debug("External AI returned empty response")
+    logging.debug("La IA externa devolvió una respuesta vacía")
     return None
 
 
 # ===============================================================
 # FEATURE ENGINEERING
 # ===============================================================
-def build_feature_vector(df: pd.DataFrame, reasons: List[str], results: List[StrategyResult]) -> np.ndarray:
+def build_feature_vector(df: pd.DataFrame, reasons: List[str], results: List[Tuple[str, StrategyResult]]) -> np.ndarray:
     ema9 = ema(df["close"], 9).iloc[-1]
     ema21 = ema(df["close"], 21).iloc[-1]
     ema50 = ema(df["close"], 50).iloc[-1]
@@ -608,7 +617,7 @@ def build_feature_vector(df: pd.DataFrame, reasons: List[str], results: List[Str
     rsi_val = rsi(df["close"], 14).iloc[-1]
     lower_bb, upper_bb = bollinger_bands(df["close"])
     atr_val = atr(df, 14).iloc[-1]
-    total_score = sum(res.score for res in results)
+    total_score = sum(res.score for _, res in results)
     features = np.array(
         [
             df["close"].iloc[-1],
@@ -647,10 +656,10 @@ class DerivWebSocket:
                 )
                 self._send({"authorize": API_TOKEN})
                 self._recv()
-                logging.info("Deriv connected")
+                logging.info("Deriv conectado")
                 return
             except Exception as exc:
-                logging.warning(f"Deriv connection error: {exc}")
+                logging.warning(f"Error de conexión con Deriv: {exc}")
                 time.sleep(2)
 
     def _send(self, payload: Dict[str, Any]) -> int:
@@ -711,7 +720,7 @@ class DerivWebSocket:
             msg = self._recv()
             if msg.get("req_id") == req_id:
                 if "error" in msg:
-                    logging.warning(f"Proposal error: {msg['error']}")
+                    logging.warning(f"Error al generar propuesta: {msg['error']}")
                     return None, 0.0
                 proposal = msg["proposal"]
                 break
@@ -720,7 +729,7 @@ class DerivWebSocket:
             msg = self._recv()
             if msg.get("req_id") == buy_id:
                 if "error" in msg:
-                    logging.warning(f"Buy error: {msg['error']}")
+                    logging.warning(f"Error al comprar contrato: {msg['error']}")
                     return None, 0.0
                 return msg["buy"]["contract_id"], float(proposal["ask_price"])
 
@@ -773,29 +782,30 @@ class TradingEngine:
             try:
                 callback(record, stats)
             except Exception as exc:
-                logging.debug(f"Trade listener error: {exc}")
+                logging.debug(f"Error en escucha de operaciones: {exc}")
 
     def _notify_status(self, status: str) -> None:
         for callback in list(self._status_listeners):
             try:
                 callback(status)
             except Exception as exc:
-                logging.debug(f"Status listener error: {exc}")
+                logging.debug(f"Error en escucha de estado: {exc}")
 
-    def _evaluate_strategies(self, df: pd.DataFrame) -> Tuple[str, float, List[str], List[StrategyResult]]:
+    def _evaluate_strategies(self, df: pd.DataFrame) -> Tuple[str, float, List[str], List[Tuple[str, StrategyResult]], Dict[str, str], Dict[str, int], int]:
         with self._strategy_lock:
-            active_funcs = [func for name, func in STRATEGY_FUNCTIONS if self.strategy_states.get(name, True)]
+            active_entries = [(name, func) for name, func in STRATEGY_FUNCTIONS if self.strategy_states.get(name, True)]
             divergence_enabled = self.strategy_states.get("Divergence", True)
             volatility_enabled = self.strategy_states.get("Volatility Filter", True)
-        results = [func(df) for func in active_funcs]
-        divergence_res = strategy_divergence_block(df) if divergence_enabled else StrategyResult("NULL", 0.0, [])
-        volatility_res = strategy_volatility_filter(df) if volatility_enabled else StrategyResult("NULL", 0.0, [])
-        signal, confidence, reasons = combine_signals(results, divergence_res, volatility_res)
-        if divergence_res.reasons:
-            reasons.extend(divergence_res.reasons)
-        if volatility_res.reasons:
-            reasons.extend(volatility_res.reasons)
-        return signal, confidence, reasons, results
+            total_active = len(active_entries) + int(divergence_enabled) + int(volatility_enabled)
+        results: List[Tuple[str, StrategyResult]] = []
+        for name, func in active_entries:
+            results.append((name, func(df)))
+        if divergence_enabled:
+            results.append(("Divergence", strategy_divergence_block(df)))
+        if volatility_enabled:
+            results.append(("Volatility Filter", strategy_volatility_filter(df)))
+        signal, confidence, reasons, agreements, votes = combine_signals(results, total_active)
+        return signal, confidence, reasons, results, agreements, votes, total_active
 
     def _simulate_result(self) -> Tuple[str, float]:
         outcome = np.random.rand() > 0.5
@@ -805,7 +815,16 @@ class TradingEngine:
     def execute_cycle(self, symbol: str) -> None:
         candles = self.api.fetch_candles(symbol)
         df = to_dataframe(candles)
-        signal, confidence, reasons, results = self._evaluate_strategies(df)
+        signal, confidence, reasons, results, agreements, votes, total_active = self._evaluate_strategies(df)
+        if total_active > 0:
+            if signal != "NULL":
+                logging.info(f"✅ {votes[signal]}/{total_active} estrategias confirman {signal}")
+            else:
+                direccion = "CALL" if votes["CALL"] >= votes["PUT"] else "PUT"
+                if max(votes.values()) > 0:
+                    logging.info(f"⚠️ {votes[direccion]}/{total_active} estrategias en desacuerdo")
+                else:
+                    logging.info(f"⚠️ Ninguna de las {total_active} estrategias activas generó señal")
         if signal == "NULL":
             return
         features = build_feature_vector(df, reasons, results)
@@ -822,14 +841,14 @@ class TradingEngine:
         if ai_prob is not None:
             if internal_prob != 0.5:
                 ai_prob = (ai_prob + internal_prob) / 2
-                ai_notes.append("Adaptive blend applied")
+                ai_notes.append("Mezcla adaptativa aplicada")
             fused = self.ai.fuse_with_technical(confidence, ai_prob)
             ai_confidence = fused
-            ai_notes.append(f"AI blend {ai_prob:.2f}")
+            ai_notes.append(f"Mezcla IA {ai_prob:.2f}")
         elif internal_prob != 0.5:
             fused = self.ai.fuse_with_technical(confidence, internal_prob)
             ai_confidence = fused
-            ai_notes.append(f"Adaptive core {internal_prob:.2f}")
+            ai_notes.append(f"Núcleo adaptativo {internal_prob:.2f}")
         if not self.risk.can_trade(ai_confidence):
             return
         contract_id, price = self.api.buy(symbol, signal, STAKE)
@@ -857,10 +876,10 @@ class TradingEngine:
         ema_diff = df["close"].iloc[-1] - df["close"].iloc[-2]
         latest_rsi = rsi(df["close"]).iloc[-1]
         logging.info(
-            f"{record.timestamp:%Y-%m-%d %H:%M:%S} INFO: [{symbol}] {signal} @{ai_confidence:.2f} | EMA:{ema_diff:.2f} RSI:{latest_rsi:.2f} | {'+'.join(reasons)}"
+            f"{record.timestamp:%Y-%m-%d %H:%M:%S} INFO: [{symbol}] {signal} @{ai_confidence:.2f} | EMA:{ema_diff:.2f} RSI:{latest_rsi:.2f} | Motivos: {'; '.join(reasons)}"
         )
         if ai_notes:
-            logging.info(f"📊 AI Advisory → {'; '.join(ai_notes)}")
+            logging.info(f"📊 Aviso IA → {'; '.join(ai_notes)}")
         self._notify_trade(record)
 
     def run(self) -> None:
@@ -876,7 +895,7 @@ class TradingEngine:
                     try:
                         self.execute_cycle(symbol)
                     except Exception as exc:
-                        logging.warning(f"Cycle error for {symbol}: {exc}")
+                        logging.warning(f"Error en ciclo para {symbol}: {exc}")
                     if not self.running.is_set():
                         break
                     time.sleep(1)
@@ -936,7 +955,7 @@ class TradingThread(QtCore.QThread):
 class BotWindow(QtWidgets.QWidget):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Deriv Bot Pro Trader")
+        self.setWindowTitle("Bot Deriv Pro Trader")
         self.resize(1320, 780)
         self.setStyleSheet(
             """
@@ -968,6 +987,9 @@ class BotWindow(QtWidgets.QWidget):
         self.engine = TradingEngine()
         self.engine.add_trade_listener(lambda record, stats: self.bridge.trade.emit(record, stats))
         self.engine.add_status_listener(lambda status: self.bridge.status.emit(status))
+        self.strategy_initial_state = self._load_strategy_config()
+        for name, enabled in self.strategy_initial_state.items():
+            self.engine.set_strategy_state(name, enabled)
 
         self.thread: Optional[TradingThread] = None
         self.latest_stats: Dict[str, float] = {
@@ -1001,29 +1023,29 @@ class BotWindow(QtWidgets.QWidget):
         vbox = QtWidgets.QVBoxLayout(tab)
 
         control_layout = QtWidgets.QHBoxLayout()
-        self.start_button = QtWidgets.QPushButton("▶️ Start")
-        self.stop_button = QtWidgets.QPushButton("⏹️ Stop")
+        self.start_button = QtWidgets.QPushButton("▶️ Iniciar")
+        self.stop_button = QtWidgets.QPushButton("⏹️ Detener")
         self.stop_button.setEnabled(False)
         self.start_button.clicked.connect(self.start_trading)
         self.stop_button.clicked.connect(self.stop_trading)
         control_layout.addWidget(self.start_button)
         control_layout.addWidget(self.stop_button)
         control_layout.addStretch()
-        self.status_label = QtWidgets.QLabel("Status: Idle")
-        self.ai_mode_label = QtWidgets.QLabel("AI Mode: Passive")
+        self.status_label = QtWidgets.QLabel("Estado: Inactivo")
+        self.ai_mode_label = QtWidgets.QLabel("Modo IA: Pasivo")
         control_layout.addWidget(self.status_label)
         control_layout.addWidget(self.ai_mode_label)
         vbox.addLayout(control_layout)
 
-        stats_group = QtWidgets.QGroupBox("Performance")
+        stats_group = QtWidgets.QGroupBox("Desempeño")
         stats_layout = QtWidgets.QGridLayout(stats_group)
         labels = [
-            ("Operations", "0"),
-            ("Wins", "0"),
-            ("Losses", "0"),
-            ("PnL", "$0.00"),
-            ("Daily PnL", "$0.00"),
-            ("Accuracy", "0.0%"),
+            ("Operaciones", "0"),
+            ("Ganadas", "0"),
+            ("Perdidas", "0"),
+            ("Ganancia", "$0.00"),
+            ("Ganancia diaria", "$0.00"),
+            ("Precisión", "0.0%"),
         ]
         self.stats_values: Dict[str, QtWidgets.QLabel] = {}
         for index, (title, initial) in enumerate(labels):
@@ -1037,13 +1059,13 @@ class BotWindow(QtWidgets.QWidget):
 
         self.trade_table = QtWidgets.QTableWidget(0, 7)
         self.trade_table.setHorizontalHeaderLabels([
-            "Time",
-            "Symbol",
-            "Decision",
-            "Confidence",
-            "Result",
+            "Hora",
+            "Símbolo",
+            "Decisión",
+            "Confianza",
+            "Resultado",
             "PnL",
-            "Notes",
+            "Notas",
         ])
         self.trade_table.horizontalHeader().setStretchLastSection(True)
         self.trade_table.verticalHeader().setVisible(False)
@@ -1056,22 +1078,31 @@ class BotWindow(QtWidgets.QWidget):
 
     def _build_strategies_tab(self) -> None:
         tab = QtWidgets.QWidget()
-        self.tabs.addTab(tab, "Strategies")
+        self.tabs.addTab(tab, "Estrategias")
         layout = QtWidgets.QVBoxLayout(tab)
-        layout.addWidget(QtWidgets.QLabel("Toggle individual strategies:"))
+        layout.addWidget(QtWidgets.QLabel("Activar o desactivar estrategias:"))
         strategy_descriptions = {
-            "RSI+EMA": "RSI + EMA crossover → seek oversold/overbought alignment",
-            "Bollinger Rebound": "Bollinger rebound → fade extremes with RSI confirmation",
-            "Trend Filter": "Trend filter → align with SMA200 and EMA structure",
-            "Pullback": "Pullback → retrace to EMA21 with confirmation candle",
-            "Breakout": "Donchian breakout → follow fresh highs/lows with RSI filter",
-            "Divergence": "Divergence block → skip trades when RSI disagrees",
-            "Volatility Filter": "Volatility filter → avoid very low/high ATR regimes",
+            "RSI+EMA": "Cruce RSI + EMA → buscar sobreventa o sobrecompra alineada",
+            "Bollinger Rebound": "Rebote en Bollinger → aprovechar extremos con confirmación RSI",
+            "Trend Filter": "Filtro de tendencia → seguir la SMA200 y estructura EMA",
+            "Pullback": "Pullback → retroceso hacia EMA21 con vela de confirmación",
+            "Breakout": "Ruptura Donchian → seguir nuevos máximos/mínimos con RSI",
+            "Divergence": "Bloqueo por divergencia → evitar operaciones si RSI discrepa",
+            "Volatility Filter": "Filtro de volatilidad → evitar ATR demasiado bajo o alto",
+        }
+        strategy_labels = {
+            "RSI+EMA": "RSI + EMA",
+            "Bollinger Rebound": "Rebote Bollinger",
+            "Trend Filter": "Filtro de tendencia",
+            "Pullback": "Pullback",
+            "Breakout": "Ruptura Donchian",
+            "Divergence": "Bloqueo por divergencia",
+            "Volatility Filter": "Filtro de volatilidad",
         }
         states = self.engine.get_strategy_states()
         strategy_names = [name for name, _ in STRATEGY_FUNCTIONS] + ["Divergence", "Volatility Filter"]
         for name in strategy_names:
-            checkbox = QtWidgets.QCheckBox(name)
+            checkbox = QtWidgets.QCheckBox(strategy_labels.get(name, name))
             checkbox.setChecked(states.get(name, True))
             checkbox.setToolTip(strategy_descriptions.get(name, ""))
             checkbox.stateChanged.connect(lambda state, n=name: self._handle_strategy_toggle(n, state))
@@ -1081,20 +1112,20 @@ class BotWindow(QtWidgets.QWidget):
 
     def _build_settings_tab(self) -> None:
         tab = QtWidgets.QWidget()
-        self.tabs.addTab(tab, "Settings")
+        self.tabs.addTab(tab, "Configuración")
         form = QtWidgets.QFormLayout(tab)
-        self.ai_phase_value = QtWidgets.QLabel("Passive")
+        self.ai_phase_value = QtWidgets.QLabel("Pasivo")
         self.ai_accuracy_value = QtWidgets.QLabel("0.0%")
         self.daily_limit_value = QtWidgets.QLabel(f"{MAX_DAILY_LOSS:.2f}")
         self.take_profit_value = QtWidgets.QLabel(f"{MAX_DAILY_PROFIT:.2f}")
         self.drawdown_value = QtWidgets.QLabel(f"{MAX_DRAWDOWN:.2f}")
-        self.ml_state_label = QtWidgets.QLabel("Adaptive core ready")
-        form.addRow("AI phase", self.ai_phase_value)
-        form.addRow("AI accuracy", self.ai_accuracy_value)
-        form.addRow("Daily loss limit", self.daily_limit_value)
-        form.addRow("Daily take profit", self.take_profit_value)
-        form.addRow("Max drawdown", self.drawdown_value)
-        form.addRow("Learning engine", self.ml_state_label)
+        self.ml_state_label = QtWidgets.QLabel("IA adaptativa lista")
+        form.addRow("Fase IA", self.ai_phase_value)
+        form.addRow("Precisión IA", self.ai_accuracy_value)
+        form.addRow("Límite diario de pérdida", self.daily_limit_value)
+        form.addRow("Objetivo diario de ganancia", self.take_profit_value)
+        form.addRow("Máx. drawdown", self.drawdown_value)
+        form.addRow("Motor de aprendizaje", self.ml_state_label)
 
     def start_trading(self) -> None:
         if self.thread is not None and self.thread.isRunning():
@@ -1104,7 +1135,7 @@ class BotWindow(QtWidgets.QWidget):
         self.thread.start()
         self.start_button.setEnabled(False)
         self.stop_button.setEnabled(True)
-        self.status_label.setText("Status: Starting...")
+        self.status_label.setText("Estado: Iniciando...")
 
     def stop_trading(self) -> None:
         if self.thread is None:
@@ -1114,11 +1145,12 @@ class BotWindow(QtWidgets.QWidget):
         self.thread = None
         self.start_button.setEnabled(True)
         self.stop_button.setEnabled(False)
-        self.status_label.setText("Status: Stopped")
+        self.status_label.setText("Estado: Detenido")
 
     def _handle_strategy_toggle(self, name: str, state: int) -> None:
         enabled = state == QtCore.Qt.Checked
         self.engine.set_strategy_state(name, enabled)
+        self._save_strategy_config()
 
     def _on_trade(self, record: TradeRecord, stats: Dict[str, float]) -> None:
         self.latest_stats = stats
@@ -1140,11 +1172,11 @@ class BotWindow(QtWidgets.QWidget):
 
     def _on_status(self, status: str) -> None:
         mapping = {
-            "connecting": "Status: Connecting...",
-            "running": "Status: Running",
-            "stopped": "Status: Stopped",
+            "connecting": "Estado: Conectando...",
+            "running": "Estado: Ejecutando",
+            "stopped": "Estado: Detenido",
         }
-        self.status_label.setText(mapping.get(status, f"Status: {status}"))
+        self.status_label.setText(mapping.get(status, f"Estado: {status}"))
         if status == "running":
             self.start_button.setEnabled(False)
             self.stop_button.setEnabled(True)
@@ -1156,33 +1188,62 @@ class BotWindow(QtWidgets.QWidget):
         self.thread = None
         self.start_button.setEnabled(True)
         self.stop_button.setEnabled(False)
-        self.status_label.setText("Status: Stopped")
+        self.status_label.setText("Estado: Detenido")
 
     def _append_log(self, message: str) -> None:
         self.log_view.appendPlainText(message)
         self.log_view.verticalScrollBar().setValue(self.log_view.verticalScrollBar().maximum())
 
     def _update_stats_labels(self, stats: Dict[str, float]) -> None:
-        self.stats_values["Operations"].setText(str(int(stats.get("operations", 0.0))))
-        self.stats_values["Wins"].setText(str(int(stats.get("wins", 0.0))))
-        self.stats_values["Losses"].setText(str(int(stats.get("losses", 0.0))))
-        self.stats_values["PnL"].setText(f"${stats.get('pnl', 0.0):.2f}")
-        self.stats_values["Daily PnL"].setText(f"${stats.get('daily_pnl', 0.0):.2f}")
-        self.stats_values["Accuracy"].setText(f"{stats.get('accuracy', 0.0):.1f}%")
+        self.stats_values["Operaciones"].setText(str(int(stats.get("operations", 0.0))))
+        self.stats_values["Ganadas"].setText(str(int(stats.get("wins", 0.0))))
+        self.stats_values["Perdidas"].setText(str(int(stats.get("losses", 0.0))))
+        self.stats_values["Ganancia"].setText(f"${stats.get('pnl', 0.0):.2f}")
+        self.stats_values["Ganancia diaria"].setText(f"${stats.get('daily_pnl', 0.0):.2f}")
+        self.stats_values["Precisión"].setText(f"{stats.get('accuracy', 0.0):.1f}%")
 
     def _refresh_phase(self) -> None:
-        phase = self.engine.ai._phase().title()
+        raw_phase = self.engine.ai._phase()
+        phase_map = {
+            "passive": "Pasivo",
+            "semi-active": "Semi-activo",
+            "autonomous": "Autónomo",
+        }
+        phase = phase_map.get(raw_phase, raw_phase.title())
         accuracy = self.engine.ai.accuracy() * 100.0
-        self.ai_mode_label.setText(f"AI Mode: {phase}")
+        self.ai_mode_label.setText(f"Modo IA: {phase}")
         self.ai_phase_value.setText(phase)
         self.ai_accuracy_value.setText(f"{accuracy:.2f}%")
-        self.ml_state_label.setText("Adaptive core ready" if self.engine.ai.enabled else "Adaptive core disabled")
+        self.ml_state_label.setText("IA adaptativa lista" if self.engine.ai.enabled else "IA adaptativa deshabilitada")
         states = self.engine.get_strategy_states()
         for name, checkbox in self.strategy_checkboxes.items():
             desired = states.get(name, True)
             if checkbox.isChecked() != desired:
                 blocker = QtCore.QSignalBlocker(checkbox)
                 checkbox.setChecked(desired)
+
+    def _load_strategy_config(self) -> Dict[str, bool]:
+        estados: Dict[str, bool] = {}
+        try:
+            if STRATEGY_CONFIG_PATH.exists():
+                with STRATEGY_CONFIG_PATH.open("r", encoding="utf-8") as handle:
+                    raw = json.load(handle)
+                if isinstance(raw, dict):
+                    for nombre, valor in raw.items():
+                        estados[nombre] = bool(valor)
+        except Exception as exc:
+            logging.debug(f"No se pudo cargar configuración de estrategias: {exc}")
+        return estados
+
+    def _save_strategy_config(self) -> None:
+        try:
+            estados = self.engine.get_strategy_states()
+            if STRATEGY_CONFIG_PATH.parent != Path("."):
+                STRATEGY_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
+            with STRATEGY_CONFIG_PATH.open("w", encoding="utf-8") as handle:
+                json.dump(estados, handle, ensure_ascii=False, indent=2)
+        except Exception as exc:
+            logging.debug(f"No se pudo guardar configuración de estrategias: {exc}")
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # type: ignore[override]
         if self.thread is not None and self.thread.isRunning():
