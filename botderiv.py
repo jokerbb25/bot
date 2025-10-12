@@ -1055,7 +1055,7 @@ class BotWindow(QtWidgets.QWidget):
         self.ai_phase_value = QtWidgets.QLabel("Passive")
         self.ai_accuracy_value = QtWidgets.QLabel("0.0%")
         self.daily_limit_value = QtWidgets.QLabel(f"{MAX_DAILY_LOSS:.2f}")
-        self.take_profit_value = QtWidgets.QLabel(f"{RISK_DAILY_TAKE_PROFIT:.2f}")
+        self.take_profit_value = QtWidgets.QLabel(f"{MAX_DAILY_PROFIT:.2f}")
         self.drawdown_value = QtWidgets.QLabel(f"{MAX_DRAWDOWN:.2f}")
         self.ml_state_label = QtWidgets.QLabel("Adaptive core ready")
         form.addRow("AI phase", self.ai_phase_value)
