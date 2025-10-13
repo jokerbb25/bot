@@ -63,13 +63,6 @@ operation_active = False
 TRADE_DURATION_SECONDS = 60
 RESULT_POLL_INTERVAL = 5
 RESUME_MESSAGE = "🔁 Reanudando análisis del mercado..."
-COOLDOWN_SECONDS = 60
-COOLDOWN_LOG_INTERVAL = 5
-cooldown_active = False
-cooldown_start: Optional[datetime] = None
-last_cooldown_log: Optional[datetime] = None
-COOLDOWN_WAIT_MESSAGE = "⏳ Esperando cooldown antes de la próxima operación..."
-COOLDOWN_END_MESSAGE = "🔁 Cooldown finalizado, reanudando análisis del mercado..."
 
 
 # ===============================================================
@@ -1027,13 +1020,6 @@ class TradingEngine:
         self.stop()
 
 
-    def _start_cooldown(self) -> None:
-        global cooldown_active, cooldown_start, last_cooldown_log
-        cooldown_active = True
-        cooldown_start = datetime.now(timezone.utc)
-        last_cooldown_log = None
-        self._notify_trade_state('waiting')
-
     def _wait_for_contract_result(self, contract_id: int, duration_seconds: int) -> str:
         end_time = datetime.now(timezone.utc) + timedelta(seconds=duration_seconds)
         logging.info(f"⏳ Esperando resultado real del contrato #{contract_id}...")
@@ -1069,25 +1055,11 @@ class TradingEngine:
 
 
     def execute_cycle(self, symbol: str) -> None:
-        global operation_active, cooldown_active, cooldown_start, last_cooldown_log
+        global operation_active
         now = datetime.now(timezone.utc)
         if operation_active:
             time.sleep(2)
             return
-        if cooldown_active:
-            if cooldown_start is not None and (now - cooldown_start).total_seconds() >= COOLDOWN_SECONDS:
-                cooldown_active = False
-                cooldown_start = None
-                last_cooldown_log = None
-                logging.info(COOLDOWN_END_MESSAGE)
-                self._notify_trade_state("ready")
-            else:
-                if last_cooldown_log is None or (now - last_cooldown_log).total_seconds() >= COOLDOWN_LOG_INTERVAL:
-                    logging.info(COOLDOWN_WAIT_MESSAGE)
-                    last_cooldown_log = now
-                self._notify_trade_state("waiting")
-                time.sleep(COOLDOWN_LOG_INTERVAL)
-                return
         candles = self.api.fetch_candles(symbol)
         df = to_dataframe(candles)
         results, consensus = self._evaluate_strategies(df)
@@ -1160,7 +1132,7 @@ class TradingEngine:
         if not self.risk.can_trade(ai_confidence):
             self._notify_trade_state("ready")
             return
-        if operation_active or cooldown_active:
+        if operation_active:
             return
         contract_id, duration_seconds = self.api.buy(symbol, signal, self.trade_amount)
         if contract_id is None:
@@ -1233,18 +1205,14 @@ class TradingEngine:
             operation_active = False
             self.active_trade_symbol = None
             logging.info(RESUME_MESSAGE)
-            self._start_cooldown()
 
     def run(self) -> None:
-        global operation_active, cooldown_active, cooldown_start, last_cooldown_log
+        global operation_active
         self.running.set()
         self._notify_status("connecting")
         self.api.connect()
         self._notify_status("running")
         operation_active = False
-        cooldown_active = False
-        cooldown_start = None
-        last_cooldown_log = None
         self._notify_trade_state("ready")
         try:
             while self.running.is_set():
@@ -1262,12 +1230,9 @@ class TradingEngine:
             self._notify_status("stopped")
 
     def stop(self) -> None:
-        global operation_active, cooldown_active, cooldown_start, last_cooldown_log
+        global operation_active
         self.running.clear()
         operation_active = False
-        cooldown_active = False
-        cooldown_start = None
-        last_cooldown_log = None
         self.active_trade_symbol = None
         self._notify_trade_state("ready")
         try:
