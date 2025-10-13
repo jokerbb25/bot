@@ -315,7 +315,8 @@ def combine_signals(results: List[Tuple[str, StrategyResult]], active_states: Di
     agreements: Dict[str, str] = {}
     pesos_direccion = {'CALL': 0.0, 'PUT': 0.0}
     conteo_direccion = {'CALL': 0, 'PUT': 0}
-    total_peso = 0.0
+    total_weight_signals = 0.0
+    total_weight_active = 0.0
     override_signal: Optional[str] = None
     override_reason = ''
     low_volatility = False
@@ -325,7 +326,7 @@ def combine_signals(results: List[Tuple[str, StrategyResult]], active_states: Di
         if not active_states.get(name, True):
             continue
         weight = STRATEGY_WEIGHTS.get(name, 1.0)
-        total_peso += weight
+        total_weight_active += weight
         active_count += 1
         agreements[name] = res.signal
         reasons.extend(res.reasons)
@@ -341,13 +342,19 @@ def combine_signals(results: List[Tuple[str, StrategyResult]], active_states: Di
             elif res.extra.get('strong_put'):
                 override_signal = 'PUT'
                 override_reason = f"RSI extremo {rsi_val:.2f}" if rsi_val is not None else 'RSI extremo'
-        if name == 'Divergence' and res.signal in {'CALL', 'PUT'}:
-            override_signal = res.signal
-            override_reason = 'Divergencia confirmada'
+        if name == 'Divergence':
+            if res.extra.get('strong_call'):
+                override_signal = 'CALL'
+                override_reason = 'Divergencia confirmada'
+            elif res.extra.get('strong_put'):
+                override_signal = 'PUT'
+                override_reason = 'Divergencia confirmada'
         if res.signal in {'CALL', 'PUT'}:
             pesos_direccion[res.signal] += weight
             conteo_direccion[res.signal] += 1
-    if total_peso == 0:
+            total_weight_signals += weight
+    if total_weight_signals == 0.0:
+        main_reason = '⚠️ Ninguna de las estrategias activas generó señal'
         return {
             'signal': 'NONE',
             'confidence': 0.0,
@@ -357,44 +364,45 @@ def combine_signals(results: List[Tuple[str, StrategyResult]], active_states: Di
             'weights': pesos_direccion,
             'active': active_count,
             'aligned': 0,
+            'signals': 0,
             'confidence_label': 'Baja',
             'low_volatility': low_volatility,
             'volatility_value': volatility_value,
-            'override': False,
+            'override': override_signal is not None,
             'override_reason': override_reason,
-            'main_reason': 'Ninguna estrategia clara',
+            'main_reason': main_reason,
             'dominant': 'NONE',
+            'total_weight': total_weight_signals,
+            'active_weight': total_weight_active,
         }
     dominante = 'CALL' if pesos_direccion['CALL'] >= pesos_direccion['PUT'] else 'PUT'
-    confianza = pesos_direccion[dominante] / total_peso if pesos_direccion[dominante] > 0 else 0.0
+    confianza = pesos_direccion[dominante] / total_weight_signals
     signal = 'NONE'
     aligned = conteo_direccion[dominante]
-    if pesos_direccion[dominante] > 0 and confianza >= 0.45:
+    if confianza >= 0.45:
         signal = dominante
-    elif override_signal:
-        signal = override_signal
-        confianza = max(confianza, 0.45)
-        aligned = conteo_direccion.get(override_signal, 0)
-    if signal == 'NONE' and override_signal:
+    if override_signal:
         signal = override_signal
         confianza = max(confianza, 0.45)
         aligned = conteo_direccion.get(override_signal, 0)
     if low_volatility and signal != 'NONE':
         confianza *= 0.85
-        reasons.append('Volatilidad baja → se reduce la confianza')
+        reasons.append('Volatilidad baja → confianza limitada')
     confianza = min(confianza, 0.98)
     if signal != 'NONE':
         confianza = max(confianza, 0.35)
-    confianza_label = _clasificar_confianza(confianza)
-    if signal == 'NONE':
-        confianza_label = 'Baja'
+    confianza_label = _clasificar_confianza(confianza) if signal != 'NONE' else 'Baja'
     motivos_alineados = [
         razon
         for nombre, res in results
         for razon in res.reasons
         if res.signal == signal and signal != 'NONE'
     ]
-    main_reason = override_reason or (motivos_alineados[0] if motivos_alineados else (reasons[0] if reasons else 'Señal compuesta'))
+    main_reason = override_reason or (
+        motivos_alineados[0] if motivos_alineados else (reasons[0] if reasons else 'Señal compuesta')
+    )
+    if low_volatility and signal != 'NONE' and 'volatilidad' not in main_reason.lower():
+        main_reason = f"{main_reason} + baja volatilidad"
     return {
         'signal': signal,
         'confidence': confianza,
@@ -404,6 +412,7 @@ def combine_signals(results: List[Tuple[str, StrategyResult]], active_states: Di
         'weights': pesos_direccion,
         'active': active_count,
         'aligned': aligned,
+        'signals': conteo_direccion['CALL'] + conteo_direccion['PUT'],
         'confidence_label': confianza_label,
         'low_volatility': low_volatility,
         'volatility_value': volatility_value,
@@ -411,7 +420,8 @@ def combine_signals(results: List[Tuple[str, StrategyResult]], active_states: Di
         'override_reason': override_reason,
         'main_reason': main_reason,
         'dominant': dominante,
-        'total_weight': total_peso,
+        'total_weight': total_weight_signals,
+        'active_weight': total_weight_active,
     }
 
 
@@ -919,28 +929,52 @@ class TradingEngine:
             mensaje = resultado.reasons[0] if resultado.reasons else 'Sin comentario'
             logging.info(f'[{symbol}] {etiqueta}: {mensaje} (señal {resultado.signal})')
         active_total = consensus['active']
+        signals_total = consensus['signals']
         if active_total == 0:
             logging.info('⚠️ Sin estrategias activas configuradas')
             return
-        if signal == 'NONE':
-            logging.info('Ninguna estrategia clara')
+        if signals_total == 0:
+            logging.info('⚠️ Ninguna de las estrategias activas generó señal')
+            logging.info(f"Estrategias activas: {active_total}/{TOTAL_STRATEGY_COUNT}")
             return
         logging.info(
-            f"📊 Confianza {consensus['confidence_label'].lower()} ({confidence:.2f}) → {consensus['main_reason']}"
+            f"Estrategias con señal: {signals_total}/{active_total}"
+        )
+        etiqueta_conf = consensus['confidence_label'].lower()
+        if signal == 'NONE':
+            logging.info(
+                f"⚠️ Confianza {etiqueta_conf} ({confidence:.2f}) → {consensus['main_reason']}"
+            )
+            logging.info(
+                f"Estrategias activas: {active_total}/{TOTAL_STRATEGY_COUNT}"
+            )
+            if consensus['low_volatility']:
+                valor_vol = consensus['volatility_value']
+                detalle = f" ({valor_vol:.4f})" if valor_vol is not None else ''
+                logging.info(f"⚠️ Volatilidad baja detectada{detalle}")
+            return
+        logging.info(
+            f"📊 Confianza {etiqueta_conf} ({confidence:.2f}) → {consensus['main_reason']}"
         )
         logging.info(
-            f"Estrategias alineadas: {consensus['aligned']}/{active_total}"
+            f"Estrategias alineadas: {consensus['aligned']}/{signals_total}"
         )
         logging.info(
             f"Estrategias activas: {active_total}/{TOTAL_STRATEGY_COUNT}"
         )
         if consensus['low_volatility']:
+            valor_vol = consensus['volatility_value']
+            detalle = f" ({valor_vol:.4f})" if valor_vol is not None else ''
             if consensus['override']:
-                logging.info('🚫 Volatilidad baja pero señal fuerte RSI → operación anticipada')
+                if 'RSI' in consensus['override_reason']:
+                    logging.info('🚫 Volatilidad baja pero señal fuerte RSI → operación anticipada')
+                else:
+                    logging.info(f"🚫 Volatilidad baja pero {consensus['override_reason'].lower()} → operación anticipada")
             else:
-                valor_vol = consensus['volatility_value']
-                detalle = f" ({valor_vol:.4f})" if valor_vol is not None else ''
-                logging.info(f"⚠️ Confianza ajustada por volatilidad baja{detalle}")
+                logging.info(f"⚠️ Volatilidad baja detectada{detalle}")
+        logging.info(
+            f"✅ Señal final: {signal} | Confianza {confidence:.2f} | Estrategias activas: {active_total}/{TOTAL_STRATEGY_COUNT}"
+        )
         features = build_feature_vector(df, reasons, results)
         ai_prob = None
         if AI_ENABLED:
@@ -976,12 +1010,16 @@ class TradingEngine:
             'confidence_value': confidence,
             'aligned': consensus['aligned'],
             'active': consensus['active'],
+            'signals': consensus['signals'],
             'direction': signal,
             'main_reason': consensus['main_reason'],
             'low_volatility': consensus['low_volatility'],
             'volatility_value': consensus['volatility_value'],
             'override': consensus['override'],
             'override_reason': consensus['override_reason'],
+            'dominant': consensus['dominant'],
+            'total_weight': consensus['total_weight'],
+            'active_weight': consensus.get('active_weight', 0.0),
         }
         record = TradeRecord(
             timestamp=datetime.now(timezone.utc),
@@ -1366,7 +1404,8 @@ class BotWindow(QtWidgets.QWidget):
         activos = int(record.metadata.get('active', 0))
         etiquetas['active'].setText(f"Estrategias activas: {activos}/{TOTAL_STRATEGY_COUNT}")
         alineadas = int(record.metadata.get('aligned', 0))
-        divisor = activos if activos else TOTAL_STRATEGY_COUNT
+        señales = int(record.metadata.get('signals', activos))
+        divisor = señales if señales else max(activos, 1)
         etiquetas['aligned'].setText(f"Estrategias alineadas: {alineadas}/{divisor}")
         direccion = record.metadata.get('direction', record.decision)
         etiquetas['direction'].setText(f"Dirección dominante: {direccion}")
