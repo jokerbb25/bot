@@ -77,6 +77,7 @@ class StrategyResult:
     signal: str
     score: float
     reasons: List[str] = field(default_factory=list)
+    extra: Dict[str, Any] = field(default_factory=dict)
 
 
 @dataclass
@@ -88,6 +89,7 @@ class TradeRecord:
     result: Optional[str]
     pnl: float
     reasons: List[str]
+    metadata: Dict[str, Any] = field(default_factory=dict)
 
 
 # ===============================================================
@@ -156,100 +158,114 @@ def log_trade(record: TradeRecord) -> None:
 # ===============================================================
 def strategy_rsi(df: pd.DataFrame) -> StrategyResult:
     if len(df) < 15:
-        return StrategyResult('NONE', 0.0, ['RSI sin suficientes datos'])
+        return StrategyResult('NONE', 0.0, ['RSI sin suficientes datos'], {'rsi': None})
     rsi_series = rsi(df['close'])
     valor = float(rsi_series.iloc[-1])
+    extra = {
+        'rsi': valor,
+        'strong_call': valor < 25,
+        'strong_put': valor > 75,
+    }
     if valor < 30:
-        return StrategyResult('CALL', 1.0, [f"RSI {valor:.2f} sobrevendido → señal CALL"])
+        return StrategyResult('CALL', 2.0, [f"RSI {valor:.2f} sobrevendido → señal CALL"], extra)
     if valor > 70:
-        return StrategyResult('PUT', -1.0, [f"RSI {valor:.2f} sobrecomprado → señal PUT"])
-    return StrategyResult('NONE', 0.0, [f"RSI {valor:.2f} sin sesgo claro"])
+        return StrategyResult('PUT', -2.0, [f"RSI {valor:.2f} sobrecomprado → señal PUT"], extra)
+    return StrategyResult('NONE', 0.0, [f"RSI {valor:.2f} sin sesgo claro"], extra)
 
 
 def strategy_ema_trend(df: pd.DataFrame) -> StrategyResult:
     if len(df) < 25:
-        return StrategyResult('NONE', 0.0, ['EMAs sin datos suficientes'])
+        return StrategyResult('NONE', 0.0, ['EMAs sin datos suficientes'], {})
     ema_corto = ema(df['close'], 9)
     ema_largo = ema(df['close'], 21)
     cruz_alcista = ema_corto.iloc[-2] <= ema_largo.iloc[-2] and ema_corto.iloc[-1] > ema_largo.iloc[-1]
     cruz_bajista = ema_corto.iloc[-2] >= ema_largo.iloc[-2] and ema_corto.iloc[-1] < ema_largo.iloc[-1]
     if cruz_alcista:
-        return StrategyResult('CALL', 0.9, ['Cruce alcista EMA9 sobre EMA21 → CALL'])
+        return StrategyResult('CALL', 1.5, ['Cruce alcista EMA9 sobre EMA21 → CALL'], {'ema_short': float(ema_corto.iloc[-1]), 'ema_long': float(ema_largo.iloc[-1])})
     if cruz_bajista:
-        return StrategyResult('PUT', -0.9, ['Cruce bajista EMA9 bajo EMA21 → PUT'])
-    return StrategyResult('NONE', 0.0, ['EMAs paralelas sin cruce'])
+        return StrategyResult('PUT', -1.5, ['Cruce bajista EMA9 bajo EMA21 → PUT'], {'ema_short': float(ema_corto.iloc[-1]), 'ema_long': float(ema_largo.iloc[-1])})
+    return StrategyResult('NONE', 0.0, ['EMAs paralelas sin cruce'], {'ema_short': float(ema_corto.iloc[-1]), 'ema_long': float(ema_largo.iloc[-1])})
 
 
 def strategy_bollinger_rebound(df: pd.DataFrame) -> StrategyResult:
     if len(df) < 22:
-        return StrategyResult('NONE', 0.0, ['Bollinger sin historial suficiente'])
+        return StrategyResult('NONE', 0.0, ['Bollinger sin historial suficiente'], {})
     lower, upper = bollinger_bands(df['close'])
     rsi_series = rsi(df['close'])
     precio = float(df['close'].iloc[-1])
     rsi_actual = float(rsi_series.iloc[-1])
     rsi_prev = float(rsi_series.iloc[-2])
-    if precio <= float(lower.iloc[-1]) * 1.005 and rsi_actual > rsi_prev:
-        return StrategyResult('CALL', 0.8, ['Precio en banda inferior y RSI repunta → CALL'])
-    if precio >= float(upper.iloc[-1]) * 0.995 and rsi_actual < rsi_prev:
-        return StrategyResult('PUT', -0.8, ['Precio en banda superior y RSI cae → PUT'])
-    return StrategyResult('NONE', 0.0, ['Sin rebote claro en Bollinger'])
+    extra = {'rsi': rsi_actual, 'lower': float(lower.iloc[-1]), 'upper': float(upper.iloc[-1])}
+    if precio <= float(lower.iloc[-1]) and rsi_actual > rsi_prev:
+        return StrategyResult('CALL', 1.2, ['Precio en banda inferior y RSI repunta → CALL'], extra)
+    if precio >= float(upper.iloc[-1]) and rsi_actual < rsi_prev:
+        return StrategyResult('PUT', -1.2, ['Precio en banda superior y RSI cae → PUT'], extra)
+    return StrategyResult('NONE', 0.0, ['Sin rebote claro en Bollinger'], extra)
 
 
 def strategy_pullback(df: pd.DataFrame) -> StrategyResult:
     if len(df) < 25:
-        return StrategyResult('NONE', 0.0, ['Pullback sin datos suficientes'])
+        return StrategyResult('NONE', 0.0, ['Pullback sin datos suficientes'], {})
     closes = df['close']
     rsi_series = rsi(closes)
-    tramo = closes.iloc[-4:]
-    rsi_tramo = rsi_series.iloc[-4:]
-    if tramo.iloc[0] > tramo.iloc[1] > tramo.iloc[2] and tramo.iloc[3] > tramo.iloc[2] and rsi_tramo.iloc[-1] > rsi_tramo.iloc[-2]:
-        return StrategyResult('CALL', 0.7, ['Pullback alcista con RSI recuperándose → CALL'])
-    if tramo.iloc[0] < tramo.iloc[1] < tramo.iloc[2] and tramo.iloc[3] < tramo.iloc[2] and rsi_tramo.iloc[-1] < rsi_tramo.iloc[-2]:
-        return StrategyResult('PUT', -0.7, ['Pullback bajista con RSI cayendo → PUT'])
-    return StrategyResult('NONE', 0.0, ['Sin pullback definido'])
+    tramo = closes.iloc[-5:]
+    rsi_tramo = rsi_series.iloc[-5:]
+    extra = {'rsi_trend': float(rsi_tramo.iloc[-1] - rsi_tramo.iloc[-2])}
+    if tramo.iloc[0] > tramo.iloc[1] > tramo.iloc[2] and tramo.iloc[3] >= tramo.iloc[2] and tramo.iloc[4] > tramo.iloc[2] and rsi_tramo.iloc[-1] > rsi_tramo.iloc[-2]:
+        return StrategyResult('CALL', 1.0, ['Pullback alcista con RSI recuperándose → CALL'], extra)
+    if tramo.iloc[0] < tramo.iloc[1] < tramo.iloc[2] and tramo.iloc[3] <= tramo.iloc[2] and tramo.iloc[4] < tramo.iloc[2] and rsi_tramo.iloc[-1] < rsi_tramo.iloc[-2]:
+        return StrategyResult('PUT', -1.0, ['Pullback bajista con RSI cayendo → PUT'], extra)
+    return StrategyResult('NONE', 0.0, ['Sin pullback definido'], extra)
 
 
-def strategy_breakout(df: pd.DataFrame) -> StrategyResult:
-    if len(df) < 25:
-        return StrategyResult('NONE', 0.0, ['Ruptura sin datos suficientes'])
+def strategy_range_breakout(df: pd.DataFrame) -> StrategyResult:
+    if len(df) < 30:
+        return StrategyResult('NONE', 0.0, ['Ruptura sin datos suficientes'], {})
+    ventana_altas = df['high'].iloc[-21:-1]
+    ventana_bajas = df['low'].iloc[-21:-1]
+    if ventana_altas.empty or ventana_bajas.empty:
+        return StrategyResult('NONE', 0.0, ['Rango sin referencias claras'], {})
+    resistencia = float(ventana_altas.max())
+    soporte = float(ventana_bajas.min())
     cierre = float(df['close'].iloc[-1])
-    resistencia = float(df['high'].iloc[-21:-1].max())
-    soporte = float(df['low'].iloc[-21:-1].min())
     rsi_actual = float(rsi(df['close']).iloc[-1])
+    extra = {'resistencia': resistencia, 'soporte': soporte, 'rsi': rsi_actual}
     if cierre > resistencia and rsi_actual > 50:
-        return StrategyResult('CALL', 0.85, ['Cierre rompe resistencia reciente → CALL'])
+        return StrategyResult('CALL', 1.0, ['Cierre rompe resistencia reciente → CALL'], extra)
     if cierre < soporte and rsi_actual < 50:
-        return StrategyResult('PUT', -0.85, ['Cierre perfora soporte reciente → PUT'])
-    return StrategyResult('NONE', 0.0, ['Sin ruptura relevante'])
+        return StrategyResult('PUT', -1.0, ['Cierre perfora soporte reciente → PUT'], extra)
+    return StrategyResult('NONE', 0.0, ['Sin ruptura relevante'], extra)
 
 
 def strategy_divergence(df: pd.DataFrame) -> StrategyResult:
     if len(df) < 12:
-        return StrategyResult('NONE', 0.0, ['Divergencias sin datos suficientes'])
+        return StrategyResult('NONE', 0.0, ['Divergencias sin datos suficientes'], {})
     rsi_series = rsi(df['close'])
     window = min(10, len(df))
     rsi_segment = rsi_series.iloc[-window:]
     price_segment = df['close'].iloc[-window:]
-    rsi_delta = float(rsi_segment.iloc[-1] - rsi_segment.iloc[0])
-    price_delta = float(price_segment.iloc[-1] - price_segment.iloc[0])
+    rsi_delta = float(rsi_segment.iloc[-1] - rsi_segment.iloc[-3]) if window >= 3 else float(rsi_segment.iloc[-1] - rsi_segment.iloc[0])
+    price_delta = float(price_segment.iloc[-1] - price_segment.iloc[-3]) if window >= 3 else float(price_segment.iloc[-1] - price_segment.iloc[0])
+    extra = {'rsi_delta': rsi_delta, 'price_delta': price_delta}
     if price_delta < 0 and rsi_delta > 0:
-        return StrategyResult('CALL', 0.6, ['Divergencia alcista RSI vs precio → CALL'])
+        return StrategyResult('CALL', 1.5, ['Divergencia alcista RSI vs precio → CALL'], {**extra, 'strong_call': True})
     if price_delta > 0 and rsi_delta < 0:
-        return StrategyResult('PUT', -0.6, ['Divergencia bajista RSI vs precio → PUT'])
-    return StrategyResult('NONE', 0.0, ['Sin divergencias claras'])
+        return StrategyResult('PUT', -1.5, ['Divergencia bajista RSI vs precio → PUT'], {**extra, 'strong_put': True})
+    return StrategyResult('NONE', 0.0, ['Sin divergencias claras'], extra)
 
 
 def strategy_volatility_filter(df: pd.DataFrame) -> StrategyResult:
     if len(df) < 25:
-        return StrategyResult('NONE', 0.0, ['Volatilidad sin datos suficientes'])
+        return StrategyResult('NONE', 0.0, ['Volatilidad sin datos suficientes'], {'volatility': None, 'low': False})
     retornos = df['close'].pct_change().dropna()
     if retornos.empty:
-        return StrategyResult('NONE', 0.0, ['Volatilidad no calculable'])
+        return StrategyResult('NONE', 0.0, ['Volatilidad no calculable'], {'volatility': None, 'low': True})
     reciente = retornos.iloc[-20:]
     volatilidad = float(reciente.std())
-    if volatilidad <= 0.002:
-        return StrategyResult('NONE', 0.0, [f"Volatilidad {volatilidad:.4f} insuficiente → sin operación"])
-    return StrategyResult('NONE', 0.0, [f"Volatilidad {volatilidad:.4f} adecuada"])
+    umbral = 0.0007
+    if volatilidad < umbral:
+        return StrategyResult('NONE', 0.0, [f"Volatilidad {volatilidad:.4f} baja → confianza limitada"], {'volatility': volatilidad, 'low': True})
+    return StrategyResult('NONE', 0.0, [f"Volatilidad {volatilidad:.4f} adecuada"], {'volatility': volatilidad, 'low': False})
 
 
 STRATEGY_FUNCTIONS: List[Tuple[str, Callable[[pd.DataFrame], StrategyResult]]] = [
@@ -257,15 +273,27 @@ STRATEGY_FUNCTIONS: List[Tuple[str, Callable[[pd.DataFrame], StrategyResult]]] =
     ('EMA Trend', strategy_ema_trend),
     ('Bollinger Rebound', strategy_bollinger_rebound),
     ('Pullback', strategy_pullback),
-    ('Breakout', strategy_breakout),
+    ('Range Breakout', strategy_range_breakout),
 ]
+
+STRATEGY_WEIGHTS: Dict[str, float] = {
+    'RSI': 2.0,
+    'EMA Trend': 1.5,
+    'Bollinger Rebound': 1.2,
+    'Pullback': 1.0,
+    'Range Breakout': 1.0,
+    'Divergence': 1.5,
+    'Volatility Filter': 0.5,
+}
+
+TOTAL_STRATEGY_COUNT = len(STRATEGY_WEIGHTS)
 
 STRATEGY_DISPLAY_NAMES: Dict[str, str] = {
     'RSI': 'RSI',
     'EMA Trend': 'Tendencia EMA',
     'Bollinger Rebound': 'Rebote Bollinger',
     'Pullback': 'Pullback',
-    'Breakout': 'Ruptura de rango',
+    'Range Breakout': 'Ruptura de rango',
     'Divergence': 'Divergencia',
     'Volatility Filter': 'Filtro de volatilidad',
 }
@@ -274,37 +302,117 @@ STRATEGY_DISPLAY_NAMES: Dict[str, str] = {
 # ===============================================================
 # SIGNAL COMBINER
 # ===============================================================
-def combine_signals(results: List[Tuple[str, StrategyResult]], total_active: int) -> Tuple[str, float, List[str], Dict[str, str], Dict[str, int], bool]:
+def _clasificar_confianza(valor: float) -> str:
+    if valor >= 0.75:
+        return 'Alta'
+    if valor >= 0.45:
+        return 'Media'
+    return 'Baja'
+
+
+def combine_signals(results: List[Tuple[str, StrategyResult]], active_states: Dict[str, bool]) -> Dict[str, Any]:
     reasons: List[str] = []
     agreements: Dict[str, str] = {}
-    votes = {'CALL': 0, 'PUT': 0}
-    bloqueo_volatilidad = False
+    pesos_direccion = {'CALL': 0.0, 'PUT': 0.0}
+    conteo_direccion = {'CALL': 0, 'PUT': 0}
+    total_peso = 0.0
+    override_signal: Optional[str] = None
+    override_reason = ''
+    low_volatility = False
+    volatility_value: Optional[float] = None
+    active_count = 0
     for name, res in results:
+        if not active_states.get(name, True):
+            continue
+        weight = STRATEGY_WEIGHTS.get(name, 1.0)
+        total_peso += weight
+        active_count += 1
         agreements[name] = res.signal
         reasons.extend(res.reasons)
         if name == 'Volatility Filter':
-            for motivo in res.reasons:
-                if 'insuficiente' in motivo.lower():
-                    bloqueo_volatilidad = True
+            volatility_value = res.extra.get('volatility')
+            if res.extra.get('low'):
+                low_volatility = True
+        if name == 'RSI':
+            rsi_val = res.extra.get('rsi')
+            if res.extra.get('strong_call'):
+                override_signal = 'CALL'
+                override_reason = f"RSI extremo {rsi_val:.2f}" if rsi_val is not None else 'RSI extremo'
+            elif res.extra.get('strong_put'):
+                override_signal = 'PUT'
+                override_reason = f"RSI extremo {rsi_val:.2f}" if rsi_val is not None else 'RSI extremo'
+        if name == 'Divergence' and res.signal in {'CALL', 'PUT'}:
+            override_signal = res.signal
+            override_reason = 'Divergencia confirmada'
         if res.signal in {'CALL', 'PUT'}:
-            votes[res.signal] += 1
-    if bloqueo_volatilidad:
-        reasons.append('Operación bloqueada por volatilidad insuficiente')
-        return 'NONE', 0.0, reasons, agreements, votes, True
-    if total_active == 0:
-        return 'NONE', 0.0, reasons, agreements, votes, False
-    umbral = max(1, total_active // 2 + 1)
-    direccion = 'NONE'
-    if votes['CALL'] > votes['PUT'] and votes['CALL'] >= umbral:
-        direccion = 'CALL'
-    elif votes['PUT'] > votes['CALL'] and votes['PUT'] >= umbral:
-        direccion = 'PUT'
-    confianza = 0.0
-    if direccion != 'NONE':
-        ratio = votes[direccion] / total_active
-        confianza = min(0.98, 0.4 + 0.4 * ratio)
-        reasons.append(f"Consenso de {votes[direccion]}/{total_active} estrategias a favor de {direccion}")
-    return direccion, confianza, reasons, agreements, votes, False
+            pesos_direccion[res.signal] += weight
+            conteo_direccion[res.signal] += 1
+    if total_peso == 0:
+        return {
+            'signal': 'NONE',
+            'confidence': 0.0,
+            'reasons': reasons,
+            'agreements': agreements,
+            'counts': conteo_direccion,
+            'weights': pesos_direccion,
+            'active': active_count,
+            'aligned': 0,
+            'confidence_label': 'Baja',
+            'low_volatility': low_volatility,
+            'volatility_value': volatility_value,
+            'override': False,
+            'override_reason': override_reason,
+            'main_reason': 'Ninguna estrategia clara',
+            'dominant': 'NONE',
+        }
+    dominante = 'CALL' if pesos_direccion['CALL'] >= pesos_direccion['PUT'] else 'PUT'
+    confianza = pesos_direccion[dominante] / total_peso if pesos_direccion[dominante] > 0 else 0.0
+    signal = 'NONE'
+    aligned = conteo_direccion[dominante]
+    if pesos_direccion[dominante] > 0 and confianza >= 0.45:
+        signal = dominante
+    elif override_signal:
+        signal = override_signal
+        confianza = max(confianza, 0.45)
+        aligned = conteo_direccion.get(override_signal, 0)
+    if signal == 'NONE' and override_signal:
+        signal = override_signal
+        confianza = max(confianza, 0.45)
+        aligned = conteo_direccion.get(override_signal, 0)
+    if low_volatility and signal != 'NONE':
+        confianza *= 0.85
+        reasons.append('Volatilidad baja → se reduce la confianza')
+    confianza = min(confianza, 0.98)
+    if signal != 'NONE':
+        confianza = max(confianza, 0.35)
+    confianza_label = _clasificar_confianza(confianza)
+    if signal == 'NONE':
+        confianza_label = 'Baja'
+    motivos_alineados = [
+        razon
+        for nombre, res in results
+        for razon in res.reasons
+        if res.signal == signal and signal != 'NONE'
+    ]
+    main_reason = override_reason or (motivos_alineados[0] if motivos_alineados else (reasons[0] if reasons else 'Señal compuesta'))
+    return {
+        'signal': signal,
+        'confidence': confianza,
+        'reasons': reasons,
+        'agreements': agreements,
+        'counts': conteo_direccion,
+        'weights': pesos_direccion,
+        'active': active_count,
+        'aligned': aligned,
+        'confidence_label': confianza_label,
+        'low_volatility': low_volatility,
+        'volatility_value': volatility_value,
+        'override': override_signal is not None,
+        'override_reason': override_reason,
+        'main_reason': main_reason,
+        'dominant': dominante,
+        'total_weight': total_peso,
+    }
 
 
 # ===============================================================
@@ -778,12 +886,12 @@ class TradingEngine:
             except Exception as exc:
                 logging.debug(f"Error en escucha de estado: {exc}")
 
-    def _evaluate_strategies(self, df: pd.DataFrame) -> Tuple[str, float, List[str], List[Tuple[str, StrategyResult]], Dict[str, str], Dict[str, int], int, bool]:
+    def _evaluate_strategies(self, df: pd.DataFrame) -> Tuple[List[Tuple[str, StrategyResult]], Dict[str, Any]]:
         with self._strategy_lock:
             active_entries = [(name, func) for name, func in STRATEGY_FUNCTIONS if self.strategy_states.get(name, True)]
             divergence_enabled = self.strategy_states.get('Divergence', True)
             volatility_enabled = self.strategy_states.get('Volatility Filter', True)
-            total_active = len(active_entries) + int(divergence_enabled) + int(volatility_enabled)
+            active_states = dict(self.strategy_states)
         results: List[Tuple[str, StrategyResult]] = []
         for name, func in active_entries:
             results.append((name, func(df)))
@@ -791,8 +899,8 @@ class TradingEngine:
             results.append(('Divergence', strategy_divergence(df)))
         if volatility_enabled:
             results.append(('Volatility Filter', strategy_volatility_filter(df)))
-        signal, confidence, reasons, agreements, votes, bloqueo_vol = combine_signals(results, total_active)
-        return signal, confidence, reasons, results, agreements, votes, total_active, bloqueo_vol
+        consensus = combine_signals(results, active_states)
+        return results, consensus
 
     def _simulate_result(self) -> Tuple[str, float]:
         outcome = np.random.rand() > 0.5
@@ -802,26 +910,37 @@ class TradingEngine:
     def execute_cycle(self, symbol: str) -> None:
         candles = self.api.fetch_candles(symbol)
         df = to_dataframe(candles)
-        signal, confidence, reasons, results, agreements, votes, total_active, bloqueo_vol = self._evaluate_strategies(df)
+        results, consensus = self._evaluate_strategies(df)
+        signal = consensus['signal']
+        confidence = consensus['confidence']
+        reasons = consensus['reasons']
         for nombre, resultado in results:
             etiqueta = STRATEGY_DISPLAY_NAMES.get(nombre, nombre)
             mensaje = resultado.reasons[0] if resultado.reasons else 'Sin comentario'
             logging.info(f'[{symbol}] {etiqueta}: {mensaje} (señal {resultado.signal})')
-        if bloqueo_vol:
-            logging.info('⚠️ Operación omitida por volatilidad insuficiente')
+        active_total = consensus['active']
+        if active_total == 0:
+            logging.info('⚠️ Sin estrategias activas configuradas')
             return
-        if total_active > 0:
-            if signal in {'CALL', 'PUT'}:
-                logging.info(f'✅ {votes[signal]}/{total_active} estrategias respaldan {signal}')
-            elif votes['CALL'] == votes['PUT'] and votes['CALL'] > 0:
-                logging.info(f"⚖️ Empate entre estrategias ({votes['CALL']}/{total_active})")
-            elif max(votes.values()) > 0:
-                direccion = 'CALL' if votes['CALL'] > votes['PUT'] else 'PUT'
-                logging.info(f"⚠️ Solo {votes[direccion]}/{total_active} estrategias apoyan {direccion}")
-            else:
-                logging.info(f'⚠️ Ninguna de las {total_active} estrategias activas generó señal')
         if signal == 'NONE':
+            logging.info('Ninguna estrategia clara')
             return
+        logging.info(
+            f"📊 Confianza {consensus['confidence_label'].lower()} ({confidence:.2f}) → {consensus['main_reason']}"
+        )
+        logging.info(
+            f"Estrategias alineadas: {consensus['aligned']}/{active_total}"
+        )
+        logging.info(
+            f"Estrategias activas: {active_total}/{TOTAL_STRATEGY_COUNT}"
+        )
+        if consensus['low_volatility']:
+            if consensus['override']:
+                logging.info('🚫 Volatilidad baja pero señal fuerte RSI → operación anticipada')
+            else:
+                valor_vol = consensus['volatility_value']
+                detalle = f" ({valor_vol:.4f})" if valor_vol is not None else ''
+                logging.info(f"⚠️ Confianza ajustada por volatilidad baja{detalle}")
         features = build_feature_vector(df, reasons, results)
         ai_prob = None
         if AI_ENABLED:
@@ -852,6 +971,18 @@ class TradingEngine:
         result, pnl = self._simulate_result()
         self.risk.register_trade(pnl)
         self.ai.log_trade(features, 1 if result == 'WIN' else 0)
+        record_metadata = {
+            'confidence_label': consensus['confidence_label'],
+            'confidence_value': confidence,
+            'aligned': consensus['aligned'],
+            'active': consensus['active'],
+            'direction': signal,
+            'main_reason': consensus['main_reason'],
+            'low_volatility': consensus['low_volatility'],
+            'volatility_value': consensus['volatility_value'],
+            'override': consensus['override'],
+            'override_reason': consensus['override_reason'],
+        }
         record = TradeRecord(
             timestamp=datetime.now(timezone.utc),
             symbol=symbol,
@@ -860,6 +991,7 @@ class TradingEngine:
             result=result,
             pnl=pnl,
             reasons=reasons + ai_notes,
+            metadata=record_metadata,
         )
         log_trade(record)
         if result == 'WIN':
@@ -996,6 +1128,7 @@ class BotWindow(QtWidgets.QWidget):
             "accuracy": 0.0,
         }
         self.strategy_checkboxes: Dict[str, QtWidgets.QCheckBox] = {}
+        self.asset_summary_labels: Dict[str, Dict[str, QtWidgets.QLabel]] = {}
 
         self._build_ui()
 
@@ -1052,6 +1185,31 @@ class BotWindow(QtWidgets.QWidget):
             self.stats_values[title] = value_label
         vbox.addWidget(stats_group)
 
+        resumen_group = QtWidgets.QGroupBox("Resumen por activo")
+        resumen_layout = QtWidgets.QHBoxLayout(resumen_group)
+        for symbol in SYMBOLS:
+            caja = QtWidgets.QGroupBox(symbol)
+            caja_layout = QtWidgets.QVBoxLayout(caja)
+            conf_label = QtWidgets.QLabel("Confianza: -")
+            activos_label = QtWidgets.QLabel("Estrategias activas: 0/7")
+            alineadas_label = QtWidgets.QLabel("Estrategias alineadas: 0/0")
+            direccion_label = QtWidgets.QLabel("Dirección dominante: -")
+            motivo_label = QtWidgets.QLabel("Motivo principal: -")
+            motivo_label.setWordWrap(True)
+            for lbl in [conf_label, activos_label, alineadas_label, direccion_label, motivo_label]:
+                caja_layout.addWidget(lbl)
+            caja_layout.addStretch(1)
+            self.asset_summary_labels[symbol] = {
+                'confidence': conf_label,
+                'active': activos_label,
+                'aligned': alineadas_label,
+                'direction': direccion_label,
+                'reason': motivo_label,
+            }
+            resumen_layout.addWidget(caja)
+        resumen_layout.addStretch(1)
+        vbox.addWidget(resumen_group)
+
         self.trade_table = QtWidgets.QTableWidget(0, 7)
         self.trade_table.setHorizontalHeaderLabels([
             "Hora",
@@ -1081,7 +1239,7 @@ class BotWindow(QtWidgets.QWidget):
             'EMA Trend': 'Cruce de EMA → confirmar dirección de corto contra largo plazo',
             'Bollinger Rebound': 'Rebote Bollinger → aprovechar extremos con impulso del RSI',
             'Pullback': 'Pullback → retroceso controlado con recuperación del RSI',
-            'Breakout': 'Ruptura → validar cierres sobre resistencia o bajo soporte',
+            'Range Breakout': 'Ruptura de rango → validar cierres sobre resistencia o bajo soporte',
             'Divergence': 'Divergencia → alerta cuando el RSI contradice al precio',
             'Volatility Filter': 'Volatilidad → exigir movimiento mínimo para operar',
         }
@@ -1090,7 +1248,7 @@ class BotWindow(QtWidgets.QWidget):
             'EMA Trend': 'Tendencia EMA',
             'Bollinger Rebound': 'Rebote Bollinger',
             'Pullback': 'Pullback',
-            'Breakout': 'Ruptura',
+            'Range Breakout': 'Ruptura',
             'Divergence': 'Divergencia',
             'Volatility Filter': 'Filtro de volatilidad',
         }
@@ -1164,6 +1322,7 @@ class BotWindow(QtWidgets.QWidget):
         if self.trade_table.rowCount() > 250:
             self.trade_table.removeRow(self.trade_table.rowCount() - 1)
         self._update_stats_labels(stats)
+        self._update_asset_summary(record)
 
     def _on_status(self, status: str) -> None:
         mapping = {
@@ -1197,6 +1356,23 @@ class BotWindow(QtWidgets.QWidget):
         self.stats_values["Ganancia diaria"].setText(f"${stats.get('daily_pnl', 0.0):.2f}")
         self.stats_values["Precisión"].setText(f"{stats.get('accuracy', 0.0):.1f}%")
 
+    def _update_asset_summary(self, record: TradeRecord) -> None:
+        etiquetas = self.asset_summary_labels.get(record.symbol)
+        if not etiquetas:
+            return
+        confianza_label = record.metadata.get('confidence_label', 'Baja')
+        confianza_valor = record.confidence
+        etiquetas['confidence'].setText(f"Confianza: {confianza_label} ({confianza_valor:.2f})")
+        activos = int(record.metadata.get('active', 0))
+        etiquetas['active'].setText(f"Estrategias activas: {activos}/{TOTAL_STRATEGY_COUNT}")
+        alineadas = int(record.metadata.get('aligned', 0))
+        divisor = activos if activos else TOTAL_STRATEGY_COUNT
+        etiquetas['aligned'].setText(f"Estrategias alineadas: {alineadas}/{divisor}")
+        direccion = record.metadata.get('direction', record.decision)
+        etiquetas['direction'].setText(f"Dirección dominante: {direccion}")
+        motivo = record.metadata.get('main_reason', 'Motivo no disponible')
+        etiquetas['reason'].setText(f"Motivo principal: {motivo}")
+
     def _refresh_phase(self) -> None:
         raw_phase = self.engine.ai._phase()
         phase_map = {
@@ -1227,6 +1403,7 @@ class BotWindow(QtWidgets.QWidget):
                     alias = {
                         'RSI+EMA': 'RSI',
                         'Trend Filter': 'EMA Trend',
+                        'Breakout': 'Range Breakout',
                     }
                     for nombre, valor in raw.items():
                         clave = alias.get(nombre, nombre)
