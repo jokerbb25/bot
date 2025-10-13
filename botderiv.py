@@ -879,6 +879,7 @@ class TradingEngine:
         self.trade_in_progress = False
         self.active_trade_symbol: Optional[str] = None
         self.waiting_logged = False
+        self.waiting_last_log = 0.0
 
     def add_trade_listener(self, callback: Callable[[TradeRecord, Dict[str, float]], None]) -> None:
         self._trade_listeners.append(callback)
@@ -990,9 +991,11 @@ class TradingEngine:
         while reprocess and self.running.is_set():
             reprocess = False
             if self.trade_in_progress:
-                if not self.waiting_logged:
+                now = time.time()
+                if self.waiting_last_log == 0.0 or now - self.waiting_last_log >= 3.0:
                     logging.info("⏳ Esperando que finalice la operación activa...")
-                    self.waiting_logged = True
+                    self.waiting_last_log = now
+                self.waiting_logged = True
                 self._notify_trade_state("waiting")
                 return
             candles = self.api.fetch_candles(symbol)
@@ -1088,10 +1091,16 @@ class TradingEngine:
             self.trade_in_progress = True
             self.active_trade_symbol = symbol
             self.waiting_logged = False
+            self.waiting_last_log = 0.0
             self._notify_trade_state("active")
             try:
                 contract_id, price = self.api.buy(symbol, signal, self.trade_amount)
                 if contract_id is None:
+                    self.trade_in_progress = False
+                    self.active_trade_symbol = None
+                    self.waiting_logged = False
+                    self.waiting_last_log = 0.0
+                    self._notify_trade_state("ready")
                     reprocess = True
                     continue
                 result, pnl = self._simulate_result()
@@ -1138,6 +1147,12 @@ class TradingEngine:
                 if ai_notes:
                     logging.info(f"📊 Aviso IA → {'; '.join(ai_notes)}")
                 self._notify_trade(record)
+                self.trade_in_progress = False
+                self.active_trade_symbol = None
+                self.waiting_logged = False
+                self.waiting_last_log = 0.0
+                self._notify_trade_state("ready")
+                logging.info("✅ Operación finalizada, retomando análisis del mercado...")
                 if (
                     self.auto_shutdown_enabled
                     and not self.auto_shutdown_triggered
@@ -1153,6 +1168,7 @@ class TradingEngine:
                     self.trade_in_progress = False
                     self.active_trade_symbol = None
                     self.waiting_logged = False
+                    self.waiting_last_log = 0.0
                     self._notify_trade_state("ready")
 
     def run(self) -> None:
@@ -1161,6 +1177,7 @@ class TradingEngine:
         self.api.connect()
         self._notify_status("running")
         self.waiting_logged = False
+        self.waiting_last_log = 0.0
         self._notify_trade_state("ready")
         try:
             while self.running.is_set():
