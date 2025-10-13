@@ -59,6 +59,10 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(mes
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 warnings.filterwarnings("ignore", category=RuntimeWarning, message="overflow encountered in exp")
 
+operation_active = False
+trade_start_time: Optional[datetime] = None
+last_waiting_log: Optional[datetime] = None
+
 
 # ===============================================================
 # DATA STRUCTURES
@@ -876,10 +880,7 @@ class TradingEngine:
         self.auto_shutdown_enabled = False
         self.auto_shutdown_limit = 0
         self.auto_shutdown_triggered = False
-        self.trade_in_progress = False
         self.active_trade_symbol: Optional[str] = None
-        self.waiting_logged = False
-        self.waiting_last_log = 0.0
 
     def add_trade_listener(self, callback: Callable[[TradeRecord, Dict[str, float]], None]) -> None:
         self._trade_listeners.append(callback)
@@ -987,17 +988,24 @@ class TradingEngine:
         self.stop()
 
     def execute_cycle(self, symbol: str) -> None:
+        global operation_active, trade_start_time, last_waiting_log
         reprocess = True
         while reprocess and self.running.is_set():
             reprocess = False
-            if self.trade_in_progress:
-                now = time.time()
-                if self.waiting_last_log == 0.0 or now - self.waiting_last_log >= 3.0:
-                    logging.info("⏳ Esperando que finalice la operación activa...")
-                    self.waiting_last_log = now
-                self.waiting_logged = True
-                self._notify_trade_state("waiting")
-                return
+            now = datetime.now(timezone.utc)
+            if operation_active:
+                if trade_start_time is not None and (now - trade_start_time).total_seconds() >= 180:
+                    operation_active = False
+                    trade_start_time = None
+                    last_waiting_log = None
+                    logging.warning("⚠️ Tiempo de espera agotado — restableciendo estado de operación y reanudando análisis del mercado.")
+                    self._notify_trade_state("ready")
+                else:
+                    if last_waiting_log is None or (now - last_waiting_log).total_seconds() >= 2:
+                        logging.info("⏳ Esperando que finalice la operación activa...")
+                        last_waiting_log = now
+                    self._notify_trade_state("waiting")
+                    return
             candles = self.api.fetch_candles(symbol)
             df = to_dataframe(candles)
             results, consensus = self._evaluate_strategies(df)
@@ -1013,42 +1021,27 @@ class TradingEngine:
             signals_total = consensus['signals']
             if active_total == 0:
                 logging.info('⚠️ Sin estrategias activas configuradas')
-                self.waiting_logged = False
                 self._notify_trade_state("ready")
                 return
             if signals_total == 0:
                 logging.info('⚠️ Ninguna de las estrategias activas generó señal')
                 logging.info(f"Estrategias activas: {active_total}/{TOTAL_STRATEGY_COUNT}")
-                self.waiting_logged = False
                 self._notify_trade_state("ready")
                 return
-            logging.info(
-                f"Estrategias con señal: {signals_total}/{active_total}"
-            )
+            logging.info(f"Estrategias con señal: {signals_total}/{active_total}")
             etiqueta_conf = consensus['confidence_label'].lower()
             if signal == 'NONE':
-                logging.info(
-                    f"⚠️ Confianza {etiqueta_conf} ({confidence:.2f}) → {consensus['main_reason']}"
-                )
-                logging.info(
-                    f"Estrategias activas: {active_total}/{TOTAL_STRATEGY_COUNT}"
-                )
+                logging.info(f"⚠️ Confianza {etiqueta_conf} ({confidence:.2f}) → {consensus['main_reason']}")
+                logging.info(f"Estrategias activas: {active_total}/{TOTAL_STRATEGY_COUNT}")
                 if consensus['low_volatility']:
                     valor_vol = consensus['volatility_value']
                     detalle = f" ({valor_vol:.4f})" if valor_vol is not None else ''
                     logging.info(f"⚠️ Volatilidad baja detectada{detalle}")
-                self.waiting_logged = False
                 self._notify_trade_state("ready")
                 return
-            logging.info(
-                f"📊 Confianza {etiqueta_conf} ({confidence:.2f}) → {consensus['main_reason']}"
-            )
-            logging.info(
-                f"Estrategias alineadas: {consensus['aligned']}/{signals_total}"
-            )
-            logging.info(
-                f"Estrategias activas: {active_total}/{TOTAL_STRATEGY_COUNT}"
-            )
+            logging.info(f"📊 Confianza {etiqueta_conf} ({confidence:.2f}) → {consensus['main_reason']}")
+            logging.info(f"Estrategias alineadas: {consensus['aligned']}/{signals_total}")
+            logging.info(f"Estrategias activas: {active_total}/{TOTAL_STRATEGY_COUNT}")
             if consensus['low_volatility']:
                 valor_vol = consensus['volatility_value']
                 detalle = f" ({valor_vol:.4f})" if valor_vol is not None else ''
@@ -1059,9 +1052,7 @@ class TradingEngine:
                         logging.info(f"🚫 Volatilidad baja pero {consensus['override_reason'].lower()} → operación anticipada")
                 else:
                     logging.info(f"⚠️ Volatilidad baja detectada{detalle}")
-            logging.info(
-                f"✅ Señal final: {signal} | Confianza {confidence:.2f} | Estrategias activas: {active_total}/{TOTAL_STRATEGY_COUNT}"
-            )
+            logging.info(f"✅ Señal final: {signal} | Confianza {confidence:.2f} | Estrategias activas: {active_total}/{TOTAL_STRATEGY_COUNT}")
             features = build_feature_vector(df, reasons, results)
             ai_prob = None
             if AI_ENABLED:
@@ -1085,99 +1076,88 @@ class TradingEngine:
                 ai_confidence = fused
                 ai_notes.append(f'Núcleo adaptativo {internal_prob:.2f}')
             if not self.risk.can_trade(ai_confidence):
-                self.waiting_logged = False
                 self._notify_trade_state("ready")
                 return
-            self.trade_in_progress = True
+            if operation_active:
+                return
+            contract_id, price = self.api.buy(symbol, signal, self.trade_amount)
+            if contract_id is None:
+                return
+            operation_active = True
+            trade_start_time = datetime.now(timezone.utc)
+            last_waiting_log = trade_start_time
+            logging.info("⏳ Esperando que finalice la operación activa...")
             self.active_trade_symbol = symbol
-            self.waiting_logged = False
-            self.waiting_last_log = 0.0
             self._notify_trade_state("active")
-            try:
-                contract_id, price = self.api.buy(symbol, signal, self.trade_amount)
-                if contract_id is None:
-                    self.trade_in_progress = False
-                    self.active_trade_symbol = None
-                    self.waiting_logged = False
-                    self.waiting_last_log = 0.0
-                    self._notify_trade_state("ready")
-                    reprocess = True
-                    continue
-                result, pnl = self._simulate_result()
-                self.risk.register_trade(pnl)
-                self.ai.log_trade(features, 1 if result == 'WIN' else 0)
-                record_metadata = {
-                    'confidence_label': consensus['confidence_label'],
-                    'confidence_value': confidence,
-                    'aligned': consensus['aligned'],
-                    'active': consensus['active'],
-                    'signals': consensus['signals'],
-                    'direction': signal,
-                    'main_reason': consensus['main_reason'],
-                    'low_volatility': consensus['low_volatility'],
-                    'volatility_value': consensus['volatility_value'],
-                    'override': consensus['override'],
-                    'override_reason': consensus['override_reason'],
-                    'dominant': consensus['dominant'],
-                    'total_weight': consensus['total_weight'],
-                    'active_weight': consensus.get('active_weight', 0.0),
-                }
-                record = TradeRecord(
-                    timestamp=datetime.now(timezone.utc),
-                    symbol=symbol,
-                    decision=signal,
-                    confidence=ai_confidence,
-                    result=result,
-                    pnl=pnl,
-                    reasons=reasons + ai_notes,
-                    metadata=record_metadata,
-                )
-                log_trade(record)
-                if result == 'WIN':
-                    self.win_count += 1
-                else:
-                    self.loss_count += 1
-                with self.lock:
-                    self.trade_history.append(record)
-                ema_diff = df['close'].iloc[-1] - df['close'].iloc[-2]
-                latest_rsi = rsi(df['close']).iloc[-1]
-                logging.info(
-                    f"{record.timestamp:%Y-%m-%d %H:%M:%S} INFO: [{symbol}] {signal} @{ai_confidence:.2f} | EMA:{ema_diff:.2f} RSI:{latest_rsi:.2f} | Motivos: {'; '.join(reasons)}"
-                )
-                if ai_notes:
-                    logging.info(f"📊 Aviso IA → {'; '.join(ai_notes)}")
-                self._notify_trade(record)
-                self.trade_in_progress = False
-                self.active_trade_symbol = None
-                self.waiting_logged = False
-                self.waiting_last_log = 0.0
-                self._notify_trade_state("ready")
-                logging.info("✅ Operación finalizada, retomando análisis del mercado...")
-                if (
-                    self.auto_shutdown_enabled
-                    and not self.auto_shutdown_triggered
-                    and result == 'LOSS'
-                    and self.auto_shutdown_limit > 0
-                    and self.risk.consecutive_losses >= self.auto_shutdown_limit
-                ):
-                    self._handle_auto_shutdown()
-                    return
-                reprocess = True
-            finally:
-                if self.trade_in_progress:
-                    self.trade_in_progress = False
-                    self.active_trade_symbol = None
-                    self.waiting_logged = False
-                    self.waiting_last_log = 0.0
-                    self._notify_trade_state("ready")
+            result, pnl = self._simulate_result()
+            self.risk.register_trade(pnl)
+            self.ai.log_trade(features, 1 if result == 'WIN' else 0)
+            record_metadata = {
+                'confidence_label': consensus['confidence_label'],
+                'confidence_value': confidence,
+                'aligned': consensus['aligned'],
+                'active': consensus['active'],
+                'signals': consensus['signals'],
+                'direction': signal,
+                'main_reason': consensus['main_reason'],
+                'low_volatility': consensus['low_volatility'],
+                'volatility_value': consensus['volatility_value'],
+                'override': consensus['override'],
+                'override_reason': consensus['override_reason'],
+                'dominant': consensus['dominant'],
+                'total_weight': consensus['total_weight'],
+                'active_weight': consensus.get('active_weight', 0.0),
+            }
+            record = TradeRecord(
+                timestamp=datetime.now(timezone.utc),
+                symbol=symbol,
+                decision=signal,
+                confidence=ai_confidence,
+                result=result,
+                pnl=pnl,
+                reasons=reasons + ai_notes,
+                metadata=record_metadata,
+            )
+            log_trade(record)
+            if result == 'WIN':
+                self.win_count += 1
+            else:
+                self.loss_count += 1
+            with self.lock:
+                self.trade_history.append(record)
+            ema_diff = df['close'].iloc[-1] - df['close'].iloc[-2]
+            latest_rsi = rsi(df['close']).iloc[-1]
+            logging.info(
+                f"{record.timestamp:%Y-%m-%d %H:%M:%S} INFO: [{symbol}] {signal} @{ai_confidence:.2f} | EMA:{ema_diff:.2f} RSI:{latest_rsi:.2f} | Motivos: {'; '.join(reasons)}"
+            )
+            if ai_notes:
+                logging.info(f"📊 Aviso IA → {'; '.join(ai_notes)}")
+            self._notify_trade(record)
+            operation_active = False
+            trade_start_time = None
+            last_waiting_log = None
+            logging.info("✅ Operación finalizada, retomando análisis del mercado...")
+            self._notify_trade_state("ready")
+            if (
+                self.auto_shutdown_enabled
+                and not self.auto_shutdown_triggered
+                and result == 'LOSS'
+                and self.auto_shutdown_limit > 0
+                and self.risk.consecutive_losses >= self.auto_shutdown_limit
+            ):
+                self._handle_auto_shutdown()
+                return
+            reprocess = True
 
     def run(self) -> None:
+        global operation_active, trade_start_time, last_waiting_log
         self.running.set()
         self._notify_status("connecting")
         self.api.connect()
         self._notify_status("running")
-        self.waiting_logged = False
-        self.waiting_last_log = 0.0
+        operation_active = False
+        trade_start_time = None
+        last_waiting_log = None
         self._notify_trade_state("ready")
         try:
             while self.running.is_set():
@@ -1195,10 +1175,12 @@ class TradingEngine:
             self._notify_status("stopped")
 
     def stop(self) -> None:
+        global operation_active, trade_start_time, last_waiting_log
         self.running.clear()
-        self.trade_in_progress = False
+        operation_active = False
+        trade_start_time = None
+        last_waiting_log = None
         self.active_trade_symbol = None
-        self.waiting_logged = False
         self._notify_trade_state("ready")
         try:
             if self.api.socket is not None:
