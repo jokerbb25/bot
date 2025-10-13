@@ -62,6 +62,9 @@ warnings.filterwarnings("ignore", category=RuntimeWarning, message="overflow enc
 operation_active = False
 trade_start_time: Optional[datetime] = None
 last_waiting_log: Optional[datetime] = None
+WAITING_MESSAGE = "⏳ Esperando que finalice la operación activa..."
+RESUME_MESSAGE = "✅ Operación finalizada, retomando análisis del mercado..."
+TIMEOUT_MESSAGE = "⚠️ Tiempo de espera agotado — restableciendo estado de operación y reanudando análisis del mercado."
 
 
 # ===============================================================
@@ -987,25 +990,27 @@ class TradingEngine:
         self._notify_status("auto_shutdown")
         self.stop()
 
+
     def execute_cycle(self, symbol: str) -> None:
         global operation_active, trade_start_time, last_waiting_log
+        if operation_active:
+            now = datetime.now(timezone.utc)
+            if trade_start_time is not None and (now - trade_start_time).total_seconds() >= 180:
+                operation_active = False
+                trade_start_time = None
+                last_waiting_log = None
+                logging.warning(TIMEOUT_MESSAGE)
+                self._notify_trade_state("ready")
+            else:
+                if last_waiting_log is None or (now - last_waiting_log).total_seconds() >= 2:
+                    logging.info(WAITING_MESSAGE)
+                    last_waiting_log = now
+                self._notify_trade_state("waiting")
+                time.sleep(2)
+            return
         reprocess = True
         while reprocess and self.running.is_set():
             reprocess = False
-            now = datetime.now(timezone.utc)
-            if operation_active:
-                if trade_start_time is not None and (now - trade_start_time).total_seconds() >= 180:
-                    operation_active = False
-                    trade_start_time = None
-                    last_waiting_log = None
-                    logging.warning("⚠️ Tiempo de espera agotado — restableciendo estado de operación y reanudando análisis del mercado.")
-                    self._notify_trade_state("ready")
-                else:
-                    if last_waiting_log is None or (now - last_waiting_log).total_seconds() >= 2:
-                        logging.info("⏳ Esperando que finalice la operación activa...")
-                        last_waiting_log = now
-                    self._notify_trade_state("waiting")
-                    return
             candles = self.api.fetch_candles(symbol)
             df = to_dataframe(candles)
             results, consensus = self._evaluate_strategies(df)
@@ -1082,19 +1087,54 @@ class TradingEngine:
                 return
             contract_id, price = self.api.buy(symbol, signal, self.trade_amount)
             if contract_id is None:
+                logging.warning('No se pudo abrir la operación, se reanuda el análisis.')
+                self._notify_trade_state("ready")
                 return
             operation_active = True
             trade_start_time = datetime.now(timezone.utc)
             last_waiting_log = trade_start_time
-            logging.info("⏳ Esperando que finalice la operación activa...")
+            logging.info(WAITING_MESSAGE)
             self.active_trade_symbol = symbol
-            self._notify_trade_state("active")
+            self._notify_trade_state('active')
+            ema_diff = df['close'].iloc[-1] - df['close'].iloc[-2]
+            latest_rsi = float(rsi(df['close']).iloc[-1])
+            threading.Thread(
+                target=self._finalize_trade,
+                args=(
+                    symbol,
+                    signal,
+                    ai_confidence,
+                    list(reasons),
+                    list(ai_notes),
+                    dict(consensus),
+                    features.copy(),
+                    ema_diff,
+                    latest_rsi,
+                ),
+                daemon=True,
+            ).start()
+            return
+
+    def _finalize_trade(
+        self,
+        symbol: str,
+        signal: str,
+        ai_confidence: float,
+        reasons: List[str],
+        ai_notes: List[str],
+        consensus: Dict[str, Any],
+        features: np.ndarray,
+        ema_diff: float,
+        latest_rsi: float,
+    ) -> None:
+        global operation_active, trade_start_time, last_waiting_log
+        try:
             result, pnl = self._simulate_result()
             self.risk.register_trade(pnl)
             self.ai.log_trade(features, 1 if result == 'WIN' else 0)
             record_metadata = {
                 'confidence_label': consensus['confidence_label'],
-                'confidence_value': confidence,
+                'confidence_value': consensus['confidence'],
                 'aligned': consensus['aligned'],
                 'active': consensus['active'],
                 'signals': consensus['signals'],
@@ -1125,19 +1165,12 @@ class TradingEngine:
                 self.loss_count += 1
             with self.lock:
                 self.trade_history.append(record)
-            ema_diff = df['close'].iloc[-1] - df['close'].iloc[-2]
-            latest_rsi = rsi(df['close']).iloc[-1]
             logging.info(
                 f"{record.timestamp:%Y-%m-%d %H:%M:%S} INFO: [{symbol}] {signal} @{ai_confidence:.2f} | EMA:{ema_diff:.2f} RSI:{latest_rsi:.2f} | Motivos: {'; '.join(reasons)}"
             )
             if ai_notes:
                 logging.info(f"📊 Aviso IA → {'; '.join(ai_notes)}")
             self._notify_trade(record)
-            operation_active = False
-            trade_start_time = None
-            last_waiting_log = None
-            logging.info("✅ Operación finalizada, retomando análisis del mercado...")
-            self._notify_trade_state("ready")
             if (
                 self.auto_shutdown_enabled
                 and not self.auto_shutdown_triggered
@@ -1146,8 +1179,15 @@ class TradingEngine:
                 and self.risk.consecutive_losses >= self.auto_shutdown_limit
             ):
                 self._handle_auto_shutdown()
-                return
-            reprocess = True
+        except Exception as exc:
+            logging.warning(f"Error al finalizar la operación: {exc}")
+        finally:
+            operation_active = False
+            trade_start_time = None
+            last_waiting_log = None
+            self.active_trade_symbol = None
+            logging.info(RESUME_MESSAGE)
+            self._notify_trade_state('ready')
 
     def run(self) -> None:
         global operation_active, trade_start_time, last_waiting_log
