@@ -867,6 +867,7 @@ class TradingEngine:
         self._trade_listeners: List[Callable[[TradeRecord, Dict[str, float]], None]] = []
         self._status_listeners: List[Callable[[str], None]] = []
         self._summary_listeners: List[Callable[[str, Dict[str, Any]], None]] = []
+        self._trade_state_listeners: List[Callable[[str], None]] = []
         self._strategy_lock = threading.Lock()
         self.strategy_states: Dict[str, bool] = {name: True for name, _ in STRATEGY_FUNCTIONS}
         self.strategy_states["Divergence"] = True
@@ -875,6 +876,9 @@ class TradingEngine:
         self.auto_shutdown_enabled = False
         self.auto_shutdown_limit = 0
         self.auto_shutdown_triggered = False
+        self.trade_in_progress = False
+        self.active_trade_symbol: Optional[str] = None
+        self.waiting_logged = False
 
     def add_trade_listener(self, callback: Callable[[TradeRecord, Dict[str, float]], None]) -> None:
         self._trade_listeners.append(callback)
@@ -884,6 +888,9 @@ class TradingEngine:
 
     def add_summary_listener(self, callback: Callable[[str, Dict[str, Any]], None]) -> None:
         self._summary_listeners.append(callback)
+
+    def add_trade_state_listener(self, callback: Callable[[str], None]) -> None:
+        self._trade_state_listeners.append(callback)
 
     def set_trade_amount(self, value: float) -> None:
         self.trade_amount = max(0.1, float(value))
@@ -941,6 +948,13 @@ class TradingEngine:
             except Exception as exc:
                 logging.debug(f"Error en escucha de resumen: {exc}")
 
+    def _notify_trade_state(self, state: str) -> None:
+        for callback in list(self._trade_state_listeners):
+            try:
+                callback(state)
+            except Exception as exc:
+                logging.debug(f"Error en escucha de estado de operación: {exc}")
+
     def _evaluate_strategies(self, df: pd.DataFrame) -> Tuple[List[Tuple[str, StrategyResult]], Dict[str, Any]]:
         with self._strategy_lock:
             active_entries = [(name, func) for name, func in STRATEGY_FUNCTIONS if self.strategy_states.get(name, True)]
@@ -972,33 +986,62 @@ class TradingEngine:
         self.stop()
 
     def execute_cycle(self, symbol: str) -> None:
-        candles = self.api.fetch_candles(symbol)
-        df = to_dataframe(candles)
-        results, consensus = self._evaluate_strategies(df)
-        self._notify_summary(symbol, consensus)
-        signal = consensus['signal']
-        confidence = consensus['confidence']
-        reasons = consensus['reasons']
-        for nombre, resultado in results:
-            etiqueta = STRATEGY_DISPLAY_NAMES.get(nombre, nombre)
-            mensaje = resultado.reasons[0] if resultado.reasons else 'Sin comentario'
-            logging.info(f'[{symbol}] {etiqueta}: {mensaje} (señal {resultado.signal})')
-        active_total = consensus['active']
-        signals_total = consensus['signals']
-        if active_total == 0:
-            logging.info('⚠️ Sin estrategias activas configuradas')
-            return
-        if signals_total == 0:
-            logging.info('⚠️ Ninguna de las estrategias activas generó señal')
-            logging.info(f"Estrategias activas: {active_total}/{TOTAL_STRATEGY_COUNT}")
-            return
-        logging.info(
-            f"Estrategias con señal: {signals_total}/{active_total}"
-        )
-        etiqueta_conf = consensus['confidence_label'].lower()
-        if signal == 'NONE':
+        reprocess = True
+        while reprocess and self.running.is_set():
+            reprocess = False
+            if self.trade_in_progress:
+                if not self.waiting_logged:
+                    logging.info("⏳ Esperando que finalice la operación activa...")
+                    self.waiting_logged = True
+                self._notify_trade_state("waiting")
+                return
+            candles = self.api.fetch_candles(symbol)
+            df = to_dataframe(candles)
+            results, consensus = self._evaluate_strategies(df)
+            self._notify_summary(symbol, consensus)
+            signal = consensus['signal']
+            confidence = consensus['confidence']
+            reasons = consensus['reasons']
+            for nombre, resultado in results:
+                etiqueta = STRATEGY_DISPLAY_NAMES.get(nombre, nombre)
+                mensaje = resultado.reasons[0] if resultado.reasons else 'Sin comentario'
+                logging.info(f'[{symbol}] {etiqueta}: {mensaje} (señal {resultado.signal})')
+            active_total = consensus['active']
+            signals_total = consensus['signals']
+            if active_total == 0:
+                logging.info('⚠️ Sin estrategias activas configuradas')
+                self.waiting_logged = False
+                self._notify_trade_state("ready")
+                return
+            if signals_total == 0:
+                logging.info('⚠️ Ninguna de las estrategias activas generó señal')
+                logging.info(f"Estrategias activas: {active_total}/{TOTAL_STRATEGY_COUNT}")
+                self.waiting_logged = False
+                self._notify_trade_state("ready")
+                return
             logging.info(
-                f"⚠️ Confianza {etiqueta_conf} ({confidence:.2f}) → {consensus['main_reason']}"
+                f"Estrategias con señal: {signals_total}/{active_total}"
+            )
+            etiqueta_conf = consensus['confidence_label'].lower()
+            if signal == 'NONE':
+                logging.info(
+                    f"⚠️ Confianza {etiqueta_conf} ({confidence:.2f}) → {consensus['main_reason']}"
+                )
+                logging.info(
+                    f"Estrategias activas: {active_total}/{TOTAL_STRATEGY_COUNT}"
+                )
+                if consensus['low_volatility']:
+                    valor_vol = consensus['volatility_value']
+                    detalle = f" ({valor_vol:.4f})" if valor_vol is not None else ''
+                    logging.info(f"⚠️ Volatilidad baja detectada{detalle}")
+                self.waiting_logged = False
+                self._notify_trade_state("ready")
+                return
+            logging.info(
+                f"📊 Confianza {etiqueta_conf} ({confidence:.2f}) → {consensus['main_reason']}"
+            )
+            logging.info(
+                f"Estrategias alineadas: {consensus['aligned']}/{signals_total}"
             )
             logging.info(
                 f"Estrategias activas: {active_total}/{TOTAL_STRATEGY_COUNT}"
@@ -1006,115 +1049,119 @@ class TradingEngine:
             if consensus['low_volatility']:
                 valor_vol = consensus['volatility_value']
                 detalle = f" ({valor_vol:.4f})" if valor_vol is not None else ''
-                logging.info(f"⚠️ Volatilidad baja detectada{detalle}")
-            return
-        logging.info(
-            f"📊 Confianza {etiqueta_conf} ({confidence:.2f}) → {consensus['main_reason']}"
-        )
-        logging.info(
-            f"Estrategias alineadas: {consensus['aligned']}/{signals_total}"
-        )
-        logging.info(
-            f"Estrategias activas: {active_total}/{TOTAL_STRATEGY_COUNT}"
-        )
-        if consensus['low_volatility']:
-            valor_vol = consensus['volatility_value']
-            detalle = f" ({valor_vol:.4f})" if valor_vol is not None else ''
-            if consensus['override']:
-                if 'RSI' in consensus['override_reason']:
-                    logging.info('🚫 Volatilidad baja pero señal fuerte RSI → operación anticipada')
+                if consensus['override']:
+                    if 'RSI' in consensus['override_reason']:
+                        logging.info('🚫 Volatilidad baja pero señal fuerte RSI → operación anticipada')
+                    else:
+                        logging.info(f"🚫 Volatilidad baja pero {consensus['override_reason'].lower()} → operación anticipada")
                 else:
-                    logging.info(f"🚫 Volatilidad baja pero {consensus['override_reason'].lower()} → operación anticipada")
-            else:
-                logging.info(f"⚠️ Volatilidad baja detectada{detalle}")
-        logging.info(
-            f"✅ Señal final: {signal} | Confianza {confidence:.2f} | Estrategias activas: {active_total}/{TOTAL_STRATEGY_COUNT}"
-        )
-        features = build_feature_vector(df, reasons, results)
-        ai_prob = None
-        if AI_ENABLED:
-            api_prob = query_ai_backend(features)
-            if api_prob is not None:
-                ai_prob = api_prob
-        ai_confidence = confidence
-        ai_notes: List[str] = []
-        internal_prob, internal_notes = self.ai.predict(features)
-        if internal_notes:
-            ai_notes.extend(internal_notes)
-        if ai_prob is not None:
-            if internal_prob != 0.5:
-                ai_prob = (ai_prob + internal_prob) / 2
-                ai_notes.append('Mezcla adaptativa aplicada')
-            fused = self.ai.fuse_with_technical(confidence, ai_prob)
-            ai_confidence = fused
-            ai_notes.append(f'Mezcla IA {ai_prob:.2f}')
-        elif internal_prob != 0.5:
-            fused = self.ai.fuse_with_technical(confidence, internal_prob)
-            ai_confidence = fused
-            ai_notes.append(f'Núcleo adaptativo {internal_prob:.2f}')
-        if not self.risk.can_trade(ai_confidence):
-            return
-        contract_id, price = self.api.buy(symbol, signal, self.trade_amount)
-        if contract_id is None:
-            return
-        result, pnl = self._simulate_result()
-        self.risk.register_trade(pnl)
-        self.ai.log_trade(features, 1 if result == 'WIN' else 0)
-        record_metadata = {
-            'confidence_label': consensus['confidence_label'],
-            'confidence_value': confidence,
-            'aligned': consensus['aligned'],
-            'active': consensus['active'],
-            'signals': consensus['signals'],
-            'direction': signal,
-            'main_reason': consensus['main_reason'],
-            'low_volatility': consensus['low_volatility'],
-            'volatility_value': consensus['volatility_value'],
-            'override': consensus['override'],
-            'override_reason': consensus['override_reason'],
-            'dominant': consensus['dominant'],
-            'total_weight': consensus['total_weight'],
-            'active_weight': consensus.get('active_weight', 0.0),
-        }
-        record = TradeRecord(
-            timestamp=datetime.now(timezone.utc),
-            symbol=symbol,
-            decision=signal,
-            confidence=ai_confidence,
-            result=result,
-            pnl=pnl,
-            reasons=reasons + ai_notes,
-            metadata=record_metadata,
-        )
-        log_trade(record)
-        if result == 'WIN':
-            self.win_count += 1
-        else:
-            self.loss_count += 1
-        with self.lock:
-            self.trade_history.append(record)
-        ema_diff = df['close'].iloc[-1] - df['close'].iloc[-2]
-        latest_rsi = rsi(df['close']).iloc[-1]
-        logging.info(
-            f"{record.timestamp:%Y-%m-%d %H:%M:%S} INFO: [{symbol}] {signal} @{ai_confidence:.2f} | EMA:{ema_diff:.2f} RSI:{latest_rsi:.2f} | Motivos: {'; '.join(reasons)}"
-        )
-        if ai_notes:
-            logging.info(f"📊 Aviso IA → {'; '.join(ai_notes)}")
-        self._notify_trade(record)
-        if (
-            self.auto_shutdown_enabled
-            and not self.auto_shutdown_triggered
-            and result == 'LOSS'
-            and self.auto_shutdown_limit > 0
-            and self.risk.consecutive_losses >= self.auto_shutdown_limit
-        ):
-            self._handle_auto_shutdown()
+                    logging.info(f"⚠️ Volatilidad baja detectada{detalle}")
+            logging.info(
+                f"✅ Señal final: {signal} | Confianza {confidence:.2f} | Estrategias activas: {active_total}/{TOTAL_STRATEGY_COUNT}"
+            )
+            features = build_feature_vector(df, reasons, results)
+            ai_prob = None
+            if AI_ENABLED:
+                api_prob = query_ai_backend(features)
+                if api_prob is not None:
+                    ai_prob = api_prob
+            ai_confidence = confidence
+            ai_notes: List[str] = []
+            internal_prob, internal_notes = self.ai.predict(features)
+            if internal_notes:
+                ai_notes.extend(internal_notes)
+            if ai_prob is not None:
+                if internal_prob != 0.5:
+                    ai_prob = (ai_prob + internal_prob) / 2
+                    ai_notes.append('Mezcla adaptativa aplicada')
+                fused = self.ai.fuse_with_technical(confidence, ai_prob)
+                ai_confidence = fused
+                ai_notes.append(f'Mezcla IA {ai_prob:.2f}')
+            elif internal_prob != 0.5:
+                fused = self.ai.fuse_with_technical(confidence, internal_prob)
+                ai_confidence = fused
+                ai_notes.append(f'Núcleo adaptativo {internal_prob:.2f}')
+            if not self.risk.can_trade(ai_confidence):
+                self.waiting_logged = False
+                self._notify_trade_state("ready")
+                return
+            self.trade_in_progress = True
+            self.active_trade_symbol = symbol
+            self.waiting_logged = False
+            self._notify_trade_state("active")
+            try:
+                contract_id, price = self.api.buy(symbol, signal, self.trade_amount)
+                if contract_id is None:
+                    reprocess = True
+                    continue
+                result, pnl = self._simulate_result()
+                self.risk.register_trade(pnl)
+                self.ai.log_trade(features, 1 if result == 'WIN' else 0)
+                record_metadata = {
+                    'confidence_label': consensus['confidence_label'],
+                    'confidence_value': confidence,
+                    'aligned': consensus['aligned'],
+                    'active': consensus['active'],
+                    'signals': consensus['signals'],
+                    'direction': signal,
+                    'main_reason': consensus['main_reason'],
+                    'low_volatility': consensus['low_volatility'],
+                    'volatility_value': consensus['volatility_value'],
+                    'override': consensus['override'],
+                    'override_reason': consensus['override_reason'],
+                    'dominant': consensus['dominant'],
+                    'total_weight': consensus['total_weight'],
+                    'active_weight': consensus.get('active_weight', 0.0),
+                }
+                record = TradeRecord(
+                    timestamp=datetime.now(timezone.utc),
+                    symbol=symbol,
+                    decision=signal,
+                    confidence=ai_confidence,
+                    result=result,
+                    pnl=pnl,
+                    reasons=reasons + ai_notes,
+                    metadata=record_metadata,
+                )
+                log_trade(record)
+                if result == 'WIN':
+                    self.win_count += 1
+                else:
+                    self.loss_count += 1
+                with self.lock:
+                    self.trade_history.append(record)
+                ema_diff = df['close'].iloc[-1] - df['close'].iloc[-2]
+                latest_rsi = rsi(df['close']).iloc[-1]
+                logging.info(
+                    f"{record.timestamp:%Y-%m-%d %H:%M:%S} INFO: [{symbol}] {signal} @{ai_confidence:.2f} | EMA:{ema_diff:.2f} RSI:{latest_rsi:.2f} | Motivos: {'; '.join(reasons)}"
+                )
+                if ai_notes:
+                    logging.info(f"📊 Aviso IA → {'; '.join(ai_notes)}")
+                self._notify_trade(record)
+                if (
+                    self.auto_shutdown_enabled
+                    and not self.auto_shutdown_triggered
+                    and result == 'LOSS'
+                    and self.auto_shutdown_limit > 0
+                    and self.risk.consecutive_losses >= self.auto_shutdown_limit
+                ):
+                    self._handle_auto_shutdown()
+                    return
+                reprocess = True
+            finally:
+                if self.trade_in_progress:
+                    self.trade_in_progress = False
+                    self.active_trade_symbol = None
+                    self.waiting_logged = False
+                    self._notify_trade_state("ready")
 
     def run(self) -> None:
         self.running.set()
         self._notify_status("connecting")
         self.api.connect()
         self._notify_status("running")
+        self.waiting_logged = False
+        self._notify_trade_state("ready")
         try:
             while self.running.is_set():
                 for symbol in SYMBOLS:
@@ -1132,6 +1179,10 @@ class TradingEngine:
 
     def stop(self) -> None:
         self.running.clear()
+        self.trade_in_progress = False
+        self.active_trade_symbol = None
+        self.waiting_logged = False
+        self._notify_trade_state("ready")
         try:
             if self.api.socket is not None:
                 self.api.socket.close()
@@ -1149,6 +1200,7 @@ class EngineBridge(QtCore.QObject):
     trade = QtCore.pyqtSignal(object, dict)
     status = QtCore.pyqtSignal(str)
     summary = QtCore.pyqtSignal(str, dict)
+    trade_state = QtCore.pyqtSignal(str)
 
 
 class LogEmitter(QtCore.QObject):
@@ -1209,6 +1261,7 @@ class BotWindow(QtWidgets.QWidget):
         self.bridge.trade.connect(self._on_trade)
         self.bridge.status.connect(self._on_status)
         self.bridge.summary.connect(self._on_summary)
+        self.bridge.trade_state.connect(self._on_trade_state)
 
         self.log_handler = QtLogHandler()
         self.log_handler.emitter.message.connect(self._append_log)
@@ -1218,6 +1271,7 @@ class BotWindow(QtWidgets.QWidget):
         self.engine.add_trade_listener(lambda record, stats: self.bridge.trade.emit(record, stats))
         self.engine.add_status_listener(lambda status: self.bridge.status.emit(status))
         self.engine.add_summary_listener(lambda symbol, data: self.bridge.summary.emit(symbol, data))
+        self.engine.add_trade_state_listener(lambda state: self.bridge.trade_state.emit(state))
         self.strategy_initial_state = self._load_strategy_config()
         for name, enabled in self.strategy_initial_state.items():
             self.engine.set_strategy_state(name, enabled)
@@ -1268,8 +1322,10 @@ class BotWindow(QtWidgets.QWidget):
         control_layout.addStretch()
         self.status_label = QtWidgets.QLabel("Estado: Inactivo")
         self.ai_mode_label = QtWidgets.QLabel("Modo IA: Pasivo")
+        self.trade_state_label = QtWidgets.QLabel("Estado: Listo")
         control_layout.addWidget(self.status_label)
         control_layout.addWidget(self.ai_mode_label)
+        control_layout.addWidget(self.trade_state_label)
         vbox.addLayout(control_layout)
 
         monto_layout = QtWidgets.QHBoxLayout()
@@ -1455,6 +1511,7 @@ class BotWindow(QtWidgets.QWidget):
                 self.start_button.setEnabled(True)
                 self.stop_button.setEnabled(False)
                 self.status_label.setText("Estado: Detenido")
+                self._on_trade_state("ready")
             return
         self.thread.stop()
         self.thread.wait(2000)
@@ -1463,6 +1520,7 @@ class BotWindow(QtWidgets.QWidget):
         self.stop_button.setEnabled(False)
         self.status_label.setText("Estado: Detenido")
         self.auto_shutdown_active = False
+        self._on_trade_state("ready")
 
     def _on_trade_amount_changed(self, value: float) -> None:
         self.engine.set_trade_amount(value)
@@ -1535,6 +1593,16 @@ class BotWindow(QtWidgets.QWidget):
                 self.start_button.setEnabled(True)
                 self.stop_button.setEnabled(False)
 
+    def _on_trade_state(self, state: str) -> None:
+        mapping = {
+            "active": "Estado: Operando",
+            "waiting": "Estado: Esperando cierre de operación...",
+            "ready": "Estado: Listo",
+        }
+        texto = mapping.get(state, "Estado: Listo")
+        if hasattr(self, "trade_state_label"):
+            self.trade_state_label.setText(texto)
+
     def _on_thread_finished(self) -> None:
         self.thread = None
         if self.auto_shutdown_active:
@@ -1545,6 +1613,7 @@ class BotWindow(QtWidgets.QWidget):
             self.start_button.setEnabled(True)
             self.stop_button.setEnabled(False)
             self.status_label.setText("Estado: Detenido")
+        self._on_trade_state("ready")
 
     def _append_log(self, message: str) -> None:
         self.log_view.appendPlainText(message)
