@@ -154,170 +154,157 @@ def log_trade(record: TradeRecord) -> None:
 # ===============================================================
 # STRATEGIES
 # ===============================================================
-def strategy_rsi_ema(df: pd.DataFrame) -> StrategyResult:
-    rsi_series = rsi(df["close"])
-    ema9 = ema(df["close"], 9)
-    ema21 = ema(df["close"], 21)
-    signal = "NULL"
-    score = 0.0
-    reasons: List[str] = []
+def strategy_rsi(df: pd.DataFrame) -> StrategyResult:
+    if len(df) < 15:
+        return StrategyResult('NONE', 0.0, ['RSI sin suficientes datos'])
+    rsi_series = rsi(df['close'])
+    valor = float(rsi_series.iloc[-1])
+    if valor < 30:
+        return StrategyResult('CALL', 1.0, [f"RSI {valor:.2f} sobrevendido → señal CALL"])
+    if valor > 70:
+        return StrategyResult('PUT', -1.0, [f"RSI {valor:.2f} sobrecomprado → señal PUT"])
+    return StrategyResult('NONE', 0.0, [f"RSI {valor:.2f} sin sesgo claro"])
+
+
+def strategy_ema_trend(df: pd.DataFrame) -> StrategyResult:
     if len(df) < 25:
-        return StrategyResult(signal, score, reasons)
-    if rsi_series.iloc[-1] < 30 and ema9.iloc[-1] > ema21.iloc[-1]:
-        signal = "CALL"
-        score = 1.0
-        reasons.append("RSI oversold + EMA9>EMA21")
-    elif rsi_series.iloc[-1] > 70 and ema9.iloc[-1] < ema21.iloc[-1]:
-        signal = "PUT"
-        score = -1.0
-        reasons.append("RSI overbought + EMA9<EMA21")
-    return StrategyResult(signal, score, reasons)
+        return StrategyResult('NONE', 0.0, ['EMAs sin datos suficientes'])
+    ema_corto = ema(df['close'], 9)
+    ema_largo = ema(df['close'], 21)
+    cruz_alcista = ema_corto.iloc[-2] <= ema_largo.iloc[-2] and ema_corto.iloc[-1] > ema_largo.iloc[-1]
+    cruz_bajista = ema_corto.iloc[-2] >= ema_largo.iloc[-2] and ema_corto.iloc[-1] < ema_largo.iloc[-1]
+    if cruz_alcista:
+        return StrategyResult('CALL', 0.9, ['Cruce alcista EMA9 sobre EMA21 → CALL'])
+    if cruz_bajista:
+        return StrategyResult('PUT', -0.9, ['Cruce bajista EMA9 bajo EMA21 → PUT'])
+    return StrategyResult('NONE', 0.0, ['EMAs paralelas sin cruce'])
 
 
 def strategy_bollinger_rebound(df: pd.DataFrame) -> StrategyResult:
     if len(df) < 22:
-        return StrategyResult("NULL", 0.0, [])
-    lower, upper = bollinger_bands(df["close"])
-    rsi_series = rsi(df["close"])
-    price = df["close"].iloc[-1]
-    signal = "NULL"
-    score = 0.0
-    reasons: List[str] = []
-    if price <= lower.iloc[-1] * 1.01 and rsi_series.iloc[-1] > rsi_series.iloc[-2]:
-        signal = "CALL"
-        score = 0.8
-        reasons.append("Bollinger rebound lower")
-    elif price >= upper.iloc[-1] * 0.99 and rsi_series.iloc[-1] < rsi_series.iloc[-2]:
-        signal = "PUT"
-        score = -0.8
-        reasons.append("Bollinger rebound upper")
-    return StrategyResult(signal, score, reasons)
-
-
-def strategy_trend_filter(df: pd.DataFrame) -> StrategyResult:
-    if len(df) < 210:
-        return StrategyResult("NULL", 0.0, [])
-    sma200 = sma(df["close"], 200)
-    ema50 = ema(df["close"], 50)
-    ema100 = ema(df["close"], 100)
-    reasons: List[str] = []
-    if df["close"].iloc[-1] > sma200.iloc[-1] and ema50.iloc[-1] > ema100.iloc[-1]:
-        reasons.append("Uptrend filter")
-        return StrategyResult("CALL", 0.6, reasons)
-    if df["close"].iloc[-1] < sma200.iloc[-1] and ema50.iloc[-1] < ema100.iloc[-1]:
-        reasons.append("Downtrend filter")
-        return StrategyResult("PUT", -0.6, reasons)
-    return StrategyResult("NULL", 0.0, [])
+        return StrategyResult('NONE', 0.0, ['Bollinger sin historial suficiente'])
+    lower, upper = bollinger_bands(df['close'])
+    rsi_series = rsi(df['close'])
+    precio = float(df['close'].iloc[-1])
+    rsi_actual = float(rsi_series.iloc[-1])
+    rsi_prev = float(rsi_series.iloc[-2])
+    if precio <= float(lower.iloc[-1]) * 1.005 and rsi_actual > rsi_prev:
+        return StrategyResult('CALL', 0.8, ['Precio en banda inferior y RSI repunta → CALL'])
+    if precio >= float(upper.iloc[-1]) * 0.995 and rsi_actual < rsi_prev:
+        return StrategyResult('PUT', -0.8, ['Precio en banda superior y RSI cae → PUT'])
+    return StrategyResult('NONE', 0.0, ['Sin rebote claro en Bollinger'])
 
 
 def strategy_pullback(df: pd.DataFrame) -> StrategyResult:
     if len(df) < 25:
-        return StrategyResult("NULL", 0.0, [])
-    ema21 = ema(df["close"], 21)
-    close = df["close"].iloc[-1]
-    prev_close = df["close"].iloc[-2]
-    signal = "NULL"
-    score = 0.0
-    reasons: List[str] = []
-    if close > ema21.iloc[-1] and prev_close < ema21.iloc[-2]:
-        signal = "CALL"
-        score = 0.7
-        reasons.append("Bullish pullback")
-    elif close < ema21.iloc[-1] and prev_close > ema21.iloc[-2]:
-        signal = "PUT"
-        score = -0.7
-        reasons.append("Bearish pullback")
-    return StrategyResult(signal, score, reasons)
+        return StrategyResult('NONE', 0.0, ['Pullback sin datos suficientes'])
+    closes = df['close']
+    rsi_series = rsi(closes)
+    tramo = closes.iloc[-4:]
+    rsi_tramo = rsi_series.iloc[-4:]
+    if tramo.iloc[0] > tramo.iloc[1] > tramo.iloc[2] and tramo.iloc[3] > tramo.iloc[2] and rsi_tramo.iloc[-1] > rsi_tramo.iloc[-2]:
+        return StrategyResult('CALL', 0.7, ['Pullback alcista con RSI recuperándose → CALL'])
+    if tramo.iloc[0] < tramo.iloc[1] < tramo.iloc[2] and tramo.iloc[3] < tramo.iloc[2] and rsi_tramo.iloc[-1] < rsi_tramo.iloc[-2]:
+        return StrategyResult('PUT', -0.7, ['Pullback bajista con RSI cayendo → PUT'])
+    return StrategyResult('NONE', 0.0, ['Sin pullback definido'])
 
 
 def strategy_breakout(df: pd.DataFrame) -> StrategyResult:
     if len(df) < 25:
-        return StrategyResult("NULL", 0.0, [])
-    lower, upper = donchian_channels(df, 20)
-    rsi_series = rsi(df["close"])
-    close = df["close"].iloc[-1]
-    signal = "NULL"
-    score = 0.0
-    reasons: List[str] = []
-    if close > upper.iloc[-1] and rsi_series.iloc[-1] > 50:
-        signal = "CALL"
-        score = 0.9
-        reasons.append("Donchian breakout up")
-    elif close < lower.iloc[-1] and rsi_series.iloc[-1] < 50:
-        signal = "PUT"
-        score = -0.9
-        reasons.append("Donchian breakout down")
-    return StrategyResult(signal, score, reasons)
+        return StrategyResult('NONE', 0.0, ['Ruptura sin datos suficientes'])
+    cierre = float(df['close'].iloc[-1])
+    resistencia = float(df['high'].iloc[-21:-1].max())
+    soporte = float(df['low'].iloc[-21:-1].min())
+    rsi_actual = float(rsi(df['close']).iloc[-1])
+    if cierre > resistencia and rsi_actual > 50:
+        return StrategyResult('CALL', 0.85, ['Cierre rompe resistencia reciente → CALL'])
+    if cierre < soporte and rsi_actual < 50:
+        return StrategyResult('PUT', -0.85, ['Cierre perfora soporte reciente → PUT'])
+    return StrategyResult('NONE', 0.0, ['Sin ruptura relevante'])
 
 
-def strategy_divergence_block(df: pd.DataFrame) -> StrategyResult:
-    if len(df) < 30:
-        return StrategyResult("NULL", 0.0, [])
-    rsi_series = rsi(df["close"])
-    price = df["close"]
-    rsi_change = rsi_series.iloc[-1] - rsi_series.iloc[-5]
-    price_change = price.iloc[-1] - price.iloc[-5]
-    reasons: List[str] = []
-    if rsi_change > 0 and price_change < 0:
-        reasons.append("Bullish divergence")
-        return StrategyResult("CALL", 0.0, reasons)
-    if rsi_change < 0 and price_change > 0:
-        reasons.append("Bearish divergence")
-        return StrategyResult("PUT", 0.0, reasons)
-    return StrategyResult("NULL", 0.0, [])
+def strategy_divergence(df: pd.DataFrame) -> StrategyResult:
+    if len(df) < 12:
+        return StrategyResult('NONE', 0.0, ['Divergencias sin datos suficientes'])
+    rsi_series = rsi(df['close'])
+    window = min(10, len(df))
+    rsi_segment = rsi_series.iloc[-window:]
+    price_segment = df['close'].iloc[-window:]
+    rsi_delta = float(rsi_segment.iloc[-1] - rsi_segment.iloc[0])
+    price_delta = float(price_segment.iloc[-1] - price_segment.iloc[0])
+    if price_delta < 0 and rsi_delta > 0:
+        return StrategyResult('CALL', 0.6, ['Divergencia alcista RSI vs precio → CALL'])
+    if price_delta > 0 and rsi_delta < 0:
+        return StrategyResult('PUT', -0.6, ['Divergencia bajista RSI vs precio → PUT'])
+    return StrategyResult('NONE', 0.0, ['Sin divergencias claras'])
 
 
 def strategy_volatility_filter(df: pd.DataFrame) -> StrategyResult:
-    if len(df) < 21:
-        return StrategyResult("NULL", 0.0, [])
-    atr_values = atr(df, 14)
-    latest_atr = atr_values.iloc[-1]
-    mean_atr = atr_values.iloc[-14:].mean()
-    reasons: List[str] = []
-    if latest_atr < mean_atr * 0.6:
-        reasons.append("Volatility too low")
-        return StrategyResult("NULL", -0.5, reasons)
-    if latest_atr > mean_atr * 1.6:
-        reasons.append("Volatility too high")
-        return StrategyResult("NULL", -0.5, reasons)
-    return StrategyResult("NULL", 0.0, [])
+    if len(df) < 25:
+        return StrategyResult('NONE', 0.0, ['Volatilidad sin datos suficientes'])
+    retornos = df['close'].pct_change().dropna()
+    if retornos.empty:
+        return StrategyResult('NONE', 0.0, ['Volatilidad no calculable'])
+    reciente = retornos.iloc[-20:]
+    volatilidad = float(reciente.std())
+    if volatilidad <= 0.002:
+        return StrategyResult('NONE', 0.0, [f"Volatilidad {volatilidad:.4f} insuficiente → sin operación"])
+    return StrategyResult('NONE', 0.0, [f"Volatilidad {volatilidad:.4f} adecuada"])
 
 
 STRATEGY_FUNCTIONS: List[Tuple[str, Callable[[pd.DataFrame], StrategyResult]]] = [
-    ("RSI+EMA", strategy_rsi_ema),
-    ("Bollinger Rebound", strategy_bollinger_rebound),
-    ("Trend Filter", strategy_trend_filter),
-    ("Pullback", strategy_pullback),
-    ("Breakout", strategy_breakout),
+    ('RSI', strategy_rsi),
+    ('EMA Trend', strategy_ema_trend),
+    ('Bollinger Rebound', strategy_bollinger_rebound),
+    ('Pullback', strategy_pullback),
+    ('Breakout', strategy_breakout),
 ]
+
+STRATEGY_DISPLAY_NAMES: Dict[str, str] = {
+    'RSI': 'RSI',
+    'EMA Trend': 'Tendencia EMA',
+    'Bollinger Rebound': 'Rebote Bollinger',
+    'Pullback': 'Pullback',
+    'Breakout': 'Ruptura de rango',
+    'Divergence': 'Divergencia',
+    'Volatility Filter': 'Filtro de volatilidad',
+}
 
 
 # ===============================================================
 # SIGNAL COMBINER
 # ===============================================================
-def combine_signals(results: List[Tuple[str, StrategyResult]], total_active: int) -> Tuple[str, float, List[str], Dict[str, str], Dict[str, int]]:
+def combine_signals(results: List[Tuple[str, StrategyResult]], total_active: int) -> Tuple[str, float, List[str], Dict[str, str], Dict[str, int], bool]:
     reasons: List[str] = []
     agreements: Dict[str, str] = {}
-    votes = {"CALL": 0, "PUT": 0}
+    votes = {'CALL': 0, 'PUT': 0}
+    bloqueo_volatilidad = False
     for name, res in results:
+        agreements[name] = res.signal
         reasons.extend(res.reasons)
-        if res.signal in {"CALL", "PUT"}:
+        if name == 'Volatility Filter':
+            for motivo in res.reasons:
+                if 'insuficiente' in motivo.lower():
+                    bloqueo_volatilidad = True
+        if res.signal in {'CALL', 'PUT'}:
             votes[res.signal] += 1
-            agreements[name] = res.signal
-        else:
-            agreements[name] = "NULL"
-    majority_needed = total_active // 2 + 1 if total_active else 0
-    selected_signal = "NULL"
-    if votes["CALL"] >= majority_needed and votes["CALL"] > votes["PUT"]:
-        selected_signal = "CALL"
-    elif votes["PUT"] >= majority_needed and votes["PUT"] > votes["CALL"]:
-        selected_signal = "PUT"
-    if selected_signal == "NULL" or total_active == 0:
-        return "NULL", 0.0, reasons, agreements, votes
-    ratio = votes[selected_signal] / total_active
-    confidence = min(0.98, 0.4 + 0.4 * ratio)
-    reasons.append(f"Consenso de {votes[selected_signal]}/{total_active} estrategias")
-    return selected_signal, confidence, reasons, agreements, votes
+    if bloqueo_volatilidad:
+        reasons.append('Operación bloqueada por volatilidad insuficiente')
+        return 'NONE', 0.0, reasons, agreements, votes, True
+    if total_active == 0:
+        return 'NONE', 0.0, reasons, agreements, votes, False
+    umbral = max(1, total_active // 2 + 1)
+    direccion = 'NONE'
+    if votes['CALL'] > votes['PUT'] and votes['CALL'] >= umbral:
+        direccion = 'CALL'
+    elif votes['PUT'] > votes['CALL'] and votes['PUT'] >= umbral:
+        direccion = 'PUT'
+    confianza = 0.0
+    if direccion != 'NONE':
+        ratio = votes[direccion] / total_active
+        confianza = min(0.98, 0.4 + 0.4 * ratio)
+        reasons.append(f"Consenso de {votes[direccion]}/{total_active} estrategias a favor de {direccion}")
+    return direccion, confianza, reasons, agreements, votes, False
 
 
 # ===============================================================
@@ -791,21 +778,21 @@ class TradingEngine:
             except Exception as exc:
                 logging.debug(f"Error en escucha de estado: {exc}")
 
-    def _evaluate_strategies(self, df: pd.DataFrame) -> Tuple[str, float, List[str], List[Tuple[str, StrategyResult]], Dict[str, str], Dict[str, int], int]:
+    def _evaluate_strategies(self, df: pd.DataFrame) -> Tuple[str, float, List[str], List[Tuple[str, StrategyResult]], Dict[str, str], Dict[str, int], int, bool]:
         with self._strategy_lock:
             active_entries = [(name, func) for name, func in STRATEGY_FUNCTIONS if self.strategy_states.get(name, True)]
-            divergence_enabled = self.strategy_states.get("Divergence", True)
-            volatility_enabled = self.strategy_states.get("Volatility Filter", True)
+            divergence_enabled = self.strategy_states.get('Divergence', True)
+            volatility_enabled = self.strategy_states.get('Volatility Filter', True)
             total_active = len(active_entries) + int(divergence_enabled) + int(volatility_enabled)
         results: List[Tuple[str, StrategyResult]] = []
         for name, func in active_entries:
             results.append((name, func(df)))
         if divergence_enabled:
-            results.append(("Divergence", strategy_divergence_block(df)))
+            results.append(('Divergence', strategy_divergence(df)))
         if volatility_enabled:
-            results.append(("Volatility Filter", strategy_volatility_filter(df)))
-        signal, confidence, reasons, agreements, votes = combine_signals(results, total_active)
-        return signal, confidence, reasons, results, agreements, votes, total_active
+            results.append(('Volatility Filter', strategy_volatility_filter(df)))
+        signal, confidence, reasons, agreements, votes, bloqueo_vol = combine_signals(results, total_active)
+        return signal, confidence, reasons, results, agreements, votes, total_active, bloqueo_vol
 
     def _simulate_result(self) -> Tuple[str, float]:
         outcome = np.random.rand() > 0.5
@@ -815,17 +802,25 @@ class TradingEngine:
     def execute_cycle(self, symbol: str) -> None:
         candles = self.api.fetch_candles(symbol)
         df = to_dataframe(candles)
-        signal, confidence, reasons, results, agreements, votes, total_active = self._evaluate_strategies(df)
+        signal, confidence, reasons, results, agreements, votes, total_active, bloqueo_vol = self._evaluate_strategies(df)
+        for nombre, resultado in results:
+            etiqueta = STRATEGY_DISPLAY_NAMES.get(nombre, nombre)
+            mensaje = resultado.reasons[0] if resultado.reasons else 'Sin comentario'
+            logging.info(f'[{symbol}] {etiqueta}: {mensaje} (señal {resultado.signal})')
+        if bloqueo_vol:
+            logging.info('⚠️ Operación omitida por volatilidad insuficiente')
+            return
         if total_active > 0:
-            if signal != "NULL":
-                logging.info(f"✅ {votes[signal]}/{total_active} estrategias confirman {signal}")
+            if signal in {'CALL', 'PUT'}:
+                logging.info(f'✅ {votes[signal]}/{total_active} estrategias respaldan {signal}')
+            elif votes['CALL'] == votes['PUT'] and votes['CALL'] > 0:
+                logging.info(f"⚖️ Empate entre estrategias ({votes['CALL']}/{total_active})")
+            elif max(votes.values()) > 0:
+                direccion = 'CALL' if votes['CALL'] > votes['PUT'] else 'PUT'
+                logging.info(f"⚠️ Solo {votes[direccion]}/{total_active} estrategias apoyan {direccion}")
             else:
-                direccion = "CALL" if votes["CALL"] >= votes["PUT"] else "PUT"
-                if max(votes.values()) > 0:
-                    logging.info(f"⚠️ {votes[direccion]}/{total_active} estrategias en desacuerdo")
-                else:
-                    logging.info(f"⚠️ Ninguna de las {total_active} estrategias activas generó señal")
-        if signal == "NULL":
+                logging.info(f'⚠️ Ninguna de las {total_active} estrategias activas generó señal')
+        if signal == 'NONE':
             return
         features = build_feature_vector(df, reasons, results)
         ai_prob = None
@@ -841,14 +836,14 @@ class TradingEngine:
         if ai_prob is not None:
             if internal_prob != 0.5:
                 ai_prob = (ai_prob + internal_prob) / 2
-                ai_notes.append("Mezcla adaptativa aplicada")
+                ai_notes.append('Mezcla adaptativa aplicada')
             fused = self.ai.fuse_with_technical(confidence, ai_prob)
             ai_confidence = fused
-            ai_notes.append(f"Mezcla IA {ai_prob:.2f}")
+            ai_notes.append(f'Mezcla IA {ai_prob:.2f}')
         elif internal_prob != 0.5:
             fused = self.ai.fuse_with_technical(confidence, internal_prob)
             ai_confidence = fused
-            ai_notes.append(f"Núcleo adaptativo {internal_prob:.2f}")
+            ai_notes.append(f'Núcleo adaptativo {internal_prob:.2f}')
         if not self.risk.can_trade(ai_confidence):
             return
         contract_id, price = self.api.buy(symbol, signal, STAKE)
@@ -856,7 +851,7 @@ class TradingEngine:
             return
         result, pnl = self._simulate_result()
         self.risk.register_trade(pnl)
-        self.ai.log_trade(features, 1 if result == "WIN" else 0)
+        self.ai.log_trade(features, 1 if result == 'WIN' else 0)
         record = TradeRecord(
             timestamp=datetime.now(timezone.utc),
             symbol=symbol,
@@ -867,14 +862,14 @@ class TradingEngine:
             reasons=reasons + ai_notes,
         )
         log_trade(record)
-        if result == "WIN":
+        if result == 'WIN':
             self.win_count += 1
         else:
             self.loss_count += 1
         with self.lock:
             self.trade_history.append(record)
-        ema_diff = df["close"].iloc[-1] - df["close"].iloc[-2]
-        latest_rsi = rsi(df["close"]).iloc[-1]
+        ema_diff = df['close'].iloc[-1] - df['close'].iloc[-2]
+        latest_rsi = rsi(df['close']).iloc[-1]
         logging.info(
             f"{record.timestamp:%Y-%m-%d %H:%M:%S} INFO: [{symbol}] {signal} @{ai_confidence:.2f} | EMA:{ema_diff:.2f} RSI:{latest_rsi:.2f} | Motivos: {'; '.join(reasons)}"
         )
@@ -1082,25 +1077,25 @@ class BotWindow(QtWidgets.QWidget):
         layout = QtWidgets.QVBoxLayout(tab)
         layout.addWidget(QtWidgets.QLabel("Activar o desactivar estrategias:"))
         strategy_descriptions = {
-            "RSI+EMA": "Cruce RSI + EMA → buscar sobreventa o sobrecompra alineada",
-            "Bollinger Rebound": "Rebote en Bollinger → aprovechar extremos con confirmación RSI",
-            "Trend Filter": "Filtro de tendencia → seguir la SMA200 y estructura EMA",
-            "Pullback": "Pullback → retroceso hacia EMA21 con vela de confirmación",
-            "Breakout": "Ruptura Donchian → seguir nuevos máximos/mínimos con RSI",
-            "Divergence": "Bloqueo por divergencia → evitar operaciones si RSI discrepa",
-            "Volatility Filter": "Filtro de volatilidad → evitar ATR demasiado bajo o alto",
+            'RSI': 'RSI extremo → busca sobreventa (<30) o sobrecompra (>70)',
+            'EMA Trend': 'Cruce de EMA → confirmar dirección de corto contra largo plazo',
+            'Bollinger Rebound': 'Rebote Bollinger → aprovechar extremos con impulso del RSI',
+            'Pullback': 'Pullback → retroceso controlado con recuperación del RSI',
+            'Breakout': 'Ruptura → validar cierres sobre resistencia o bajo soporte',
+            'Divergence': 'Divergencia → alerta cuando el RSI contradice al precio',
+            'Volatility Filter': 'Volatilidad → exigir movimiento mínimo para operar',
         }
         strategy_labels = {
-            "RSI+EMA": "RSI + EMA",
-            "Bollinger Rebound": "Rebote Bollinger",
-            "Trend Filter": "Filtro de tendencia",
-            "Pullback": "Pullback",
-            "Breakout": "Ruptura Donchian",
-            "Divergence": "Bloqueo por divergencia",
-            "Volatility Filter": "Filtro de volatilidad",
+            'RSI': 'RSI',
+            'EMA Trend': 'Tendencia EMA',
+            'Bollinger Rebound': 'Rebote Bollinger',
+            'Pullback': 'Pullback',
+            'Breakout': 'Ruptura',
+            'Divergence': 'Divergencia',
+            'Volatility Filter': 'Filtro de volatilidad',
         }
         states = self.engine.get_strategy_states()
-        strategy_names = [name for name, _ in STRATEGY_FUNCTIONS] + ["Divergence", "Volatility Filter"]
+        strategy_names = [name for name, _ in STRATEGY_FUNCTIONS] + ['Divergence', 'Volatility Filter']
         for name in strategy_names:
             checkbox = QtWidgets.QCheckBox(strategy_labels.get(name, name))
             checkbox.setChecked(states.get(name, True))
@@ -1226,11 +1221,16 @@ class BotWindow(QtWidgets.QWidget):
         estados: Dict[str, bool] = {}
         try:
             if STRATEGY_CONFIG_PATH.exists():
-                with STRATEGY_CONFIG_PATH.open("r", encoding="utf-8") as handle:
+                with STRATEGY_CONFIG_PATH.open('r', encoding='utf-8') as handle:
                     raw = json.load(handle)
                 if isinstance(raw, dict):
+                    alias = {
+                        'RSI+EMA': 'RSI',
+                        'Trend Filter': 'EMA Trend',
+                    }
                     for nombre, valor in raw.items():
-                        estados[nombre] = bool(valor)
+                        clave = alias.get(nombre, nombre)
+                        estados[clave] = bool(valor)
         except Exception as exc:
             logging.debug(f"No se pudo cargar configuración de estrategias: {exc}")
         return estados
