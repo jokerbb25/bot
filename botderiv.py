@@ -429,25 +429,28 @@ def combine_signals(results: List[Tuple[str, StrategyResult]], active_states: Di
 # RISK MANAGEMENT
 # ===============================================================
 class RiskManager:
-    def __init__(self) -> None:
+    def __init__(self, daily_loss_limit: float = MAX_DAILY_LOSS, daily_profit_target: float = MAX_DAILY_PROFIT, max_drawdown: float = MAX_DRAWDOWN) -> None:
         self.daily_pnl = 0.0
         self.total_pnl = 0.0
         self.daily_trades = 0
         self.consecutive_losses = 0
         self.last_trade_time = datetime.now(timezone.utc) - timedelta(seconds=TRADE_DELAY)
+        self.max_daily_loss = daily_loss_limit
+        self.daily_profit_target = daily_profit_target
+        self.max_drawdown_allowed = max_drawdown
 
     def can_trade(self, confidence: float) -> bool:
         now = datetime.now(timezone.utc)
         if self.daily_trades >= MAX_DAILY_TRADES:
             logging.info("Se alcanzó el máximo de operaciones diarias")
             return False
-        if self.daily_pnl <= MAX_DAILY_LOSS:
+        if self.daily_pnl <= self.max_daily_loss:
             logging.info("Se alcanzó el límite diario de pérdida")
             return False
-        if self.daily_pnl >= MAX_DAILY_PROFIT:
+        if self.daily_pnl >= self.daily_profit_target:
             logging.info("Se alcanzó el objetivo diario de ganancia")
             return False
-        if self.total_pnl <= MAX_DRAWDOWN:
+        if self.total_pnl <= self.max_drawdown_allowed:
             logging.info("Se alcanzó el drawdown máximo")
             return False
         if (now - self.last_trade_time).total_seconds() < TRADE_DELAY:
@@ -472,6 +475,15 @@ class RiskManager:
         self.daily_pnl = 0.0
         self.daily_trades = 0
         self.consecutive_losses = 0
+
+    def set_daily_loss_limit(self, value: float) -> None:
+        self.max_daily_loss = value
+
+    def set_daily_profit_target(self, value: float) -> None:
+        self.daily_profit_target = value
+
+    def set_max_drawdown(self, value: float) -> None:
+        self.max_drawdown_allowed = value
 
 
 # ===============================================================
@@ -854,16 +866,42 @@ class TradingEngine:
         self.loss_count = 0
         self._trade_listeners: List[Callable[[TradeRecord, Dict[str, float]], None]] = []
         self._status_listeners: List[Callable[[str], None]] = []
+        self._summary_listeners: List[Callable[[str, Dict[str, Any]], None]] = []
         self._strategy_lock = threading.Lock()
         self.strategy_states: Dict[str, bool] = {name: True for name, _ in STRATEGY_FUNCTIONS}
         self.strategy_states["Divergence"] = True
         self.strategy_states["Volatility Filter"] = True
+        self.trade_amount = STAKE
+        self.auto_shutdown_enabled = False
+        self.auto_shutdown_limit = 0
+        self.auto_shutdown_triggered = False
 
     def add_trade_listener(self, callback: Callable[[TradeRecord, Dict[str, float]], None]) -> None:
         self._trade_listeners.append(callback)
 
     def add_status_listener(self, callback: Callable[[str], None]) -> None:
         self._status_listeners.append(callback)
+
+    def add_summary_listener(self, callback: Callable[[str, Dict[str, Any]], None]) -> None:
+        self._summary_listeners.append(callback)
+
+    def set_trade_amount(self, value: float) -> None:
+        self.trade_amount = max(0.1, float(value))
+
+    def set_daily_loss_limit(self, value: float) -> None:
+        self.risk.set_daily_loss_limit(float(value))
+
+    def set_daily_profit_target(self, value: float) -> None:
+        self.risk.set_daily_profit_target(float(value))
+
+    def set_max_drawdown(self, value: float) -> None:
+        self.risk.set_max_drawdown(float(value))
+
+    def configure_auto_shutdown(self, enabled: bool, limit: int) -> None:
+        self.auto_shutdown_enabled = enabled
+        self.auto_shutdown_limit = max(0, int(limit))
+        if not enabled:
+            self.auto_shutdown_triggered = False
 
     def set_strategy_state(self, name: str, enabled: bool) -> None:
         with self._strategy_lock:
@@ -896,6 +934,13 @@ class TradingEngine:
             except Exception as exc:
                 logging.debug(f"Error en escucha de estado: {exc}")
 
+    def _notify_summary(self, symbol: str, data: Dict[str, Any]) -> None:
+        for callback in list(self._summary_listeners):
+            try:
+                callback(symbol, data)
+            except Exception as exc:
+                logging.debug(f"Error en escucha de resumen: {exc}")
+
     def _evaluate_strategies(self, df: pd.DataFrame) -> Tuple[List[Tuple[str, StrategyResult]], Dict[str, Any]]:
         with self._strategy_lock:
             active_entries = [(name, func) for name, func in STRATEGY_FUNCTIONS if self.strategy_states.get(name, True)]
@@ -914,13 +959,23 @@ class TradingEngine:
 
     def _simulate_result(self) -> Tuple[str, float]:
         outcome = np.random.rand() > 0.5
-        pnl = STAKE * PAYOUT if outcome else -STAKE
+        pnl = self.trade_amount * PAYOUT if outcome else -self.trade_amount
         return ("WIN" if outcome else "LOSS"), pnl
+
+    def _handle_auto_shutdown(self) -> None:
+        if self.auto_shutdown_triggered:
+            return
+        self.auto_shutdown_triggered = True
+        logging.warning("⚠️ Límite de pérdidas consecutivas alcanzado — bot detenido automáticamente")
+        self.risk.consecutive_losses = 0
+        self._notify_status("auto_shutdown")
+        self.stop()
 
     def execute_cycle(self, symbol: str) -> None:
         candles = self.api.fetch_candles(symbol)
         df = to_dataframe(candles)
         results, consensus = self._evaluate_strategies(df)
+        self._notify_summary(symbol, consensus)
         signal = consensus['signal']
         confidence = consensus['confidence']
         reasons = consensus['reasons']
@@ -999,7 +1054,7 @@ class TradingEngine:
             ai_notes.append(f'Núcleo adaptativo {internal_prob:.2f}')
         if not self.risk.can_trade(ai_confidence):
             return
-        contract_id, price = self.api.buy(symbol, signal, STAKE)
+        contract_id, price = self.api.buy(symbol, signal, self.trade_amount)
         if contract_id is None:
             return
         result, pnl = self._simulate_result()
@@ -1046,6 +1101,14 @@ class TradingEngine:
         if ai_notes:
             logging.info(f"📊 Aviso IA → {'; '.join(ai_notes)}")
         self._notify_trade(record)
+        if (
+            self.auto_shutdown_enabled
+            and not self.auto_shutdown_triggered
+            and result == 'LOSS'
+            and self.auto_shutdown_limit > 0
+            and self.risk.consecutive_losses >= self.auto_shutdown_limit
+        ):
+            self._handle_auto_shutdown()
 
     def run(self) -> None:
         self.running.set()
@@ -1085,6 +1148,7 @@ class TradingEngine:
 class EngineBridge(QtCore.QObject):
     trade = QtCore.pyqtSignal(object, dict)
     status = QtCore.pyqtSignal(str)
+    summary = QtCore.pyqtSignal(str, dict)
 
 
 class LogEmitter(QtCore.QObject):
@@ -1144,6 +1208,7 @@ class BotWindow(QtWidgets.QWidget):
         self.bridge = EngineBridge()
         self.bridge.trade.connect(self._on_trade)
         self.bridge.status.connect(self._on_status)
+        self.bridge.summary.connect(self._on_summary)
 
         self.log_handler = QtLogHandler()
         self.log_handler.emitter.message.connect(self._append_log)
@@ -1152,6 +1217,7 @@ class BotWindow(QtWidgets.QWidget):
         self.engine = TradingEngine()
         self.engine.add_trade_listener(lambda record, stats: self.bridge.trade.emit(record, stats))
         self.engine.add_status_listener(lambda status: self.bridge.status.emit(status))
+        self.engine.add_summary_listener(lambda symbol, data: self.bridge.summary.emit(symbol, data))
         self.strategy_initial_state = self._load_strategy_config()
         for name, enabled in self.strategy_initial_state.items():
             self.engine.set_strategy_state(name, enabled)
@@ -1167,6 +1233,7 @@ class BotWindow(QtWidgets.QWidget):
         }
         self.strategy_checkboxes: Dict[str, QtWidgets.QCheckBox] = {}
         self.asset_summary_labels: Dict[str, Dict[str, QtWidgets.QLabel]] = {}
+        self.auto_shutdown_active = False
 
         self._build_ui()
 
@@ -1181,7 +1248,9 @@ class BotWindow(QtWidgets.QWidget):
         layout.addWidget(self.tabs)
         self._build_general_tab()
         self._build_strategies_tab()
+        self._build_asset_summary_tab()
         self._build_settings_tab()
+        self._initialize_asset_summary()
 
     def _build_general_tab(self) -> None:
         tab = QtWidgets.QWidget()
@@ -1203,6 +1272,19 @@ class BotWindow(QtWidgets.QWidget):
         control_layout.addWidget(self.ai_mode_label)
         vbox.addLayout(control_layout)
 
+        monto_layout = QtWidgets.QHBoxLayout()
+        monto_label = QtWidgets.QLabel("Monto por operación:")
+        self.trade_amount_spin = QtWidgets.QDoubleSpinBox()
+        self.trade_amount_spin.setRange(0.1, 1000.0)
+        self.trade_amount_spin.setDecimals(2)
+        self.trade_amount_spin.setSingleStep(0.1)
+        self.trade_amount_spin.setValue(self.engine.trade_amount)
+        self.trade_amount_spin.valueChanged.connect(self._on_trade_amount_changed)
+        monto_layout.addWidget(monto_label)
+        monto_layout.addWidget(self.trade_amount_spin)
+        monto_layout.addStretch()
+        vbox.addLayout(monto_layout)
+
         stats_group = QtWidgets.QGroupBox("Desempeño")
         stats_layout = QtWidgets.QGridLayout(stats_group)
         labels = [
@@ -1222,31 +1304,6 @@ class BotWindow(QtWidgets.QWidget):
             stats_layout.addWidget(value_label, index // 3, (index % 3) * 2 + 1)
             self.stats_values[title] = value_label
         vbox.addWidget(stats_group)
-
-        resumen_group = QtWidgets.QGroupBox("Resumen por activo")
-        resumen_layout = QtWidgets.QHBoxLayout(resumen_group)
-        for symbol in SYMBOLS:
-            caja = QtWidgets.QGroupBox(symbol)
-            caja_layout = QtWidgets.QVBoxLayout(caja)
-            conf_label = QtWidgets.QLabel("Confianza: -")
-            activos_label = QtWidgets.QLabel("Estrategias activas: 0/7")
-            alineadas_label = QtWidgets.QLabel("Estrategias alineadas: 0/0")
-            direccion_label = QtWidgets.QLabel("Dirección dominante: -")
-            motivo_label = QtWidgets.QLabel("Motivo principal: -")
-            motivo_label.setWordWrap(True)
-            for lbl in [conf_label, activos_label, alineadas_label, direccion_label, motivo_label]:
-                caja_layout.addWidget(lbl)
-            caja_layout.addStretch(1)
-            self.asset_summary_labels[symbol] = {
-                'confidence': conf_label,
-                'active': activos_label,
-                'aligned': alineadas_label,
-                'direction': direccion_label,
-                'reason': motivo_label,
-            }
-            resumen_layout.addWidget(caja)
-        resumen_layout.addStretch(1)
-        vbox.addWidget(resumen_group)
 
         self.trade_table = QtWidgets.QTableWidget(0, 7)
         self.trade_table.setHorizontalHeaderLabels([
@@ -1301,26 +1358,89 @@ class BotWindow(QtWidgets.QWidget):
             self.strategy_checkboxes[name] = checkbox
         layout.addStretch(1)
 
+    def _build_asset_summary_tab(self) -> None:
+        tab = QtWidgets.QWidget()
+        self.tabs.addTab(tab, "Resumen de activo")
+        grid = QtWidgets.QGridLayout(tab)
+        columnas = 2
+        for indice, symbol in enumerate(SYMBOLS):
+            caja = QtWidgets.QGroupBox(symbol)
+            caja_layout = QtWidgets.QVBoxLayout(caja)
+            confianza = QtWidgets.QLabel("Confianza: -")
+            activas = QtWidgets.QLabel(f"Estrategias activas: 0/{TOTAL_STRATEGY_COUNT}")
+            alineadas = QtWidgets.QLabel("Estrategias alineadas: 0/0")
+            direccion = QtWidgets.QLabel("Dirección dominante: -")
+            motivo = QtWidgets.QLabel("Motivo principal: -")
+            motivo.setWordWrap(True)
+            for etiqueta in (confianza, activas, alineadas, direccion, motivo):
+                caja_layout.addWidget(etiqueta)
+            caja_layout.addStretch(1)
+            fila = indice // columnas
+            columna = indice % columnas
+            grid.addWidget(caja, fila, columna)
+            self.asset_summary_labels[symbol] = {
+                'confidence': confianza,
+                'active': activas,
+                'aligned': alineadas,
+                'direction': direccion,
+                'reason': motivo,
+            }
+        for columna in range(columnas):
+            grid.setColumnStretch(columna, 1)
+        grid.setRowStretch((len(SYMBOLS) + columnas - 1) // columnas, 1)
+
     def _build_settings_tab(self) -> None:
         tab = QtWidgets.QWidget()
         self.tabs.addTab(tab, "Configuración")
         form = QtWidgets.QFormLayout(tab)
         self.ai_phase_value = QtWidgets.QLabel("Pasivo")
         self.ai_accuracy_value = QtWidgets.QLabel("0.0%")
-        self.daily_limit_value = QtWidgets.QLabel(f"{MAX_DAILY_LOSS:.2f}")
-        self.take_profit_value = QtWidgets.QLabel(f"{MAX_DAILY_PROFIT:.2f}")
-        self.drawdown_value = QtWidgets.QLabel(f"{MAX_DRAWDOWN:.2f}")
+        self.daily_loss_spin = QtWidgets.QDoubleSpinBox()
+        self.daily_loss_spin.setRange(-10000.0, 0.0)
+        self.daily_loss_spin.setDecimals(2)
+        self.daily_loss_spin.setSingleStep(1.0)
+        self.daily_loss_spin.setValue(self.engine.risk.max_daily_loss)
+        self.daily_loss_spin.valueChanged.connect(lambda valor: self.engine.set_daily_loss_limit(valor))
+        self.take_profit_spin = QtWidgets.QDoubleSpinBox()
+        self.take_profit_spin.setRange(0.0, 10000.0)
+        self.take_profit_spin.setDecimals(2)
+        self.take_profit_spin.setSingleStep(1.0)
+        self.take_profit_spin.setValue(self.engine.risk.daily_profit_target)
+        self.take_profit_spin.valueChanged.connect(lambda valor: self.engine.set_daily_profit_target(valor))
+        self.drawdown_spin = QtWidgets.QDoubleSpinBox()
+        self.drawdown_spin.setRange(-10000.0, 0.0)
+        self.drawdown_spin.setDecimals(2)
+        self.drawdown_spin.setSingleStep(1.0)
+        self.drawdown_spin.setValue(self.engine.risk.max_drawdown_allowed)
+        self.drawdown_spin.valueChanged.connect(lambda valor: self.engine.set_max_drawdown(valor))
         self.ml_state_label = QtWidgets.QLabel("IA adaptativa lista")
         form.addRow("Fase IA", self.ai_phase_value)
         form.addRow("Precisión IA", self.ai_accuracy_value)
-        form.addRow("Límite diario de pérdida", self.daily_limit_value)
-        form.addRow("Objetivo diario de ganancia", self.take_profit_value)
-        form.addRow("Máx. drawdown", self.drawdown_value)
+        form.addRow("Límite diario de pérdida", self.daily_loss_spin)
+        form.addRow("Objetivo diario de ganancia", self.take_profit_spin)
+        form.addRow("Máx. drawdown", self.drawdown_spin)
         form.addRow("Motor de aprendizaje", self.ml_state_label)
+
+        control_group = QtWidgets.QGroupBox("Control de apagado automático")
+        control_layout = QtWidgets.QGridLayout(control_group)
+        self.auto_shutdown_checkbox = QtWidgets.QCheckBox("Activar apagado automático")
+        control_layout.addWidget(self.auto_shutdown_checkbox, 0, 0, 1, 2)
+        etiqueta_limite = QtWidgets.QLabel("Apagar bot tras perder X operaciones seguidas:")
+        self.auto_shutdown_spin = QtWidgets.QSpinBox()
+        self.auto_shutdown_spin.setRange(1, 50)
+        self.auto_shutdown_spin.setValue(3)
+        control_layout.addWidget(etiqueta_limite, 1, 0)
+        control_layout.addWidget(self.auto_shutdown_spin, 1, 1)
+        form.addRow(control_group)
+        self.auto_shutdown_checkbox.toggled.connect(self._update_auto_shutdown)
+        self.auto_shutdown_spin.valueChanged.connect(self._update_auto_shutdown)
+        self._update_auto_shutdown()
 
     def start_trading(self) -> None:
         if self.thread is not None and self.thread.isRunning():
             return
+        self.auto_shutdown_active = False
+        self.engine.auto_shutdown_triggered = False
         self.thread = TradingThread(self.engine)
         self.thread.finished.connect(self._on_thread_finished)
         self.thread.start()
@@ -1330,6 +1450,11 @@ class BotWindow(QtWidgets.QWidget):
 
     def stop_trading(self) -> None:
         if self.thread is None:
+            if self.auto_shutdown_active:
+                self.auto_shutdown_active = False
+                self.start_button.setEnabled(True)
+                self.stop_button.setEnabled(False)
+                self.status_label.setText("Estado: Detenido")
             return
         self.thread.stop()
         self.thread.wait(2000)
@@ -1337,11 +1462,24 @@ class BotWindow(QtWidgets.QWidget):
         self.start_button.setEnabled(True)
         self.stop_button.setEnabled(False)
         self.status_label.setText("Estado: Detenido")
+        self.auto_shutdown_active = False
+
+    def _on_trade_amount_changed(self, value: float) -> None:
+        self.engine.set_trade_amount(value)
 
     def _handle_strategy_toggle(self, name: str, state: int) -> None:
         enabled = state == QtCore.Qt.Checked
         self.engine.set_strategy_state(name, enabled)
         self._save_strategy_config()
+
+    def _update_auto_shutdown(self) -> None:
+        habilitado = self.auto_shutdown_checkbox.isChecked()
+        limite = self.auto_shutdown_spin.value()
+        self.engine.configure_auto_shutdown(habilitado, limite)
+        if not habilitado and self.auto_shutdown_active:
+            self.auto_shutdown_active = False
+            if self.thread is None:
+                self.start_button.setEnabled(True)
 
     def _on_trade(self, record: TradeRecord, stats: Dict[str, float]) -> None:
         self.latest_stats = stats
@@ -1360,9 +1498,26 @@ class BotWindow(QtWidgets.QWidget):
         if self.trade_table.rowCount() > 250:
             self.trade_table.removeRow(self.trade_table.rowCount() - 1)
         self._update_stats_labels(stats)
-        self._update_asset_summary(record)
+        metadata = record.metadata
+        summary_data = {
+            'confidence': metadata.get('confidence_value', record.confidence),
+            'confidence_label': metadata.get('confidence_label', 'Baja'),
+            'active': metadata.get('active', 0),
+            'signals': metadata.get('signals', 0),
+            'aligned': metadata.get('aligned', 0),
+            'signal': metadata.get('direction', record.decision),
+            'dominant': metadata.get('dominant', record.decision),
+            'main_reason': metadata.get('main_reason', 'Motivo no disponible'),
+        }
+        self._update_asset_summary_from_dict(record.symbol, summary_data)
 
     def _on_status(self, status: str) -> None:
+        if status == "auto_shutdown":
+            self.auto_shutdown_active = True
+            self.status_label.setText("Estado: Apagado automático")
+            self.start_button.setEnabled(False)
+            self.stop_button.setEnabled(True)
+            return
         mapping = {
             "connecting": "Estado: Conectando...",
             "running": "Estado: Ejecutando",
@@ -1373,14 +1528,23 @@ class BotWindow(QtWidgets.QWidget):
             self.start_button.setEnabled(False)
             self.stop_button.setEnabled(True)
         if status == "stopped":
-            self.start_button.setEnabled(True)
-            self.stop_button.setEnabled(False)
+            if self.auto_shutdown_active:
+                self.start_button.setEnabled(False)
+                self.stop_button.setEnabled(True)
+            else:
+                self.start_button.setEnabled(True)
+                self.stop_button.setEnabled(False)
 
     def _on_thread_finished(self) -> None:
         self.thread = None
-        self.start_button.setEnabled(True)
-        self.stop_button.setEnabled(False)
-        self.status_label.setText("Estado: Detenido")
+        if self.auto_shutdown_active:
+            self.start_button.setEnabled(False)
+            self.stop_button.setEnabled(True)
+            self.status_label.setText("Estado: Apagado automático")
+        else:
+            self.start_button.setEnabled(True)
+            self.stop_button.setEnabled(False)
+            self.status_label.setText("Estado: Detenido")
 
     def _append_log(self, message: str) -> None:
         self.log_view.appendPlainText(message)
@@ -1394,23 +1558,68 @@ class BotWindow(QtWidgets.QWidget):
         self.stats_values["Ganancia diaria"].setText(f"${stats.get('daily_pnl', 0.0):.2f}")
         self.stats_values["Precisión"].setText(f"{stats.get('accuracy', 0.0):.1f}%")
 
-    def _update_asset_summary(self, record: TradeRecord) -> None:
-        etiquetas = self.asset_summary_labels.get(record.symbol)
+    def _on_summary(self, symbol: str, data: Dict[str, Any]) -> None:
+        resumen = {
+            'confidence': data.get('confidence', 0.0),
+            'confidence_label': data.get('confidence_label', 'Baja'),
+            'active': data.get('active', 0),
+            'signals': data.get('signals', 0),
+            'aligned': data.get('aligned', 0),
+            'signal': data.get('signal', 'NONE'),
+            'dominant': data.get('dominant', data.get('signal', 'NONE')),
+            'main_reason': data.get('main_reason', 'Motivo no disponible'),
+        }
+        self._update_asset_summary_from_dict(symbol, resumen)
+
+    def _update_asset_summary_from_dict(self, symbol: str, data: Dict[str, Any]) -> None:
+        etiquetas = self.asset_summary_labels.get(symbol)
         if not etiquetas:
             return
-        confianza_label = record.metadata.get('confidence_label', 'Baja')
-        confianza_valor = record.confidence
+        confianza_valor = float(data.get('confidence', 0.0))
+        confianza_label = str(data.get('confidence_label', 'Baja'))
         etiquetas['confidence'].setText(f"Confianza: {confianza_label} ({confianza_valor:.2f})")
-        activos = int(record.metadata.get('active', 0))
+        activos = int(data.get('active', 0))
         etiquetas['active'].setText(f"Estrategias activas: {activos}/{TOTAL_STRATEGY_COUNT}")
-        alineadas = int(record.metadata.get('aligned', 0))
-        señales = int(record.metadata.get('signals', activos))
-        divisor = señales if señales else max(activos, 1)
+        señales = int(data.get('signals', 0))
+        alineadas = int(data.get('aligned', 0))
+        divisor = señales if señales else activos
+        if divisor <= 0:
+            divisor = 1
         etiquetas['aligned'].setText(f"Estrategias alineadas: {alineadas}/{divisor}")
-        direccion = record.metadata.get('direction', record.decision)
+        direccion = str(data.get('signal', 'NONE'))
+        if direccion == 'NONE':
+            direccion = str(data.get('dominant', 'NONE'))
         etiquetas['direction'].setText(f"Dirección dominante: {direccion}")
-        motivo = record.metadata.get('main_reason', 'Motivo no disponible')
+        self._apply_direction_style(etiquetas['direction'], direccion)
+        motivo = str(data.get('main_reason', 'Motivo no disponible'))
         etiquetas['reason'].setText(f"Motivo principal: {motivo}")
+
+    def _apply_direction_style(self, label: QtWidgets.QLabel, direction: str) -> None:
+        direction_upper = direction.upper()
+        if direction_upper == 'CALL':
+            label.setStyleSheet("color: #66bb6a;")
+        elif direction_upper == 'PUT':
+            label.setStyleSheet("color: #ef5350;")
+        else:
+            label.setStyleSheet("color: #b0bec5;")
+
+    def _initialize_asset_summary(self) -> None:
+        estados = self.engine.get_strategy_states()
+        activos = sum(1 for habilitada in estados.values() if habilitada)
+        for symbol in SYMBOLS:
+            self._update_asset_summary_from_dict(
+                symbol,
+                {
+                    'confidence': 0.0,
+                    'confidence_label': 'Baja',
+                    'active': activos,
+                    'signals': 0,
+                    'aligned': 0,
+                    'signal': 'NONE',
+                    'dominant': 'NONE',
+                    'main_reason': 'Aún sin datos',
+                },
+            )
 
     def _refresh_phase(self) -> None:
         raw_phase = self.engine.ai._phase()
