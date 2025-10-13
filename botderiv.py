@@ -65,6 +65,13 @@ last_waiting_log: Optional[datetime] = None
 WAITING_MESSAGE = "⏳ Esperando que finalice la operación activa..."
 RESUME_MESSAGE = "✅ Operación finalizada, retomando análisis del mercado..."
 TIMEOUT_MESSAGE = "⚠️ Tiempo de espera agotado — restableciendo estado de operación y reanudando análisis del mercado."
+COOLDOWN_SECONDS = 60
+COOLDOWN_LOG_INTERVAL = 5
+cooldown_active = False
+cooldown_start: Optional[datetime] = None
+last_cooldown_log: Optional[datetime] = None
+COOLDOWN_WAIT_MESSAGE = "⏳ Esperando cooldown antes de la próxima operación..."
+COOLDOWN_END_MESSAGE = "🔁 Cooldown finalizado, reanudando análisis del mercado..."
 
 
 # ===============================================================
@@ -991,16 +998,25 @@ class TradingEngine:
         self.stop()
 
 
+    def _start_cooldown(self) -> None:
+        global cooldown_active, cooldown_start, last_cooldown_log
+        cooldown_active = True
+        cooldown_start = datetime.now(timezone.utc)
+        last_cooldown_log = None
+        self._notify_trade_state('waiting')
+
+
     def execute_cycle(self, symbol: str) -> None:
-        global operation_active, trade_start_time, last_waiting_log
+        global operation_active, trade_start_time, last_waiting_log, cooldown_active, cooldown_start, last_cooldown_log
+        now = datetime.now(timezone.utc)
         if operation_active:
-            now = datetime.now(timezone.utc)
             if trade_start_time is not None and (now - trade_start_time).total_seconds() >= 180:
                 operation_active = False
                 trade_start_time = None
                 last_waiting_log = None
                 logging.warning(TIMEOUT_MESSAGE)
-                self._notify_trade_state("ready")
+                self._start_cooldown()
+                self._notify_trade_state("waiting")
             else:
                 if last_waiting_log is None or (now - last_waiting_log).total_seconds() >= 2:
                     logging.info(WAITING_MESSAGE)
@@ -1008,6 +1024,20 @@ class TradingEngine:
                 self._notify_trade_state("waiting")
                 time.sleep(2)
             return
+        if cooldown_active:
+            if cooldown_start is not None and (now - cooldown_start).total_seconds() >= COOLDOWN_SECONDS:
+                cooldown_active = False
+                cooldown_start = None
+                last_cooldown_log = None
+                logging.info(COOLDOWN_END_MESSAGE)
+                self._notify_trade_state("ready")
+            else:
+                if last_cooldown_log is None or (now - last_cooldown_log).total_seconds() >= COOLDOWN_LOG_INTERVAL:
+                    logging.info(COOLDOWN_WAIT_MESSAGE)
+                    last_cooldown_log = now
+                self._notify_trade_state("waiting")
+                time.sleep(COOLDOWN_LOG_INTERVAL)
+                return
         reprocess = True
         while reprocess and self.running.is_set():
             reprocess = False
@@ -1083,7 +1113,7 @@ class TradingEngine:
             if not self.risk.can_trade(ai_confidence):
                 self._notify_trade_state("ready")
                 return
-            if operation_active:
+            if operation_active or cooldown_active:
                 return
             contract_id, price = self.api.buy(symbol, signal, self.trade_amount)
             if contract_id is None:
@@ -1187,10 +1217,10 @@ class TradingEngine:
             last_waiting_log = None
             self.active_trade_symbol = None
             logging.info(RESUME_MESSAGE)
-            self._notify_trade_state('ready')
+            self._start_cooldown()
 
     def run(self) -> None:
-        global operation_active, trade_start_time, last_waiting_log
+        global operation_active, trade_start_time, last_waiting_log, cooldown_active, cooldown_start, last_cooldown_log
         self.running.set()
         self._notify_status("connecting")
         self.api.connect()
@@ -1198,6 +1228,9 @@ class TradingEngine:
         operation_active = False
         trade_start_time = None
         last_waiting_log = None
+        cooldown_active = False
+        cooldown_start = None
+        last_cooldown_log = None
         self._notify_trade_state("ready")
         try:
             while self.running.is_set():
@@ -1215,11 +1248,14 @@ class TradingEngine:
             self._notify_status("stopped")
 
     def stop(self) -> None:
-        global operation_active, trade_start_time, last_waiting_log
+        global operation_active, trade_start_time, last_waiting_log, cooldown_active, cooldown_start, last_cooldown_log
         self.running.clear()
         operation_active = False
         trade_start_time = None
         last_waiting_log = None
+        cooldown_active = False
+        cooldown_start = None
+        last_cooldown_log = None
         self.active_trade_symbol = None
         self._notify_trade_state("ready")
         try:
