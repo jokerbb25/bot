@@ -60,11 +60,9 @@ warnings.filterwarnings("ignore", category=DeprecationWarning)
 warnings.filterwarnings("ignore", category=RuntimeWarning, message="overflow encountered in exp")
 
 operation_active = False
-trade_start_time: Optional[datetime] = None
-last_waiting_log: Optional[datetime] = None
-WAITING_MESSAGE = "⏳ Esperando que finalice la operación activa..."
-RESUME_MESSAGE = "✅ Operación finalizada, retomando análisis del mercado..."
-TIMEOUT_MESSAGE = "⚠️ Tiempo de espera agotado — restableciendo estado de operación y reanudando análisis del mercado."
+TRADE_DURATION_SECONDS = 60
+RESULT_POLL_INTERVAL = 5
+RESUME_MESSAGE = "🔁 Reanudando análisis del mercado..."
 COOLDOWN_SECONDS = 60
 COOLDOWN_LOG_INTERVAL = 5
 cooldown_active = False
@@ -833,7 +831,7 @@ class DerivWebSocket:
                     )
                 return candles
 
-    def buy(self, symbol: str, direction: str, amount: float) -> Tuple[Optional[int], float]:
+    def buy(self, symbol: str, direction: str, amount: float) -> Tuple[Optional[int], int]:
         req_id = self._send(
             {
                 "proposal": 1,
@@ -861,8 +859,44 @@ class DerivWebSocket:
             if msg.get("req_id") == buy_id:
                 if "error" in msg:
                     logging.warning(f"Error al comprar contrato: {msg['error']}")
-                    return None, 0.0
-                return msg["buy"]["contract_id"], float(proposal["ask_price"])
+                    return None, 0
+                duration_val = int(proposal.get("duration", 1))
+                unit = str(proposal.get("duration_unit", "m")).lower()
+                if unit == "s":
+                    duration_seconds = duration_val
+                elif unit == "h":
+                    duration_seconds = duration_val * 3600
+                elif unit == "d":
+                    duration_seconds = duration_val * 86400
+                else:
+                    duration_seconds = duration_val * 60
+                return msg["buy"]["contract_id"], duration_seconds
+
+    def check_trade_result(self, contract_id: int, retries: int = 6, delay: float = 3.0) -> str:
+        for attempt in range(retries):
+            try:
+                req_id = self._send({"proposal_open_contract": 1, "contract_id": contract_id})
+                while True:
+                    msg = self._recv()
+                    if msg.get("req_id") == req_id:
+                        if "error" in msg:
+                            raise RuntimeError(msg["error"].get("message", "Error desconocido"))
+                        data = msg.get("proposal_open_contract", {})
+                        status = str(data.get("status", "")).lower()
+                        if status in {"won", "lost"}:
+                            return status
+                        if data.get("is_sold"):
+                            profit_raw = data.get("profit")
+                            try:
+                                profit_val = float(profit_raw)
+                            except (TypeError, ValueError):
+                                profit_val = 0.0
+                            return "won" if profit_val > 0 else "lost"
+                        break
+            except Exception as exc:
+                logging.warning(f"[{contract_id}] Error al consultar resultado: {exc}")
+            time.sleep(delay)
+        return "unknown"
 
 
 # ===============================================================
@@ -983,11 +1017,6 @@ class TradingEngine:
         consensus = combine_signals(results, active_states)
         return results, consensus
 
-    def _simulate_result(self) -> Tuple[str, float]:
-        outcome = np.random.rand() > 0.5
-        pnl = self.trade_amount * PAYOUT if outcome else -self.trade_amount
-        return ("WIN" if outcome else "LOSS"), pnl
-
     def _handle_auto_shutdown(self) -> None:
         if self.auto_shutdown_triggered:
             return
@@ -1005,24 +1034,45 @@ class TradingEngine:
         last_cooldown_log = None
         self._notify_trade_state('waiting')
 
+    def _wait_for_contract_result(self, contract_id: int, duration_seconds: int) -> str:
+        end_time = datetime.now(timezone.utc) + timedelta(seconds=duration_seconds)
+        logging.info(f"⏳ Esperando resultado real del contrato #{contract_id}...")
+        while True:
+            now = datetime.now(timezone.utc)
+            remaining = int((end_time - now).total_seconds())
+            if remaining <= 0:
+                break
+            logging.info(f"⌛ Contrato #{contract_id} — {remaining}s restantes...")
+            time.sleep(min(RESULT_POLL_INTERVAL, max(1, remaining)))
+        status = self.api.check_trade_result(contract_id)
+        if status == "won":
+            logging.info(f"✅ Contrato #{contract_id} GANADO")
+        elif status == "lost":
+            logging.info(f"❌ Contrato #{contract_id} PERDIDO")
+        else:
+            logging.info(f"⚠️ Contrato #{contract_id} sin resultado confirmado, reintentando...")
+            status = self.api.check_trade_result(contract_id, retries=3, delay=5.0)
+            if status == "won":
+                logging.info(f"✅ Contrato #{contract_id} GANADO")
+            elif status == "lost":
+                logging.info(f"❌ Contrato #{contract_id} PERDIDO")
+            else:
+                logging.info(f"⚠️ Contrato #{contract_id} continúa sin resultado tras múltiples intentos")
+        return status
+
+    def _resolve_trade_result(self, status: str) -> Tuple[str, float]:
+        if status == "won":
+            return "WIN", self.trade_amount * PAYOUT
+        if status == "lost":
+            return "LOSS", -self.trade_amount
+        return "UNKNOWN", 0.0
+
 
     def execute_cycle(self, symbol: str) -> None:
-        global operation_active, trade_start_time, last_waiting_log, cooldown_active, cooldown_start, last_cooldown_log
+        global operation_active, cooldown_active, cooldown_start, last_cooldown_log
         now = datetime.now(timezone.utc)
         if operation_active:
-            if trade_start_time is not None and (now - trade_start_time).total_seconds() >= 180:
-                operation_active = False
-                trade_start_time = None
-                last_waiting_log = None
-                logging.warning(TIMEOUT_MESSAGE)
-                self._start_cooldown()
-                self._notify_trade_state("waiting")
-            else:
-                if last_waiting_log is None or (now - last_waiting_log).total_seconds() >= 2:
-                    logging.info(WAITING_MESSAGE)
-                    last_waiting_log = now
-                self._notify_trade_state("waiting")
-                time.sleep(2)
+            time.sleep(2)
             return
         if cooldown_active:
             if cooldown_start is not None and (now - cooldown_start).total_seconds() >= COOLDOWN_SECONDS:
@@ -1038,130 +1088,95 @@ class TradingEngine:
                 self._notify_trade_state("waiting")
                 time.sleep(COOLDOWN_LOG_INTERVAL)
                 return
-        reprocess = True
-        while reprocess and self.running.is_set():
-            reprocess = False
-            candles = self.api.fetch_candles(symbol)
-            df = to_dataframe(candles)
-            results, consensus = self._evaluate_strategies(df)
-            self._notify_summary(symbol, consensus)
-            signal = consensus['signal']
-            confidence = consensus['confidence']
-            reasons = consensus['reasons']
-            for nombre, resultado in results:
-                etiqueta = STRATEGY_DISPLAY_NAMES.get(nombre, nombre)
-                mensaje = resultado.reasons[0] if resultado.reasons else 'Sin comentario'
-                logging.info(f'[{symbol}] {etiqueta}: {mensaje} (señal {resultado.signal})')
-            active_total = consensus['active']
-            signals_total = consensus['signals']
-            if active_total == 0:
-                logging.info('⚠️ Sin estrategias activas configuradas')
-                self._notify_trade_state("ready")
-                return
-            if signals_total == 0:
-                logging.info('⚠️ Ninguna de las estrategias activas generó señal')
-                logging.info(f"Estrategias activas: {active_total}/{TOTAL_STRATEGY_COUNT}")
-                self._notify_trade_state("ready")
-                return
-            logging.info(f"Estrategias con señal: {signals_total}/{active_total}")
-            etiqueta_conf = consensus['confidence_label'].lower()
-            if signal == 'NONE':
-                logging.info(f"⚠️ Confianza {etiqueta_conf} ({confidence:.2f}) → {consensus['main_reason']}")
-                logging.info(f"Estrategias activas: {active_total}/{TOTAL_STRATEGY_COUNT}")
-                if consensus['low_volatility']:
-                    valor_vol = consensus['volatility_value']
-                    detalle = f" ({valor_vol:.4f})" if valor_vol is not None else ''
-                    logging.info(f"⚠️ Volatilidad baja detectada{detalle}")
-                self._notify_trade_state("ready")
-                return
-            logging.info(f"📊 Confianza {etiqueta_conf} ({confidence:.2f}) → {consensus['main_reason']}")
-            logging.info(f"Estrategias alineadas: {consensus['aligned']}/{signals_total}")
+        candles = self.api.fetch_candles(symbol)
+        df = to_dataframe(candles)
+        results, consensus = self._evaluate_strategies(df)
+        self._notify_summary(symbol, consensus)
+        signal = consensus['signal']
+        confidence = consensus['confidence']
+        reasons = consensus['reasons']
+        for nombre, resultado in results:
+            etiqueta = STRATEGY_DISPLAY_NAMES.get(nombre, nombre)
+            mensaje = resultado.reasons[0] if resultado.reasons else 'Sin comentario'
+            logging.info(f'[{symbol}] {etiqueta}: {mensaje} (señal {resultado.signal})')
+        active_total = consensus['active']
+        signals_total = consensus['signals']
+        if active_total == 0:
+            logging.info('⚠️ Sin estrategias activas configuradas')
+            self._notify_trade_state("ready")
+            return
+        if signals_total == 0:
+            logging.info('⚠️ Ninguna de las estrategias activas generó señal')
+            logging.info(f"Estrategias activas: {active_total}/{TOTAL_STRATEGY_COUNT}")
+            self._notify_trade_state("ready")
+            return
+        logging.info(f"Estrategias con señal: {signals_total}/{active_total}")
+        etiqueta_conf = consensus['confidence_label'].lower()
+        if signal == 'NONE':
+            logging.info(f"⚠️ Confianza {etiqueta_conf} ({confidence:.2f}) → {consensus['main_reason']}")
             logging.info(f"Estrategias activas: {active_total}/{TOTAL_STRATEGY_COUNT}")
             if consensus['low_volatility']:
                 valor_vol = consensus['volatility_value']
                 detalle = f" ({valor_vol:.4f})" if valor_vol is not None else ''
-                if consensus['override']:
-                    if 'RSI' in consensus['override_reason']:
-                        logging.info('🚫 Volatilidad baja pero señal fuerte RSI → operación anticipada')
-                    else:
-                        logging.info(f"🚫 Volatilidad baja pero {consensus['override_reason'].lower()} → operación anticipada")
-                else:
-                    logging.info(f"⚠️ Volatilidad baja detectada{detalle}")
-            logging.info(f"✅ Señal final: {signal} | Confianza {confidence:.2f} | Estrategias activas: {active_total}/{TOTAL_STRATEGY_COUNT}")
-            features = build_feature_vector(df, reasons, results)
-            ai_prob = None
-            if AI_ENABLED:
-                api_prob = query_ai_backend(features)
-                if api_prob is not None:
-                    ai_prob = api_prob
-            ai_confidence = confidence
-            ai_notes: List[str] = []
-            internal_prob, internal_notes = self.ai.predict(features)
-            if internal_notes:
-                ai_notes.extend(internal_notes)
-            if ai_prob is not None:
-                if internal_prob != 0.5:
-                    ai_prob = (ai_prob + internal_prob) / 2
-                    ai_notes.append('Mezcla adaptativa aplicada')
-                fused = self.ai.fuse_with_technical(confidence, ai_prob)
-                ai_confidence = fused
-                ai_notes.append(f'Mezcla IA {ai_prob:.2f}')
-            elif internal_prob != 0.5:
-                fused = self.ai.fuse_with_technical(confidence, internal_prob)
-                ai_confidence = fused
-                ai_notes.append(f'Núcleo adaptativo {internal_prob:.2f}')
-            if not self.risk.can_trade(ai_confidence):
-                self._notify_trade_state("ready")
-                return
-            if operation_active or cooldown_active:
-                return
-            contract_id, price = self.api.buy(symbol, signal, self.trade_amount)
-            if contract_id is None:
-                logging.warning('No se pudo abrir la operación, se reanuda el análisis.')
-                self._notify_trade_state("ready")
-                return
-            operation_active = True
-            trade_start_time = datetime.now(timezone.utc)
-            last_waiting_log = trade_start_time
-            logging.info(WAITING_MESSAGE)
-            self.active_trade_symbol = symbol
-            self._notify_trade_state('active')
-            ema_diff = df['close'].iloc[-1] - df['close'].iloc[-2]
-            latest_rsi = float(rsi(df['close']).iloc[-1])
-            threading.Thread(
-                target=self._finalize_trade,
-                args=(
-                    symbol,
-                    signal,
-                    ai_confidence,
-                    list(reasons),
-                    list(ai_notes),
-                    dict(consensus),
-                    features.copy(),
-                    ema_diff,
-                    latest_rsi,
-                ),
-                daemon=True,
-            ).start()
+                logging.info(f"⚠️ Volatilidad baja detectada{detalle}")
+            self._notify_trade_state("ready")
             return
-
-    def _finalize_trade(
-        self,
-        symbol: str,
-        signal: str,
-        ai_confidence: float,
-        reasons: List[str],
-        ai_notes: List[str],
-        consensus: Dict[str, Any],
-        features: np.ndarray,
-        ema_diff: float,
-        latest_rsi: float,
-    ) -> None:
-        global operation_active, trade_start_time, last_waiting_log
+        logging.info(f"📊 Confianza {etiqueta_conf} ({confidence:.2f}) → {consensus['main_reason']}")
+        logging.info(f"Estrategias alineadas: {consensus['aligned']}/{signals_total}")
+        logging.info(f"Estrategias activas: {active_total}/{TOTAL_STRATEGY_COUNT}")
+        if consensus['low_volatility']:
+            valor_vol = consensus['volatility_value']
+            detalle = f" ({valor_vol:.4f})" if valor_vol is not None else ''
+            if consensus['override']:
+                if 'RSI' in consensus['override_reason']:
+                    logging.info('🚫 Volatilidad baja pero señal fuerte RSI → operación anticipada')
+                else:
+                    logging.info(f"🚫 Volatilidad baja pero {consensus['override_reason'].lower()} → operación anticipada")
+            else:
+                logging.info(f"⚠️ Volatilidad baja detectada{detalle}")
+        logging.info(f"✅ Señal final: {signal} | Confianza {confidence:.2f} | Estrategias activas: {active_total}/{TOTAL_STRATEGY_COUNT}")
+        features = build_feature_vector(df, reasons, results)
+        ai_prob = None
+        if AI_ENABLED:
+            api_prob = query_ai_backend(features)
+            if api_prob is not None:
+                ai_prob = api_prob
+        ai_confidence = confidence
+        ai_notes: List[str] = []
+        internal_prob, internal_notes = self.ai.predict(features)
+        if internal_notes:
+            ai_notes.extend(internal_notes)
+        if ai_prob is not None:
+            if internal_prob != 0.5:
+                ai_prob = (ai_prob + internal_prob) / 2
+                ai_notes.append('Mezcla adaptativa aplicada')
+            fused = self.ai.fuse_with_technical(confidence, ai_prob)
+            ai_confidence = fused
+            ai_notes.append(f'Mezcla IA {ai_prob:.2f}')
+        elif internal_prob != 0.5:
+            fused = self.ai.fuse_with_technical(confidence, internal_prob)
+            ai_confidence = fused
+            ai_notes.append(f'Núcleo adaptativo {internal_prob:.2f}')
+        if not self.risk.can_trade(ai_confidence):
+            self._notify_trade_state("ready")
+            return
+        if operation_active or cooldown_active:
+            return
+        contract_id, duration_seconds = self.api.buy(symbol, signal, self.trade_amount)
+        if contract_id is None:
+            logging.warning('No se pudo abrir la operación, se reanuda el análisis.')
+            self._notify_trade_state("ready")
+            return
+        operation_active = True
+        self.active_trade_symbol = symbol
+        self._notify_trade_state('active')
+        dur_seconds = duration_seconds if duration_seconds > 0 else TRADE_DURATION_SECONDS
+        logging.info(f"🟢 Operación abierta — Contrato #{contract_id} | Duración: {dur_seconds}s")
         try:
-            result, pnl = self._simulate_result()
+            result_status = self._wait_for_contract_result(contract_id, dur_seconds)
+            trade_result, pnl = self._resolve_trade_result(result_status)
             self.risk.register_trade(pnl)
-            self.ai.log_trade(features, 1 if result == 'WIN' else 0)
+            self.ai.log_trade(features, 1 if trade_result == 'WIN' else 0)
             record_metadata = {
                 'confidence_label': consensus['confidence_label'],
                 'confidence_value': consensus['confidence'],
@@ -1177,24 +1192,27 @@ class TradingEngine:
                 'dominant': consensus['dominant'],
                 'total_weight': consensus['total_weight'],
                 'active_weight': consensus.get('active_weight', 0.0),
+                'contract_id': contract_id,
             }
             record = TradeRecord(
                 timestamp=datetime.now(timezone.utc),
                 symbol=symbol,
                 decision=signal,
                 confidence=ai_confidence,
-                result=result,
+                result=trade_result,
                 pnl=pnl,
                 reasons=reasons + ai_notes,
                 metadata=record_metadata,
             )
             log_trade(record)
-            if result == 'WIN':
+            if trade_result == 'WIN':
                 self.win_count += 1
-            else:
+            elif trade_result == 'LOSS':
                 self.loss_count += 1
             with self.lock:
                 self.trade_history.append(record)
+            ema_diff = df['close'].iloc[-1] - df['close'].iloc[-2]
+            latest_rsi = float(rsi(df['close']).iloc[-1])
             logging.info(
                 f"{record.timestamp:%Y-%m-%d %H:%M:%S} INFO: [{symbol}] {signal} @{ai_confidence:.2f} | EMA:{ema_diff:.2f} RSI:{latest_rsi:.2f} | Motivos: {'; '.join(reasons)}"
             )
@@ -1204,30 +1222,26 @@ class TradingEngine:
             if (
                 self.auto_shutdown_enabled
                 and not self.auto_shutdown_triggered
-                and result == 'LOSS'
+                and trade_result == 'LOSS'
                 and self.auto_shutdown_limit > 0
                 and self.risk.consecutive_losses >= self.auto_shutdown_limit
             ):
                 self._handle_auto_shutdown()
         except Exception as exc:
-            logging.warning(f"Error al finalizar la operación: {exc}")
+            logging.warning(f"Error al gestionar la operación #{contract_id}: {exc}")
         finally:
             operation_active = False
-            trade_start_time = None
-            last_waiting_log = None
             self.active_trade_symbol = None
             logging.info(RESUME_MESSAGE)
             self._start_cooldown()
 
     def run(self) -> None:
-        global operation_active, trade_start_time, last_waiting_log, cooldown_active, cooldown_start, last_cooldown_log
+        global operation_active, cooldown_active, cooldown_start, last_cooldown_log
         self.running.set()
         self._notify_status("connecting")
         self.api.connect()
         self._notify_status("running")
         operation_active = False
-        trade_start_time = None
-        last_waiting_log = None
         cooldown_active = False
         cooldown_start = None
         last_cooldown_log = None
@@ -1248,11 +1262,9 @@ class TradingEngine:
             self._notify_status("stopped")
 
     def stop(self) -> None:
-        global operation_active, trade_start_time, last_waiting_log, cooldown_active, cooldown_start, last_cooldown_log
+        global operation_active, cooldown_active, cooldown_start, last_cooldown_log
         self.running.clear()
         operation_active = False
-        trade_start_time = None
-        last_waiting_log = None
         cooldown_active = False
         cooldown_start = None
         last_cooldown_log = None
