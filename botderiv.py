@@ -4,6 +4,9 @@ import json
 import threading
 import logging
 import warnings
+import csv
+from collections import defaultdict, deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -16,6 +19,7 @@ from ta.momentum import RSIIndicator
 from ta.trend import EMAIndicator, SMAIndicator
 from ta.volatility import BollingerBands, AverageTrueRange
 from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 
@@ -156,6 +160,268 @@ def log_trade(record: TradeRecord) -> None:
             df.to_csv(path, mode="a", header=False, index=False)
     except Exception as exc:  # pragma: no cover
         logging.debug(f"Error al registrar operación: {exc}")
+
+
+class auto_learning:
+    def __init__(self) -> None:
+        self.csv_path = Path("botderivcsv.csv")
+        self.csv_fields = [
+            "asset",
+            "direction",
+            "result",
+            "rsi",
+            "ema",
+            "bollinger",
+            "volatility",
+            "confidence",
+        ]
+        self.lock = threading.Lock()
+        self.model_lock = threading.Lock()
+        self.bias_lock = threading.Lock()
+        self.executor = ThreadPoolExecutor(max_workers=2)
+        self.asset_stats: Dict[str, Dict[str, int]] = defaultdict(lambda: {"wins": 0, "total": 0})
+        self.global_totals = {"wins": 0, "total": 0}
+        self.last_trades: deque = deque(maxlen=50)
+        self.training_data: List[List[float]] = []
+        self.training_labels: List[int] = []
+        self.trade_counter = 0
+        self.model: Optional[RandomForestClassifier] = None
+        self.biases = {"RSI": 0.0, "EMA": 0.0}
+        self.last_prediction = 0.5
+        self.learning_event = threading.Event()
+        self.learning_thread = threading.Thread(target=self._learning_loop, daemon=True)
+        self.learning_thread.start()
+        self._pending_context: Dict[str, Dict[str, float]] = {}
+        self._ensure_csv()
+
+    def _ensure_csv(self) -> None:
+        if self.csv_path.exists():
+            return
+        with self.lock:
+            if self.csv_path.exists():
+                return
+            try:
+                with self.csv_path.open("w", newline="", encoding="utf-8") as handle:
+                    writer = csv.DictWriter(handle, fieldnames=self.csv_fields)
+                    writer.writeheader()
+            except Exception as exc:  # pragma: no cover
+                logging.debug(f"No se pudo crear CSV de autoaprendizaje: {exc}")
+
+    def register_trade_context(self, asset: str, direction: str, confidence: float) -> None:
+        with self.lock:
+            self._pending_context[asset] = {
+                "direction": direction,
+                "confidence": float(confidence),
+            }
+
+    def update_history(self, result: str, asset: str, rsi_value: float, ema_value: float, boll_value: float, volatility_value: float) -> None:
+        self.executor.submit(
+            self._update_history_sync,
+            result,
+            asset,
+            float(rsi_value),
+            float(ema_value),
+            float(boll_value),
+            float(volatility_value),
+        )
+
+    def _update_history_sync(self, result: str, asset: str, rsi_value: float, ema_value: float, boll_value: float, volatility_value: float) -> None:
+        context = self._pop_context(asset)
+        direction = context.get("direction", "NONE")
+        confidence = context.get("confidence", 0.0)
+        self._ensure_csv()
+        with self.lock:
+            try:
+                with self.csv_path.open("a", newline="", encoding="utf-8") as handle:
+                    writer = csv.DictWriter(handle, fieldnames=self.csv_fields)
+                    writer.writerow(
+                        {
+                            "asset": asset,
+                            "direction": direction,
+                            "result": result,
+                            "rsi": f"{rsi_value:.6f}",
+                            "ema": f"{ema_value:.6f}",
+                            "bollinger": f"{boll_value:.6f}",
+                            "volatility": f"{volatility_value:.6f}",
+                            "confidence": f"{confidence:.6f}",
+                        }
+                    )
+            except Exception as exc:  # pragma: no cover
+                logging.debug(f"No se pudo registrar historial de autoaprendizaje: {exc}")
+        resultado = str(result).upper()
+        etiqueta = 1 if resultado == "WIN" else 0 if resultado == "LOSS" else None
+        with self.lock:
+            if etiqueta is not None:
+                stats = self.asset_stats[asset]
+                stats["total"] += 1
+                if etiqueta == 1:
+                    stats["wins"] += 1
+                self.global_totals["total"] += 1
+                if etiqueta == 1:
+                    self.global_totals["wins"] += 1
+            self.last_trades.append(
+                {
+                    "asset": asset,
+                    "direction": direction,
+                    "result": resultado,
+                    "rsi": rsi_value,
+                    "ema": ema_value,
+                    "boll": boll_value,
+                    "volatility": volatility_value,
+                    "confidence": confidence,
+                    "label": etiqueta,
+                }
+            )
+        with self.bias_lock:
+            rsi_bias = self.biases["RSI"]
+            ema_bias = self.biases["EMA"]
+        features = [
+            float(rsi_value + rsi_bias),
+            float(ema_value + ema_bias),
+            float(boll_value),
+            float(volatility_value),
+        ]
+        should_train = False
+        with self.lock:
+            if etiqueta is not None:
+                self.training_data.append(features)
+                self.training_labels.append(etiqueta)
+                if len(self.training_data) > 5000:
+                    self.training_data = self.training_data[-5000:]
+                    self.training_labels = self.training_labels[-5000:]
+            self.trade_counter += 1
+            if self.trade_counter % 100 == 0 and self.trade_counter > 0:
+                should_train = True
+        if should_train:
+            self.executor.submit(self._train_model)
+        self.learning_event.set()
+
+    def _pop_context(self, asset: str) -> Dict[str, float]:
+        with self.lock:
+            return self._pending_context.pop(asset, {}).copy()
+
+    def adjust_bias(self) -> None:
+        self.learning_event.set()
+
+    def _learning_loop(self) -> None:
+        while True:
+            self.learning_event.wait()
+            self.learning_event.clear()
+            try:
+                self._compute_biases()
+            except Exception as exc:  # pragma: no cover
+                logging.debug(f"Error en bucle de autoaprendizaje: {exc}")
+            time.sleep(0.2)
+
+    def _compute_biases(self) -> None:
+        with self.lock:
+            recientes = [item for item in list(self.last_trades)[-30:] if item.get("label") is not None]
+        if not recientes:
+            with self.bias_lock:
+                self.biases["RSI"] *= 0.9
+                self.biases["EMA"] *= 0.9
+            return
+        ganadas = [item for item in recientes if item["label"] == 1]
+        perdidas = [item for item in recientes if item["label"] == 0]
+        if not ganadas or not perdidas:
+            with self.bias_lock:
+                self.biases["RSI"] *= 0.95
+                self.biases["EMA"] *= 0.95
+            return
+        rsi_media_ganadas = float(np.mean([item["rsi"] for item in ganadas]))
+        rsi_media_perdidas = float(np.mean([item["rsi"] for item in perdidas]))
+        ema_media_ganadas = float(np.mean([item["ema"] for item in ganadas]))
+        ema_media_perdidas = float(np.mean([item["ema"] for item in perdidas]))
+        objetivo_rsi = float(np.clip((rsi_media_ganadas - rsi_media_perdidas) / 50.0, -5.0, 5.0))
+        objetivo_ema = float(np.clip((ema_media_ganadas - ema_media_perdidas) / 10.0, -5.0, 5.0))
+        with self.bias_lock:
+            self.biases["RSI"] = self.biases["RSI"] * 0.7 + objetivo_rsi * 0.3
+            self.biases["EMA"] = self.biases["EMA"] * 0.7 + objetivo_ema * 0.3
+
+    def _train_model(self) -> None:
+        with self.lock:
+            datos = np.array(self.training_data, dtype=float) if self.training_data else np.empty((0, 4), dtype=float)
+            etiquetas = np.array(self.training_labels, dtype=int) if self.training_labels else np.empty((0,), dtype=int)
+        if datos.size == 0 or datos.shape[0] < 50:
+            return
+        try:
+            modelo = RandomForestClassifier(n_estimators=80, random_state=42)
+            modelo.fit(datos, etiquetas)
+            with self.model_lock:
+                self.model = modelo
+        except Exception as exc:  # pragma: no cover
+            logging.debug(f"No se pudo entrenar RandomForest interno: {exc}")
+
+    def predict_next(self, rsi_value: float, ema_value: float, boll_value: float, volatility_value: float) -> float:
+        with self.bias_lock:
+            rsi_bias = self.biases["RSI"]
+            ema_bias = self.biases["EMA"]
+        features = np.array(
+            [
+                float(rsi_value + rsi_bias),
+                float(ema_value + ema_bias),
+                float(boll_value),
+                float(volatility_value),
+            ],
+            dtype=float,
+        ).reshape(1, -1)
+        with self.model_lock:
+            modelo = self.model
+        if modelo is None:
+            self.last_prediction = 0.5
+            return 0.5
+        try:
+            proba = float(modelo.predict_proba(features)[0][1])
+        except Exception:
+            proba = 0.5
+        self.last_prediction = proba
+        return proba
+
+    def get_summary(self) -> Dict[str, Any]:
+        with self.lock:
+            per_asset = {asset: (values["wins"] / values["total"] * 100.0) if values["total"] else 0.0 for asset, values in self.asset_stats.items()}
+            for nombre in SYMBOLS:
+                if nombre not in per_asset:
+                    per_asset[nombre] = 0.0
+            total_operaciones = self.global_totals["total"]
+            global_accuracy = (self.global_totals["wins"] / total_operaciones * 100.0) if total_operaciones else 0.0
+            historial = list(self.last_trades)[-5:]
+        with self.bias_lock:
+            bias_snapshot = dict(self.biases)
+        resumen = {
+            "per_asset": per_asset,
+            "global_accuracy": global_accuracy,
+            "last_trades": list(reversed(historial)),
+            "status": self.learning_thread.is_alive(),
+            "biases": bias_snapshot,
+            "last_prediction": self.last_prediction,
+        }
+        return resumen
+
+    def reset_history(self) -> None:
+        self.executor.submit(self._reset_history_sync)
+
+    def _reset_history_sync(self) -> None:
+        with self.lock:
+            self.asset_stats = defaultdict(lambda: {"wins": 0, "total": 0})
+            self.global_totals = {"wins": 0, "total": 0}
+            self.last_trades.clear()
+            self.training_data.clear()
+            self.training_labels.clear()
+            self.trade_counter = 0
+            self._pending_context.clear()
+            try:
+                if self.csv_path.exists():
+                    self.csv_path.unlink()
+            except Exception as exc:  # pragma: no cover
+                logging.debug(f"No se pudo eliminar CSV de autoaprendizaje: {exc}")
+        with self.model_lock:
+            self.model = None
+        self.last_prediction = 0.5
+        self._ensure_csv()
+
+
+auto_learn = auto_learning()
 
 
 # ===============================================================
@@ -1134,6 +1400,7 @@ class TradingEngine:
             return
         if operation_active:
             return
+        auto_learn.register_trade_context(symbol, signal, ai_confidence)
         contract_id, duration_seconds = self.api.buy(symbol, signal, self.trade_amount)
         if contract_id is None:
             logging.warning('No se pudo abrir la operación, se reanuda el análisis.')
@@ -1185,6 +1452,16 @@ class TradingEngine:
                 self.trade_history.append(record)
             ema_diff = df['close'].iloc[-1] - df['close'].iloc[-2]
             latest_rsi = float(rsi(df['close']).iloc[-1])
+            ema_corto_valor = float(ema(df['close'], 9).iloc[-1])
+            ema_largo_valor = float(ema(df['close'], 21).iloc[-1])
+            ema_spread = ema_corto_valor - ema_largo_valor
+            bandas_inferior, bandas_superior = bollinger_bands(df['close'])
+            boll_width = float(bandas_superior.iloc[-1] - bandas_inferior.iloc[-1]) if len(bandas_superior) else 0.0
+            volatilidad_serie = df['close'].pct_change().rolling(20).std()
+            volatilidad_actual = float(np.nan_to_num(volatilidad_serie.iloc[-1], nan=0.0)) if len(volatilidad_serie) else 0.0
+            auto_learn.update_history(trade_result, symbol, latest_rsi, ema_spread, boll_width, volatilidad_actual)
+            auto_learn.adjust_bias()
+            auto_learn.predict_next(latest_rsi, ema_spread, boll_width, volatilidad_actual)
             logging.info(
                 f"{record.timestamp:%Y-%m-%d %H:%M:%S} INFO: [{symbol}] {signal} @{ai_confidence:.2f} | EMA:{ema_diff:.2f} RSI:{latest_rsi:.2f} | Motivos: {'; '.join(reasons)}"
             )
@@ -1340,6 +1617,12 @@ class BotWindow(QtWidgets.QWidget):
         self.strategy_checkboxes: Dict[str, QtWidgets.QCheckBox] = {}
         self.asset_summary_labels: Dict[str, Dict[str, QtWidgets.QLabel]] = {}
         self.auto_shutdown_active = False
+        self.history_accuracy_labels: Dict[str, QtWidgets.QLabel] = {}
+        self.history_global_label: Optional[QtWidgets.QLabel] = None
+        self.history_status_label: Optional[QtWidgets.QLabel] = None
+        self.history_list: Optional[QtWidgets.QListWidget] = None
+        self.history_bias_label: Optional[QtWidgets.QLabel] = None
+        self.history_prediction_label: Optional[QtWidgets.QLabel] = None
 
         self._build_ui()
 
@@ -1356,6 +1639,7 @@ class BotWindow(QtWidgets.QWidget):
         self._build_strategies_tab()
         self._build_asset_summary_tab()
         self._build_settings_tab()
+        self._build_history_tab()
         self._initialize_asset_summary()
 
     def _build_general_tab(self) -> None:
@@ -1544,6 +1828,63 @@ class BotWindow(QtWidgets.QWidget):
         self.auto_shutdown_spin.valueChanged.connect(self._update_auto_shutdown)
         self._update_auto_shutdown()
 
+    def _build_history_tab(self) -> None:
+        tab = QtWidgets.QWidget()
+        self.tabs.addTab(tab, "History & Learning")
+        layout = QtWidgets.QVBoxLayout(tab)
+
+        accuracy_group = QtWidgets.QGroupBox("Precisión por activo")
+        accuracy_layout = QtWidgets.QGridLayout(accuracy_group)
+        for index, symbol in enumerate(SYMBOLS):
+            name_label = QtWidgets.QLabel(symbol)
+            name_label.setProperty("class", "section-title")
+            value_label = QtWidgets.QLabel("0.00%")
+            value_label.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+            accuracy_layout.addWidget(name_label, index, 0)
+            accuracy_layout.addWidget(value_label, index, 1)
+            self.history_accuracy_labels[symbol] = value_label
+        layout.addWidget(accuracy_group)
+
+        global_group = QtWidgets.QGroupBox("Rendimiento global")
+        global_layout = QtWidgets.QHBoxLayout(global_group)
+        global_label = QtWidgets.QLabel("Precisión global:")
+        self.history_global_label = QtWidgets.QLabel("0.00%")
+        status_label = QtWidgets.QLabel("Aprendizaje:")
+        self.history_status_label = QtWidgets.QLabel("OFF")
+        self.history_status_label.setStyleSheet("color: #ef5350;")
+        bias_label = QtWidgets.QLabel("Sesgos actuales:")
+        self.history_bias_label = QtWidgets.QLabel("RSI 0.00 | EMA 0.00")
+        prediction_label = QtWidgets.QLabel("Última predicción:")
+        self.history_prediction_label = QtWidgets.QLabel("0.50")
+        global_layout.addWidget(global_label)
+        global_layout.addWidget(self.history_global_label)
+        global_layout.addSpacing(12)
+        global_layout.addWidget(status_label)
+        global_layout.addWidget(self.history_status_label)
+        global_layout.addSpacing(12)
+        global_layout.addWidget(bias_label)
+        global_layout.addWidget(self.history_bias_label)
+        global_layout.addSpacing(12)
+        global_layout.addWidget(prediction_label)
+        global_layout.addWidget(self.history_prediction_label)
+        global_layout.addStretch(1)
+        layout.addWidget(global_group)
+
+        trades_group = QtWidgets.QGroupBox("Últimas operaciones")
+        trades_layout = QtWidgets.QVBoxLayout(trades_group)
+        self.history_list = QtWidgets.QListWidget()
+        self.history_list.setMaximumHeight(200)
+        trades_layout.addWidget(self.history_list)
+        layout.addWidget(trades_group)
+
+        button_layout = QtWidgets.QHBoxLayout()
+        self.reset_history_button = QtWidgets.QPushButton("Reset History")
+        button_layout.addStretch(1)
+        button_layout.addWidget(self.reset_history_button)
+        layout.addLayout(button_layout)
+        self.reset_history_button.clicked.connect(self._reset_history_data)
+        self._update_history_tab()
+
     def start_trading(self) -> None:
         if self.thread is not None and self.thread.isRunning():
             return
@@ -1591,6 +1932,10 @@ class BotWindow(QtWidgets.QWidget):
             if self.thread is None:
                 self.start_button.setEnabled(True)
 
+    def _reset_history_data(self) -> None:
+        auto_learn.reset_history()
+        QtCore.QTimer.singleShot(350, self._update_history_tab)
+
     def _on_trade(self, record: TradeRecord, stats: Dict[str, float]) -> None:
         self.latest_stats = stats
         self.trade_table.insertRow(0)
@@ -1620,6 +1965,7 @@ class BotWindow(QtWidgets.QWidget):
             'main_reason': metadata.get('main_reason', 'Motivo no disponible'),
         }
         self._update_asset_summary_from_dict(record.symbol, summary_data)
+        self._update_history_tab()
 
     def _on_status(self, status: str) -> None:
         if status == "auto_shutdown":
@@ -1761,6 +2107,7 @@ class BotWindow(QtWidgets.QWidget):
             if checkbox.isChecked() != desired:
                 blocker = QtCore.QSignalBlocker(checkbox)
                 checkbox.setChecked(desired)
+        self._update_history_tab()
 
     def _load_strategy_config(self) -> Dict[str, bool]:
         estados: Dict[str, bool] = {}
@@ -1790,6 +2137,44 @@ class BotWindow(QtWidgets.QWidget):
                 json.dump(estados, handle, ensure_ascii=False, indent=2)
         except Exception as exc:
             logging.debug(f"No se pudo guardar configuración de estrategias: {exc}")
+
+    def _update_history_tab(self) -> None:
+        summary = auto_learn.get_summary()
+        per_asset = summary.get('per_asset', {})
+        for symbol in SYMBOLS:
+            label = self.history_accuracy_labels.get(symbol)
+            if label is not None:
+                valor = float(per_asset.get(symbol, 0.0))
+                label.setText(f"{valor:.2f}%")
+        if self.history_global_label is not None:
+            self.history_global_label.setText(f"{float(summary.get('global_accuracy', 0.0)):.2f}%")
+        estado_activo = bool(summary.get('status', False))
+        if self.history_status_label is not None:
+            self.history_status_label.setText("ON" if estado_activo else "OFF")
+            self.history_status_label.setStyleSheet("color: #66bb6a;" if estado_activo else "color: #ef5350;")
+        biases = summary.get('biases', {})
+        if self.history_bias_label is not None:
+            rsi_bias = float(biases.get('RSI', 0.0))
+            ema_bias = float(biases.get('EMA', 0.0))
+            self.history_bias_label.setText(f"RSI {rsi_bias:.2f} | EMA {ema_bias:.2f}")
+        if self.history_prediction_label is not None:
+            self.history_prediction_label.setText(f"{float(summary.get('last_prediction', 0.5)):.2f}")
+        if self.history_list is not None:
+            self.history_list.clear()
+            for trade in summary.get('last_trades', []):
+                asset = trade.get('asset', '-')
+                direction = trade.get('direction', '-')
+                result = trade.get('result', '-')
+                confidence = float(trade.get('confidence', 0.0))
+                text = f"{asset} {direction} {result} {confidence:.2f}"
+                item = QtWidgets.QListWidgetItem(text)
+                color = QtGui.QColor('#b0bec5')
+                if result == 'WIN':
+                    color = QtGui.QColor('#66bb6a')
+                elif result == 'LOSS':
+                    color = QtGui.QColor('#ef5350')
+                item.setForeground(color)
+                self.history_list.addItem(item)
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # type: ignore[override]
         if self.thread is not None and self.thread.isRunning():
