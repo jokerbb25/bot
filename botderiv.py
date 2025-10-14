@@ -4,6 +4,9 @@ import json
 import threading
 import logging
 import warnings
+import csv
+from collections import defaultdict, deque
+from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -16,6 +19,7 @@ from ta.momentum import RSIIndicator
 from ta.trend import EMAIndicator, SMAIndicator
 from ta.volatility import BollingerBands, AverageTrueRange
 from sklearn.linear_model import LogisticRegression
+from sklearn.ensemble import RandomForestClassifier
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 
@@ -89,6 +93,268 @@ class TradeRecord:
     pnl: float
     reasons: List[str]
 
+
+# ===============================================================
+# AUTO LEARNING MODULE
+# ===============================================================
+
+
+class auto_learning:
+    def __init__(self) -> None:
+        self.file_path = Path("botderivcsv.csv")
+        self.lock = threading.Lock()
+        self.executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="auto_learning")
+        self.asset_stats: Dict[str, Dict[str, float]] = defaultdict(lambda: {"wins": 0.0, "total": 0.0})
+        self.global_wins = 0.0
+        self.global_total = 0.0
+        self.last_trades: deque = deque(maxlen=5)
+        self.recent_outcomes: deque = deque(maxlen=200)
+        self.feature_store: deque = deque(maxlen=5000)
+        self.label_store: deque = deque(maxlen=5000)
+        self.trades_since_train = 0
+        self.bias = {"rsi": 0.0, "ema": 0.0}
+        self.model: Optional[RandomForestClassifier] = None
+        self.model_ready = False
+        self.last_prediction = 0.5
+        self._ensure_csv()
+        self._load_existing()
+
+    def _ensure_csv(self) -> None:
+        if not self.file_path.exists():
+            try:
+                with self.file_path.open("w", newline="", encoding="utf-8") as handle:
+                    writer = csv.writer(handle)
+                    writer.writerow(["asset", "direction", "result", "RSI", "EMA", "Bollinger", "volatility", "confidence"])
+            except Exception as exc:
+                logging.debug(f"No se pudo inicializar historial de aprendizaje: {exc}")
+
+    def _load_existing(self) -> None:
+        if not self.file_path.exists():
+            return
+        try:
+            data = pd.read_csv(self.file_path)
+        except Exception as exc:
+            logging.debug(f"No se pudo cargar historial previo: {exc}")
+            return
+        if data.empty:
+            return
+        records = data.tail(5000).to_dict("records")
+        with self.lock:
+            recent_trade_reprs: List[Dict[str, Any]] = []
+            for row in records:
+                asset = str(row.get("asset", ""))
+                result = str(row.get("result", "")).upper()
+                rsi_value = float(row.get("RSI", 0.0))
+                ema_value = float(row.get("EMA", 0.0))
+                boll_value = float(row.get("Bollinger", 0.0))
+                vol_value = float(row.get("volatility", 0.0))
+                confidence_value = float(row.get("confidence", 0.0))
+                direction = str(row.get("direction", ""))
+                label = 1 if result == "WIN" else 0
+                stats = self.asset_stats[asset]
+                stats["total"] += 1
+                stats["wins"] += label
+                self.global_total += 1
+                self.global_wins += label
+                trade_repr = {
+                    "asset": asset,
+                    "direction": direction,
+                    "result": result,
+                    "timestamp": "Histórico",
+                    "confidence": confidence_value,
+                }
+                recent_trade_reprs.append(trade_repr)
+                self.recent_outcomes.append((label, rsi_value, ema_value))
+                self.feature_store.append([rsi_value, ema_value, boll_value, vol_value])
+                self.label_store.append(label)
+            self.last_trades.clear()
+            self.last_trades.extendleft(recent_trade_reprs[-5:])
+            self.last_prediction = 0.5
+
+    def _schedule(self, func: Callable, *args: Any, **kwargs: Any) -> None:
+        try:
+            self.executor.submit(func, *args, **kwargs)
+        except Exception as exc:
+            logging.debug(f"No se pudo programar tarea de aprendizaje: {exc}")
+
+    def update_history(
+        self,
+        result: str,
+        asset: str,
+        rsi_value: float,
+        ema_value: float,
+        boll_value: float,
+        volatility_value: float,
+        direction: Optional[str] = None,
+        confidence: Optional[float] = None,
+    ) -> None:
+        timestamp = datetime.now(timezone.utc).strftime("%H:%M:%S")
+        result_flag = 1 if str(result).upper() == "WIN" else 0
+        direction_text = direction or "-"
+        confidence_value = float(confidence) if confidence is not None else 0.0
+        entry = {
+            "asset": asset,
+            "direction": direction_text,
+            "result": str(result).upper(),
+            "RSI": float(rsi_value),
+            "EMA": float(ema_value),
+            "Bollinger": float(boll_value),
+            "volatility": float(volatility_value),
+            "confidence": confidence_value,
+        }
+        should_train = False
+        with self.lock:
+            stats = self.asset_stats[asset]
+            stats["total"] += 1
+            stats["wins"] += result_flag
+            self.global_total += 1
+            self.global_wins += result_flag
+            self.last_trades.appendleft(
+                {
+                    "asset": asset,
+                    "direction": direction_text,
+                    "result": str(result).upper(),
+                    "timestamp": timestamp,
+                    "confidence": confidence_value,
+                }
+            )
+            self.recent_outcomes.append((result_flag, float(rsi_value), float(ema_value)))
+            self.feature_store.append([float(rsi_value), float(ema_value), float(boll_value), float(volatility_value)])
+            self.label_store.append(result_flag)
+            self.trades_since_train += 1
+            should_train = self.trades_since_train >= 100
+            if should_train:
+                self.trades_since_train = 0
+        self._schedule(self._persist_trade, entry, should_train)
+
+    def _persist_trade(self, entry: Dict[str, Any], should_train: bool) -> None:
+        try:
+            with self.file_path.open("a", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=["asset", "direction", "result", "RSI", "EMA", "Bollinger", "volatility", "confidence"])
+                writer.writerow(entry)
+        except Exception as exc:
+            logging.debug(f"No se pudo guardar historial de trade: {exc}")
+        if should_train:
+            self._train_model()
+
+    def _train_model(self) -> None:
+        try:
+            with self.lock:
+                if len(self.feature_store) < 20:
+                    return
+                labels = list(self.label_store)
+                if not (0 in labels and 1 in labels):
+                    return
+                features = np.array(list(self.feature_store), dtype=float)
+                outcomes = np.array(labels, dtype=int)
+            model = RandomForestClassifier(n_estimators=75, random_state=42, max_depth=6)
+            model.fit(features, outcomes)
+            with self.lock:
+                self.model = model
+                self.model_ready = True
+        except Exception as exc:
+            logging.debug(f"Error al entrenar modelo automático: {exc}")
+
+    def adjust_bias(self) -> None:
+        self._schedule(self._adjust_bias_task)
+
+    def _adjust_bias_task(self) -> None:
+        with self.lock:
+            if len(self.recent_outcomes) < 10:
+                return
+            wins = [item for item in self.recent_outcomes if item[0] == 1]
+            losses = [item for item in self.recent_outcomes if item[0] == 0]
+            if not wins or not losses:
+                return
+            avg_rsi_win = float(np.mean([item[1] for item in wins]))
+            avg_rsi_loss = float(np.mean([item[1] for item in losses]))
+            avg_ema_win = float(np.mean([item[2] for item in wins]))
+            avg_ema_loss = float(np.mean([item[2] for item in losses]))
+            self.bias["rsi"] = max(-5.0, min(5.0, (avg_rsi_win - avg_rsi_loss) / 10.0))
+            self.bias["ema"] = max(-2.0, min(2.0, (avg_ema_win - avg_ema_loss) / 20.0))
+
+    def predict_next(self, rsi_value: float, ema_value: float, boll_value: float, volatility_value: float) -> float:
+        with self.lock:
+            model = self.model
+            ready = self.model_ready
+            bias_rsi = self.bias["rsi"]
+            bias_ema = self.bias["ema"]
+        adjusted_features = np.array(
+            [
+                [
+                    float(rsi_value) + bias_rsi,
+                    float(ema_value) + bias_ema,
+                    float(boll_value),
+                    float(volatility_value),
+                ]
+            ],
+            dtype=float,
+        )
+        prediction = 0.5
+        if ready and model is not None:
+            try:
+                proba = model.predict_proba(adjusted_features)[0][1]
+                prediction = float(max(0.0, min(1.0, proba)))
+            except Exception as exc:
+                logging.debug(f"Error al predecir siguiente operación: {exc}")
+        with self.lock:
+            self.last_prediction = prediction
+        return prediction
+
+    def asset_accuracy(self) -> Dict[str, float]:
+        with self.lock:
+            snapshot = {asset: (stats["wins"] / stats["total"] * 100.0 if stats["total"] > 0 else 0.0) for asset, stats in self.asset_stats.items()}
+        return snapshot
+
+    def global_accuracy(self) -> float:
+        with self.lock:
+            if self.global_total <= 0:
+                return 0.0
+            return float((self.global_wins / self.global_total) * 100.0)
+
+    def recent_history(self) -> List[Dict[str, Any]]:
+        with self.lock:
+            return list(self.last_trades)
+
+    def status(self) -> str:
+        shutdown = getattr(self.executor, "_shutdown", False)
+        return "OFF" if shutdown else "ON"
+
+    def bias_snapshot(self) -> Dict[str, float]:
+        with self.lock:
+            return dict(self.bias)
+
+    def snapshot(self) -> Dict[str, Any]:
+        return {
+            "asset_accuracy": self.asset_accuracy(),
+            "global_accuracy": self.global_accuracy(),
+            "recent_trades": self.recent_history(),
+            "status": self.status(),
+            "bias": self.bias_snapshot(),
+            "prediction": self.last_prediction,
+        }
+
+    def reset_history(self) -> None:
+        def task() -> None:
+            try:
+                if self.file_path.exists():
+                    self.file_path.unlink()
+            except Exception as exc:
+                logging.debug(f"No se pudo eliminar historial: {exc}")
+            self._ensure_csv()
+            with self.lock:
+                self.asset_stats.clear()
+                self.global_total = 0.0
+                self.global_wins = 0.0
+                self.last_trades.clear()
+                self.recent_outcomes.clear()
+                self.feature_store.clear()
+                self.label_store.clear()
+                self.trades_since_train = 0
+                self.model = None
+                self.model_ready = False
+                self.last_prediction = 0.5
+        self._schedule(task)
 
 # ===============================================================
 # UTILITY FUNCTIONS
@@ -742,6 +1008,7 @@ class TradingEngine:
         self.api = DerivWebSocket()
         self.risk = RiskManager()
         self.ai = AdaptiveAIManager()
+        self.auto_learn = auto_learning()
         self.trade_history: List[TradeRecord] = []
         self.lock = threading.Lock()
         self.running = threading.Event()
@@ -778,6 +1045,13 @@ class TradingEngine:
             "daily_pnl": float(self.risk.daily_pnl),
             "accuracy": float((self.win_count / max(1, self.win_count + self.loss_count)) * 100.0),
         }
+        learning_snapshot = self.auto_learn.snapshot()
+        stats["auto_asset_accuracy"] = learning_snapshot.get("asset_accuracy", {})
+        stats["auto_global_accuracy"] = learning_snapshot.get("global_accuracy", 0.0)
+        stats["auto_recent_trades"] = learning_snapshot.get("recent_trades", [])
+        stats["auto_learning_status"] = learning_snapshot.get("status", "OFF")
+        stats["auto_bias"] = learning_snapshot.get("bias", {})
+        stats["auto_prediction"] = learning_snapshot.get("prediction", 0.5)
         for callback in list(self._trade_listeners):
             try:
                 callback(record, stats)
@@ -874,12 +1148,59 @@ class TradingEngine:
         with self.lock:
             self.trade_history.append(record)
         ema_diff = df["close"].iloc[-1] - df["close"].iloc[-2]
-        latest_rsi = rsi(df["close"]).iloc[-1]
+        rsi_series = rsi(df["close"])
+        latest_rsi = rsi_series.iloc[-1]
+        try:
+            ema_fast_series = ema(df["close"], 9)
+            ema_slow_series = ema(df["close"], 21)
+            ema_fast_val = float(ema_fast_series.iloc[-1]) if not ema_fast_series.empty else float(df["close"].iloc[-1])
+            ema_slow_val = float(ema_slow_series.iloc[-1]) if not ema_slow_series.empty else float(df["close"].iloc[-1])
+            if np.isnan(ema_fast_val) or np.isinf(ema_fast_val):
+                ema_fast_val = float(df["close"].iloc[-1])
+            if np.isnan(ema_slow_val) or np.isinf(ema_slow_val):
+                ema_slow_val = float(df["close"].iloc[-1])
+        except Exception:
+            ema_fast_val = float(df["close"].iloc[-1])
+            ema_slow_val = float(df["close"].iloc[-1])
+        ema_spread = float(ema_fast_val - ema_slow_val)
+        try:
+            lower_band, upper_band = bollinger_bands(df["close"])
+            if lower_band.empty or upper_band.empty:
+                raise ValueError("Bandas vacías")
+            boll_raw = float(upper_band.iloc[-1] - lower_band.iloc[-1])
+            if np.isnan(boll_raw) or np.isinf(boll_raw):
+                boll_value = 0.0
+            else:
+                boll_value = boll_raw
+        except Exception:
+            boll_value = 0.0
+        try:
+            atr_series = atr(df)
+            if atr_series.empty:
+                raise ValueError("ATR vacío")
+            atr_value = float(atr_series.iloc[-1])
+            if np.isnan(atr_value) or np.isinf(atr_value):
+                atr_value = 0.0
+        except Exception:
+            atr_value = 0.0
         logging.info(
             f"{record.timestamp:%Y-%m-%d %H:%M:%S} INFO: [{symbol}] {signal} @{ai_confidence:.2f} | EMA:{ema_diff:.2f} RSI:{latest_rsi:.2f} | Motivos: {'; '.join(reasons)}"
         )
         if ai_notes:
             logging.info(f"📊 Aviso IA → {'; '.join(ai_notes)}")
+        self.auto_learn.update_history(
+            result,
+            symbol,
+            float(latest_rsi),
+            ema_spread,
+            boll_value,
+            atr_value,
+            direction=signal,
+            confidence=ai_confidence,
+        )
+        self.auto_learn.adjust_bias()
+        prediction = self.auto_learn.predict_next(float(latest_rsi), ema_spread, boll_value, atr_value)
+        logging.debug(f"Auto-learning predicción: {prediction:.2f}")
         self._notify_trade(record)
 
     def run(self) -> None:
@@ -910,6 +1231,9 @@ class TradingEngine:
         except Exception:
             pass
         self.api.socket = None
+
+    def reset_auto_learning(self) -> None:
+        self.auto_learn.reset_history()
 
 
 # ===============================================================
@@ -992,15 +1316,25 @@ class BotWindow(QtWidgets.QWidget):
             self.engine.set_strategy_state(name, enabled)
 
         self.thread: Optional[TradingThread] = None
-        self.latest_stats: Dict[str, float] = {
+        self.latest_stats: Dict[str, Any] = {
             "operations": 0.0,
             "wins": 0.0,
             "losses": 0.0,
             "pnl": 0.0,
             "daily_pnl": 0.0,
             "accuracy": 0.0,
+            "auto_asset_accuracy": {symbol: 0.0 for symbol in SYMBOLS},
+            "auto_global_accuracy": 0.0,
+            "auto_recent_trades": [],
+            "auto_learning_status": "OFF",
+            "auto_bias": {},
+            "auto_prediction": 0.5,
         }
         self.strategy_checkboxes: Dict[str, QtWidgets.QCheckBox] = {}
+        self.asset_accuracy_labels: Dict[str, QtWidgets.QLabel] = {}
+        self.global_accuracy_label: Optional[QtWidgets.QLabel] = None
+        self.history_list_widget: Optional[QtWidgets.QListWidget] = None
+        self.learning_status_label: Optional[QtWidgets.QLabel] = None
 
         self._build_ui()
 
@@ -1016,6 +1350,7 @@ class BotWindow(QtWidgets.QWidget):
         self._build_general_tab()
         self._build_strategies_tab()
         self._build_settings_tab()
+        self._build_history_tab()
 
     def _build_general_tab(self) -> None:
         tab = QtWidgets.QWidget()
@@ -1127,6 +1462,53 @@ class BotWindow(QtWidgets.QWidget):
         form.addRow("Máx. drawdown", self.drawdown_value)
         form.addRow("Motor de aprendizaje", self.ml_state_label)
 
+    def _build_history_tab(self) -> None:
+        tab = QtWidgets.QWidget()
+        self.tabs.addTab(tab, "History & Learning")
+        layout = QtWidgets.QVBoxLayout(tab)
+
+        accuracy_group = QtWidgets.QGroupBox("Precisión por activo")
+        grid = QtWidgets.QGridLayout(accuracy_group)
+        for index, symbol in enumerate(SYMBOLS):
+            title = QtWidgets.QLabel(symbol)
+            title.setProperty("class", "section-title")
+            value = QtWidgets.QLabel("0.00%")
+            row = index // 2
+            column = (index % 2) * 2
+            grid.addWidget(title, row, column)
+            grid.addWidget(value, row, column + 1)
+            self.asset_accuracy_labels[symbol] = value
+        layout.addWidget(accuracy_group)
+
+        global_group = QtWidgets.QGroupBox("Desempeño global")
+        global_layout = QtWidgets.QHBoxLayout(global_group)
+        label = QtWidgets.QLabel("Precisión global")
+        label.setProperty("class", "section-title")
+        self.global_accuracy_label = QtWidgets.QLabel("0.00%")
+        global_layout.addWidget(label)
+        global_layout.addWidget(self.global_accuracy_label)
+        global_layout.addStretch(1)
+        layout.addWidget(global_group)
+
+        history_group = QtWidgets.QGroupBox("Últimas operaciones")
+        history_layout = QtWidgets.QVBoxLayout(history_group)
+        self.history_list_widget = QtWidgets.QListWidget()
+        self.history_list_widget.setAlternatingRowColors(True)
+        history_layout.addWidget(self.history_list_widget)
+        layout.addWidget(history_group, 1)
+
+        control_layout = QtWidgets.QHBoxLayout()
+        self.learning_status_label = QtWidgets.QLabel("Sistema: OFF")
+        self.learning_status_label.setStyleSheet("color: #ef5350; font-weight: bold;")
+        control_layout.addWidget(self.learning_status_label)
+        control_layout.addStretch(1)
+        reset_button = QtWidgets.QPushButton("Reset History")
+        reset_button.clicked.connect(self._reset_history)
+        control_layout.addWidget(reset_button)
+        layout.addLayout(control_layout)
+
+        layout.addStretch(1)
+
     def start_trading(self) -> None:
         if self.thread is not None and self.thread.isRunning():
             return
@@ -1152,7 +1534,7 @@ class BotWindow(QtWidgets.QWidget):
         self.engine.set_strategy_state(name, enabled)
         self._save_strategy_config()
 
-    def _on_trade(self, record: TradeRecord, stats: Dict[str, float]) -> None:
+    def _on_trade(self, record: TradeRecord, stats: Dict[str, Any]) -> None:
         self.latest_stats = stats
         self.trade_table.insertRow(0)
         entries = [
@@ -1169,6 +1551,7 @@ class BotWindow(QtWidgets.QWidget):
         if self.trade_table.rowCount() > 250:
             self.trade_table.removeRow(self.trade_table.rowCount() - 1)
         self._update_stats_labels(stats)
+        self._update_history_tab(stats)
 
     def _on_status(self, status: str) -> None:
         mapping = {
@@ -1194,13 +1577,50 @@ class BotWindow(QtWidgets.QWidget):
         self.log_view.appendPlainText(message)
         self.log_view.verticalScrollBar().setValue(self.log_view.verticalScrollBar().maximum())
 
-    def _update_stats_labels(self, stats: Dict[str, float]) -> None:
+    def _update_stats_labels(self, stats: Dict[str, Any]) -> None:
         self.stats_values["Operaciones"].setText(str(int(stats.get("operations", 0.0))))
         self.stats_values["Ganadas"].setText(str(int(stats.get("wins", 0.0))))
         self.stats_values["Perdidas"].setText(str(int(stats.get("losses", 0.0))))
         self.stats_values["Ganancia"].setText(f"${stats.get('pnl', 0.0):.2f}")
         self.stats_values["Ganancia diaria"].setText(f"${stats.get('daily_pnl', 0.0):.2f}")
         self.stats_values["Precisión"].setText(f"{stats.get('accuracy', 0.0):.1f}%")
+
+    def _update_history_tab(self, stats: Dict[str, Any]) -> None:
+        asset_data = stats.get("auto_asset_accuracy", {})
+        for symbol, label in self.asset_accuracy_labels.items():
+            value = float(asset_data.get(symbol, 0.0))
+            label.setText(f"{value:.2f}%")
+        if self.global_accuracy_label is not None:
+            value = float(stats.get("auto_global_accuracy", 0.0))
+            self.global_accuracy_label.setText(f"{value:.2f}%")
+        if self.learning_status_label is not None:
+            status_text = str(stats.get("auto_learning_status", "OFF"))
+            color = "#4caf50" if status_text == "ON" else "#ef5350"
+            self.learning_status_label.setText(f"Sistema: {status_text}")
+            self.learning_status_label.setStyleSheet(f"color: {color}; font-weight: bold;")
+        if self.history_list_widget is not None:
+            self.history_list_widget.clear()
+            for trade in stats.get("auto_recent_trades", [])[:5]:
+                asset = trade.get("asset", "")
+                direction = trade.get("direction", "")
+                result = str(trade.get("result", ""))
+                timestamp = trade.get("timestamp", "")
+                confidence = trade.get("confidence", 0.0)
+                item_text = f"{timestamp} | {asset} {direction} | {result} ({confidence:.2f})"
+                item = QtWidgets.QListWidgetItem(item_text)
+                color = QtGui.QColor("#4caf50") if result.upper() == "WIN" else QtGui.QColor("#ef5350")
+                item.setForeground(color)
+                self.history_list_widget.addItem(item)
+
+    def _reset_history(self) -> None:
+        self.engine.reset_auto_learning()
+        self.latest_stats["auto_asset_accuracy"] = {symbol: 0.0 for symbol in SYMBOLS}
+        self.latest_stats["auto_global_accuracy"] = 0.0
+        self.latest_stats["auto_recent_trades"] = []
+        self.latest_stats["auto_learning_status"] = "ON"
+        self.latest_stats["auto_bias"] = {}
+        self.latest_stats["auto_prediction"] = 0.5
+        self._update_history_tab(self.latest_stats)
 
     def _refresh_phase(self) -> None:
         raw_phase = self.engine.ai._phase()
@@ -1221,6 +1641,14 @@ class BotWindow(QtWidgets.QWidget):
             if checkbox.isChecked() != desired:
                 blocker = QtCore.QSignalBlocker(checkbox)
                 checkbox.setChecked(desired)
+        learning_snapshot = self.engine.auto_learn.snapshot()
+        self.latest_stats["auto_asset_accuracy"] = learning_snapshot.get("asset_accuracy", {})
+        self.latest_stats["auto_global_accuracy"] = learning_snapshot.get("global_accuracy", 0.0)
+        self.latest_stats["auto_recent_trades"] = learning_snapshot.get("recent_trades", [])
+        self.latest_stats["auto_learning_status"] = learning_snapshot.get("status", "OFF")
+        self.latest_stats["auto_bias"] = learning_snapshot.get("bias", {})
+        self.latest_stats["auto_prediction"] = learning_snapshot.get("prediction", 0.5)
+        self._update_history_tab(self.latest_stats)
 
     def _load_strategy_config(self) -> Dict[str, bool]:
         estados: Dict[str, bool] = {}
