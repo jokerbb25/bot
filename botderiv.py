@@ -29,6 +29,14 @@ try:
     from skopt import gp_minimize
 except ImportError:  # pragma: no cover
     gp_minimize = None  # type: ignore
+try:  # pragma: no cover
+    import tensorflow as tf  # type: ignore
+    from tensorflow import keras  # type: ignore
+    from tensorflow.keras import layers  # type: ignore
+except Exception:  # pragma: no cover
+    tf = None  # type: ignore
+    keras = None  # type: ignore
+    layers = None  # type: ignore
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 
@@ -268,6 +276,8 @@ class auto_learning:
         self.rsi_high_threshold = 70.0
         self.adx_min_threshold = 20.0
         self.predictive_model_path = Path("predictive_model.pkl")
+        self.neural_model: Any = None
+        self.neural_model_path = Path("neural_predictor.h5")
         self.reinforce_batches = 0
         self.optimize_batches = 0
         self.learning_event = threading.Event()
@@ -280,6 +290,9 @@ class auto_learning:
         for profile in self.symbol_profiles.values():
             profile["learning_rate"] = self.learning_rate
         self._current_symbol: Optional[str] = None
+        self.current_regime: Optional[str] = None
+        self.regime_baseline_weights: Dict[str, float] = dict(self.weights)
+        self.regime_baseline_min_conf: float = self.min_confidence
         self._ensure_csv()
 
     def _ensure_csv(self) -> None:
@@ -436,6 +449,124 @@ class auto_learning:
             for key, value in list(self.weights.items()):
                 self.weights[key] = float(np.clip(value, 0.2, 3.0))
 
+    def reset_regime_baseline(self) -> None:
+        with self.weights_lock:
+            self.regime_baseline_weights = dict(self.weights)
+        with self.lock:
+            self.regime_baseline_min_conf = self.min_confidence
+        self.current_regime = None
+
+    def detect_market_regime(
+        self,
+        adx_value: float,
+        bollinger_width: float,
+        volatility: float,
+    ) -> str:
+        adx_value = float(adx_value)
+        bollinger_width = float(bollinger_width)
+        volatility = float(volatility)
+        if adx_value > 25.0 and volatility < 0.02:
+            return "TRENDING"
+        if adx_value < 20.0 and volatility < 0.015 and bollinger_width < 0.015:
+            return "RANGING"
+        if volatility > 0.03 or bollinger_width > 0.03:
+            return "VOLATILE"
+        return "CALM"
+
+    def apply_market_regime(self, regime: str) -> Dict[str, Any]:
+        regime = str(regime).upper()
+        if regime not in {"TRENDING", "RANGING", "VOLATILE", "CALM"}:
+            regime = "CALM"
+        if regime != self.current_regime:
+            self.reset_regime_baseline()
+            self.current_regime = regime
+        with self.weights_lock:
+            base_weights = dict(self.regime_baseline_weights)
+            new_weights = dict(base_weights)
+            if regime == "TRENDING":
+                new_weights["EMA"] = base_weights.get("EMA", 1.0) * 1.05
+                new_weights["RSI"] = base_weights.get("RSI", 1.0) * 0.95
+            elif regime == "RANGING":
+                new_weights["RSI"] = base_weights.get("RSI", 1.0) * 1.05
+                new_weights["MACD"] = base_weights.get("MACD", 0.8) * 0.95
+            elif regime == "VOLATILE":
+                new_weights = dict(base_weights)
+            else:
+                new_weights = dict(base_weights)
+            self.weights.update(new_weights)
+            self._clamp_weights()
+            weights_snapshot = dict(self.weights)
+        with self.lock:
+            base_min = float(self.regime_baseline_min_conf)
+            if regime == "VOLATILE":
+                self.min_confidence = float(np.clip(base_min + 0.05, 0.3, 0.95))
+            elif regime == "CALM":
+                self.min_confidence = float(np.clip(base_min - 0.02, 0.3, 0.95))
+            else:
+                self.min_confidence = base_min
+            min_conf_snapshot = self.min_confidence
+        return {"weights": weights_snapshot, "min_confidence": min_conf_snapshot, "regime": regime}
+
+    def train_neural_predictor(self) -> None:
+        if keras is None or layers is None:
+            logging.debug("TensorFlow no disponible, se omite el entrenamiento de la red neuronal")
+            return
+        with self.memory_lock:
+            if len(self.memory) < 500:
+                return
+            data = pd.DataFrame(self.memory)
+        try:
+            X = data[["RSI", "EMA", "MACD", "ADX", "hour"]].values
+            y = (data["result"].str.upper() == "WIN").astype(int).values
+            model = keras.Sequential(
+                [
+                    layers.Input(shape=(5,)),
+                    layers.Dense(32, activation="relu"),
+                    layers.Dense(16, activation="relu"),
+                    layers.Dense(1, activation="sigmoid"),
+                ]
+            )
+            model.compile(optimizer="adam", loss="binary_crossentropy", metrics=["accuracy"])
+            model.fit(X, y, epochs=15, batch_size=32, verbose=0)
+            model.save(self.neural_model_path)
+            self.neural_model = model
+            logging.info("🤖 Neural predictor trained and saved.")
+        except Exception as exc:  # pragma: no cover
+            logging.debug(f"No se pudo entrenar el predictor neuronal: {exc}")
+
+    def _load_neural_model(self) -> None:
+        if keras is None:
+            return
+        if self.neural_model is not None:
+            return
+        if not self.neural_model_path.exists():
+            return
+        try:
+            self.neural_model = keras.models.load_model(self.neural_model_path)
+        except Exception as exc:  # pragma: no cover
+            logging.debug(f"No se pudo cargar el predictor neuronal: {exc}")
+            self.neural_model = None
+
+    def predict_with_neural(
+        self,
+        rsi: float,
+        ema: float,
+        macd: float,
+        adx: float,
+        hour: int,
+    ) -> float:
+        if keras is None or layers is None:
+            return 0.5
+        self._load_neural_model()
+        if self.neural_model is None:
+            return 0.5
+        try:
+            X = np.array([[float(rsi), float(ema), float(macd), float(adx), float(hour)]], dtype=float)
+            prob = float(self.neural_model.predict(X, verbose=0)[0][0])
+            return float(max(0.0, min(1.0, prob)))
+        except Exception:  # pragma: no cover
+            return 0.5
+
     def record_result(
         self,
         symbol: str,
@@ -500,6 +631,7 @@ class auto_learning:
                     self.weights["ADX"] *= 1.02
                     self.weights["MACD"] *= 1.02
             self._clamp_weights()
+            self.reset_regime_baseline()
             with self.weights_lock:
                 weights_snapshot = dict(self.weights)
             logging.info(
@@ -948,6 +1080,7 @@ class auto_learning:
             self.stability_guard(recent, historical)
             if optimize:
                 self.train_predictive_model()
+                self.train_neural_predictor()
                 self.optimize_thresholds()
         except Exception as exc:  # pragma: no cover
             logging.debug(f"Error en aprendizaje periódico: {exc}")
@@ -995,6 +1128,7 @@ class auto_learning:
                     adjustments_made = True
         if adjustments_made:
             self._clamp_weights()
+            self.reset_regime_baseline()
 
     def stability_guard(self, recent_winrate: float, historical_winrate: float) -> None:
         if recent_winrate - historical_winrate <= 0.20:
@@ -1035,6 +1169,8 @@ class auto_learning:
         adx: float,
         hour: int,
     ) -> float:
+        probabilities: List[float] = []
+        rf_prob = 0.5
         with self.model_lock:
             model = self.model
         if model is None and load is not None and self.predictive_model_path.exists():
@@ -1044,13 +1180,25 @@ class auto_learning:
                     self.model = model
             except Exception:  # pragma: no cover
                 model = None
-        if model is None:
-            return 0.5
-        try:
-            prob = model.predict_proba([[rsi, ema, macd, adx, hour]])[0][1]
-            return float(prob)
-        except Exception:
-            return 0.5
+        if model is not None:
+            try:
+                rf_prob = float(model.predict_proba([[rsi, ema, macd, adx, hour]])[0][1])
+                probabilities.append(rf_prob)
+            except Exception:  # pragma: no cover
+                rf_prob = 0.5
+        neural_prob = self.predict_with_neural(rsi, ema, macd, adx, hour)
+        if self.neural_model is not None or (
+            keras is not None and self.neural_model_path.exists()
+        ):
+            probabilities.append(neural_prob)
+        if not probabilities:
+            combined = 0.5
+        elif len(probabilities) == 1:
+            combined = probabilities[0]
+        else:
+            combined = float(np.clip(np.mean(probabilities), 0.0, 1.0))
+        self.last_prediction = combined
+        return combined
 
     def optimize_thresholds(self) -> None:
         if gp_minimize is None:
@@ -1077,6 +1225,7 @@ class auto_learning:
         self.min_confidence = float(np.clip(result.x[0], 0.4, 0.95))
         self.rsi_high_threshold = float(np.clip(result.x[1], 55.0, 85.0))
         self.adx_min_threshold = float(np.clip(result.x[2], 5.0, 60.0))
+        self.reset_regime_baseline()
         logging.info(
             f"🎯 Bayesian optimization finished: min_conf={self.min_confidence:.2f}, RSI_high={self.rsi_high_threshold:.2f}, ADX_min={self.adx_min_threshold:.2f}"
         )
@@ -1250,12 +1399,35 @@ class auto_learning:
             self.biases = {symbol: {"RSI": 0.0, "EMA": 0.0} for symbol in SYMBOLS}
         with self.model_lock:
             self.model = None
+        self.neural_model = None
         self.last_prediction = 0.5
         with self.memory_lock:
             self.memory = []
             self.recent_results.clear()
             self.reinforce_batches = 0
             self.optimize_batches = 0
+        with self.weights_lock:
+            self.weights = {
+                "RSI": 1.0,
+                "EMA": 1.0,
+                "BOLL": 1.0,
+                "ADX": 0.8,
+                "MACD": 0.8,
+            }
+        with self.lock:
+            self.min_confidence = MIN_TRADE_CONFIDENCE
+            self.symbol_weights = {symbol: 1.0 for symbol in SYMBOLS}
+        if self.neural_model_path.exists():
+            try:
+                self.neural_model_path.unlink()
+            except Exception:  # pragma: no cover
+                pass
+        if self.predictive_model_path.exists():
+            try:
+                self.predictive_model_path.unlink()
+            except Exception:  # pragma: no cover
+                pass
+        self.reset_regime_baseline()
         self._ensure_csv()
 
 
@@ -2329,6 +2501,14 @@ class TradingEngine:
             macd_value = auto_learn.calculate_macd(df['close'].values)
             price_reference = entry_price if entry_price else 1.0
             boll_ratio = boll_width / price_reference if price_reference else 0.0
+            rsi_signal = next((out.signal for name, out in results if name == 'RSI'), 'NONE')
+            ema_signal = next((out.signal for name, out in results if name == 'EMA Trend'), 'NONE')
+            macd_signal = 'CALL' if macd_value > 0 else 'PUT' if macd_value < 0 else 'NONE'
+            regime = auto_learn.detect_market_regime(adx_value, boll_ratio, volatilidad_actual)
+            regime_snapshot = auto_learn.apply_market_regime(regime)
+            logging.info(
+                f"📊 Market Regime: {regime} | min_conf={regime_snapshot['min_confidence']:.2f}"
+            )
             indicator_conf = auto_learn.calculate_confidence(
                 latest_rsi,
                 ema_spread,
@@ -2336,9 +2516,6 @@ class TradingEngine:
                 adx_value,
                 macd_value,
             )
-            rsi_signal = next((out.signal for name, out in results if name == 'RSI'), 'NONE')
-            ema_signal = next((out.signal for name, out in results if name == 'EMA Trend'), 'NONE')
-            macd_signal = 'CALL' if macd_value > 0 else 'PUT' if macd_value < 0 else 'NONE'
             evaluation.update(
                 {
                     'latest_rsi': latest_rsi,
@@ -2351,6 +2528,8 @@ class TradingEngine:
                     'rsi_signal': rsi_signal,
                     'ema_signal': ema_signal,
                     'macd_signal': macd_signal,
+                    'market_regime': regime,
+                    'regime_min_confidence': regime_snapshot['min_confidence'],
                 }
             )
             signals = [rsi_signal, ema_signal, macd_signal]
@@ -2531,6 +2710,7 @@ class TradingEngine:
                 'contract_id': contract_id,
                 'stake': stake_amount,
                 'ml_probability': ml_probability,
+                'market_regime': evaluation.get('market_regime', 'UNKNOWN'),
             }
             record = TradeRecord(
                 timestamp=datetime.now(timezone.utc),
@@ -2576,7 +2756,7 @@ class TradingEngine:
             )
             auto_learn.predict_next(latest_rsi, ema_spread, boll_width, volatilidad_actual)
             logging.info(
-                f"{record.timestamp:%Y-%m-%d %H:%M:%S} INFO: [{symbol}] {signal} @{ai_confidence:.2f} | Stake:{stake_amount:.2f} | EMA:{evaluation['ema_diff']:.2f} RSI:{latest_rsi:.2f} | Motivos: {'; '.join(reasons)}"
+                f"{record.timestamp:%Y-%m-%d %H:%M:%S} INFO: [{symbol}] {signal} @{ai_confidence:.2f} | Stake:{stake_amount:.2f} | EMA:{evaluation['ema_diff']:.2f} RSI:{latest_rsi:.2f} | Regime:{evaluation.get('market_regime', 'UNKNOWN')} | Motivos: {'; '.join(reasons)}"
             )
             if ai_notes:
                 logging.info(f"📊 Aviso IA → {'; '.join(ai_notes)}")
