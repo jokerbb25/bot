@@ -2093,6 +2093,9 @@ class TradingEngine:
         self.kelly_enabled = False
         self.initial_balance = 1000.0
         self.base_trade_amount = STAKE
+        self.regime_cycle_count = 0
+        with auto_learn.weights_lock:
+            self._baseline_weights = dict(auto_learn.weights)
 
     def add_trade_listener(self, callback: Callable[[TradeRecord, Dict[str, float]], None]) -> None:
         self._trade_listeners.append(callback)
@@ -2222,6 +2225,52 @@ class TradingEngine:
             results.append(('Volatility Filter', strategy_volatility_filter(df)))
         consensus = combine_signals(results, active_states)
         return results, consensus
+
+    def detect_market_regime(self, adx_value: float, bollinger_width: float, volatility: float) -> str:
+        if adx_value > 25.0 and volatility < 0.02:
+            regime = "TRENDING"
+        elif adx_value < 20.0 and volatility < 0.015:
+            regime = "RANGING"
+        elif volatility > 0.03 or bollinger_width > 0.03:
+            regime = "VOLATILE"
+        else:
+            regime = "CALM"
+        logging.info(f"📊 Market Regime Detected: {regime}")
+        return regime
+
+    def _apply_regime_adjustments(self, regime: str) -> None:
+        if not regime:
+            return
+        update_weights = False
+        with auto_learn.weights_lock:
+            weights_snapshot = dict(auto_learn.weights)
+            if regime == "TRENDING":
+                weights_snapshot["EMA"] = weights_snapshot.get("EMA", 1.0) * 1.05
+                weights_snapshot["RSI"] = weights_snapshot.get("RSI", 1.0) * 0.95
+                update_weights = True
+            elif regime == "RANGING":
+                weights_snapshot["RSI"] = weights_snapshot.get("RSI", 1.0) * 1.05
+                weights_snapshot["MACD"] = weights_snapshot.get("MACD", 1.0) * 0.95
+                update_weights = True
+            elif regime == "VOLATILE" or regime == "CALM":
+                update_weights = False
+            if update_weights:
+                for key, value in list(weights_snapshot.items()):
+                    weights_snapshot[key] = float(np.clip(value, 0.2, 3.0))
+                auto_learn.weights = weights_snapshot
+        with auto_learn.lock:
+            current_conf = float(auto_learn.min_confidence)
+            if regime == "VOLATILE":
+                current_conf += 0.05
+            elif regime == "CALM":
+                current_conf -= 0.02
+            current_conf = float(np.clip(current_conf, 0.3, 0.95))
+            auto_learn.min_confidence = current_conf
+        self.regime_cycle_count += 1
+        if self.regime_cycle_count % 200 == 0:
+            with auto_learn.weights_lock:
+                auto_learn.weights = dict(self._baseline_weights)
+            logging.info("🔄 Resetting indicator weights to baseline.")
 
     def _handle_auto_shutdown(self) -> None:
         if self.auto_shutdown_triggered:
@@ -2427,6 +2476,8 @@ class TradingEngine:
                     'macd_signal': macd_signal,
                 }
             )
+            regime = self.detect_market_regime(adx_value, boll_width, volatilidad_actual)
+            self._apply_regime_adjustments(regime)
             signals = [rsi_signal, ema_signal, macd_signal]
             if signals.count('CALL') >= 2:
                 evaluation['confluence_direction'] = 'CALL'
