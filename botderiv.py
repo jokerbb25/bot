@@ -302,7 +302,7 @@ class auto_learning:
         self.regime_baseline_min_conf: float = self.min_confidence
         self._ensure_csv()
         if keras is not None:
-            self._load_neural_model_async()
+            self.load_model_async()
 
     def _ensure_csv(self) -> None:
         if self.csv_path.exists():
@@ -559,7 +559,7 @@ class auto_learning:
             with self.neural_training_lock:
                 self.is_training_neural = False
 
-    def _load_neural_model_async(self) -> None:
+    def load_model_async(self) -> None:
         if keras is None:
             return
         with self.neural_io_lock:
@@ -595,7 +595,7 @@ class auto_learning:
     ) -> float:
         if keras is None or layers is None:
             return 0.5
-        self._load_neural_model_async()
+        self.load_model_async()
         with self.model_lock:
             model = self.neural_model
         if model is None:
@@ -1220,7 +1220,7 @@ class auto_learning:
             if not self.neural_initialized and memory_length >= 500:
                 self.train_neural_predictor()
             elif not self.neural_initialized and self.neural_model_path.exists():
-                self._load_neural_model_async()
+                self.load_model_async()
         with self.model_lock:
             model = self.model
         if model is None and load is not None and self.predictive_model_path.exists():
