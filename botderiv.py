@@ -301,9 +301,6 @@ class auto_learning:
         self.regime_baseline_weights: Dict[str, float] = dict(self.weights)
         self.regime_baseline_min_conf: float = self.min_confidence
         self._ensure_csv()
-        if keras is not None:
-            self.load_model_async()
-
     def _ensure_csv(self) -> None:
         if self.csv_path.exists():
             return
@@ -516,7 +513,7 @@ class auto_learning:
             min_conf_snapshot = self.min_confidence
         return {"weights": weights_snapshot, "min_confidence": min_conf_snapshot, "regime": regime}
 
-    def train_neural_predictor(self) -> None:
+    def schedule_neural_training(self) -> None:
         if keras is None or layers is None:
             logging.debug("TensorFlow no disponible, se omite el entrenamiento de la red neuronal")
             return
@@ -1120,7 +1117,7 @@ class auto_learning:
             self.stability_guard(recent, historical)
             if optimize:
                 self.train_predictive_model()
-                self.train_neural_predictor()
+                self.schedule_neural_training()
                 self.optimize_thresholds()
         except Exception as exc:  # pragma: no cover
             logging.debug(f"Error en aprendizaje periódico: {exc}")
@@ -1218,7 +1215,7 @@ class auto_learning:
             self.train_predictive_model()
         if keras is not None:
             if not self.neural_initialized and memory_length >= 500:
-                self.train_neural_predictor()
+                self.schedule_neural_training()
             elif not self.neural_initialized and self.neural_model_path.exists():
                 self.load_model_async()
         with self.model_lock:
@@ -3076,9 +3073,15 @@ class BotWindow(QtWidgets.QWidget):
         self.bridge.summary.connect(self._on_summary)
         self.bridge.trade_state.connect(self._on_trade_state)
 
-        self.log_handler = QtLogHandler()
-        self.log_handler.emitter.message.connect(self._append_log)
-        logging.getLogger().addHandler(self.log_handler)
+        logger = logging.getLogger()
+        existing_handler = next((h for h in logger.handlers if isinstance(h, QtLogHandler)), None)
+        if existing_handler is None:
+            self.log_handler = QtLogHandler()
+            self.log_handler.emitter.message.connect(self._append_log)
+            logger.addHandler(self.log_handler)
+        else:
+            self.log_handler = existing_handler
+            self.log_handler.emitter.message.connect(self._append_log)
 
         self.engine = TradingEngine()
         self.engine.add_trade_listener(lambda record, stats: self.bridge.trade.emit(record, stats))
@@ -3109,6 +3112,9 @@ class BotWindow(QtWidgets.QWidget):
         self.history_prediction_label: Optional[QtWidgets.QLabel] = None
 
         self._build_ui()
+
+        if keras is not None:
+            auto_learn.load_model_async()
 
         self.refresh_timer = QtCore.QTimer(self)
         self.refresh_timer.setInterval(1500)
@@ -3696,9 +3702,6 @@ def main() -> None:
     window.show()
     app.exec_()
 
-
-if __name__ == "__main__":
-    main()
 
 if __name__ == "__main__":
     main()
