@@ -44,6 +44,7 @@ MAX_DAILY_LOSS = -75.0
 MAX_DAILY_PROFIT = 100.0
 COOLDOWN_AFTER_LOSS = 60
 MAX_DRAWDOWN = -150.0
+MIN_TRADE_CONFIDENCE = 0.45
 
 AI_ENABLED = True
 AI_PASSIVE_MODE = True
@@ -197,9 +198,13 @@ class auto_learning:
     def __init__(self) -> None:
         self.csv_path = Path("botderivcsv.csv")
         self.csv_fields = [
+            "timestamp",
             "asset",
             "direction",
             "result",
+            "signal_source",
+            "signal_direction",
+            "price_change",
             "rsi",
             "ema",
             "bollinger",
@@ -225,6 +230,10 @@ class auto_learning:
         self.biases: Dict[str, Dict[str, float]] = {
             symbol: {"RSI": 0.0, "EMA": 0.0} for symbol in SYMBOLS
         }
+        self.last_signal: Dict[str, Dict[str, str]] = {
+            symbol: {"source": "COMBINED"} for symbol in SYMBOLS
+        }
+        self.weights: Dict[str, float] = {symbol: 1.0 for symbol in SYMBOLS}
         self.last_prediction = 0.5
         self.learning_event = threading.Event()
         self.learning_thread = threading.Thread(target=self._learning_loop, daemon=True)
@@ -296,35 +305,6 @@ class auto_learning:
         with self.lock:
             profile = self._get_symbol_profile(asset)
             return self._symbol_snapshot(profile)
-
-    def _update_bias_for_trade(
-        self,
-        asset: str,
-        etiqueta: Optional[int],
-        direction: str,
-        confidence: float,
-        volatility_value: float,
-    ) -> Tuple[float, float]:
-        with self.bias_lock:
-            if asset not in self.biases:
-                self.biases[asset] = {"RSI": 0.0, "EMA": 0.0}
-            bias_state = self.biases[asset]
-            if etiqueta == 0:
-                base_step = 0.02
-                confidence_modifier = np.clip((0.55 - confidence) * 0.05, -0.01, 0.01)
-                volatility_modifier = np.clip(abs(volatility_value) * 5.0, 0.0, 0.01)
-                step = np.clip(base_step + confidence_modifier + volatility_modifier, 0.01, 0.03)
-                if direction == "CALL":
-                    bias_state["RSI"] -= step
-                    bias_state["EMA"] += step * 0.5
-                elif direction == "PUT":
-                    bias_state["RSI"] += step
-                    bias_state["EMA"] -= step * 0.5
-                else:
-                    bias_state["EMA"] += np.sign(bias_state["EMA"]) * step * 0.2
-                bias_state["RSI"] = float(np.clip(bias_state["RSI"], -2.0, 2.0))
-                bias_state["EMA"] = float(np.clip(bias_state["EMA"], -2.0, 2.0))
-            return float(bias_state["RSI"]), float(bias_state["EMA"])
 
     def _apply_symbol_learning(
         self,
@@ -438,15 +418,38 @@ class auto_learning:
                 )
         return self._symbol_snapshot(profile)
 
-    def register_trade_context(self, asset: str, direction: str, confidence: float) -> None:
+    def register_trade_context(
+        self,
+        asset: str,
+        direction: str,
+        confidence: float,
+        entry_price: float,
+        signal_source: str,
+    ) -> None:
         with self.lock:
             self._get_symbol_profile(asset)
             self._pending_context[asset] = {
                 "direction": direction,
                 "confidence": float(confidence),
+                "entry_price": float(entry_price),
+                "signal_source": signal_source,
             }
 
-    def update_history(self, result: str, asset: str, rsi_value: float, ema_value: float, boll_value: float, volatility_value: float) -> None:
+    def record_signal_source(self, asset: str, source: str) -> None:
+        with self.lock:
+            state = self.last_signal.setdefault(asset, {})
+            state["source"] = source
+
+    def update_history(
+        self,
+        result: str,
+        asset: str,
+        rsi_value: float,
+        ema_value: float,
+        boll_value: float,
+        volatility_value: float,
+        price_change: float,
+    ) -> None:
         self.executor.submit(
             self._update_history_sync,
             result,
@@ -455,21 +458,30 @@ class auto_learning:
             float(ema_value),
             float(boll_value),
             float(volatility_value),
+            float(price_change),
         )
 
-    def _update_history_sync(self, result: str, asset: str, rsi_value: float, ema_value: float, boll_value: float, volatility_value: float) -> None:
+    def _update_history_sync(
+        self,
+        result: str,
+        asset: str,
+        rsi_value: float,
+        ema_value: float,
+        boll_value: float,
+        volatility_value: float,
+        price_change: float,
+    ) -> None:
         context = self._pop_context(asset)
         direction = context.get("direction", "NONE")
         confidence = context.get("confidence", 0.0)
+        signal_source = context.get("signal_source") or self.last_signal.get(asset, {}).get("source", "COMBINED")
+        timestamp_now = datetime.now(timezone.utc).isoformat()
         resultado = str(result).upper()
         etiqueta = 1 if resultado == "WIN" else 0 if resultado == "LOSS" else None
         self._ensure_csv()
-        row_payload: Dict[str, str] = {}
         should_train = False
         adjusted_rsi_value = float(rsi_value)
         adjusted_ema_value = float(ema_value)
-        rsi_bias = 0.0
-        ema_bias = 0.0
         with self.lock:
             profile = self._get_symbol_profile(asset)
             snapshot = self._symbol_snapshot(profile)
@@ -493,16 +505,13 @@ class auto_learning:
                 ema_value,
                 volatility_value,
             )
-            rsi_bias, ema_bias = self._update_bias_for_trade(
-                asset,
-                etiqueta,
-                direction,
-                float(confidence),
-                float(volatility_value),
-            )
             symbol_params = ajustes if ajustes else snapshot
             adjusted_rsi_value = float(rsi_value + (symbol_params.get("rsi_period", 14.0) - 14.0) * 0.5)
             adjusted_ema_value = float(ema_value + symbol_params.get("ema_tolerance", 0.0) * 0.1)
+            with self.bias_lock:
+                bias_state = self.biases.setdefault(asset, {"RSI": 0.0, "EMA": 0.0})
+                rsi_bias = float(bias_state.get("RSI", 0.0))
+                ema_bias = float(bias_state.get("EMA", 0.0))
             trade_entry = {
                 "asset": asset,
                 "direction": direction,
@@ -518,6 +527,8 @@ class auto_learning:
                 "ema_slow": ajustes.get("ema_slow", snapshot.get("ema_slow", 21.0)) if ajustes else snapshot.get("ema_slow", 21.0),
                 "rsi_bias": rsi_bias,
                 "ema_bias": ema_bias,
+                "price_change": price_change,
+                "signal_source": signal_source,
             }
             self.last_trades.append(trade_entry)
             features = [
@@ -536,9 +547,13 @@ class auto_learning:
             if self.trade_counter % 100 == 0 and self.trade_counter > 0:
                 should_train = True
             row_payload = {
+                "timestamp": timestamp_now,
                 "asset": asset,
                 "direction": direction,
                 "result": resultado,
+                "signal_source": signal_source,
+                "signal_direction": direction,
+                "price_change": f"{price_change:.6f}",
                 "rsi": f"{rsi_value:.6f}",
                 "ema": f"{ema_value:.6f}",
                 "bollinger": f"{boll_value:.6f}",
@@ -564,8 +579,74 @@ class auto_learning:
         with self.lock:
             return self._pending_context.pop(asset, {}).copy()
 
-    def adjust_bias(self) -> None:
+    def adjust_bias(self, symbol: str, result: str, signal_direction: str, price_change: float) -> None:
+        if str(result).upper() != "LOSS":
+            return
+        source = self.last_signal.get(symbol, {}).get("source", "COMBINED")
+        direction = str(signal_direction).upper()
+        price_delta = float(price_change)
+        direction_error = False
+        if direction == "CALL" and price_delta < 0:
+            direction_error = True
+        elif direction == "PUT" and price_delta > 0:
+            direction_error = True
+        else:
+            direction_error = False
+        with self.bias_lock:
+            bias_state = self.biases.setdefault(symbol, {"RSI": 0.0, "EMA": 0.0})
+            if source == "RSI":
+                bias_state["RSI"] += -0.02 if direction_error else 0.02
+            elif source == "EMA":
+                bias_state["EMA"] += -0.02 if direction_error else 0.02
+            else:
+                delta = -0.01 if direction_error else 0.01
+                bias_state["RSI"] += delta
+                bias_state["EMA"] += delta
+            bias_state["RSI"] = float(np.clip(bias_state["RSI"], -2.0, 2.0))
+            bias_state["EMA"] = float(np.clip(bias_state["EMA"], -2.0, 2.0))
+            rsi_bias = float(bias_state["RSI"])
+            ema_bias = float(bias_state["EMA"])
+        logging.info(
+            f"🧠 Bias adjusted [{symbol}] Source={source} RSI={rsi_bias:.2f} EMA={ema_bias:.2f}"
+        )
+        self.log_bias_update(symbol, result, direction, price_delta, source)
         self.learning_event.set()
+
+    def log_bias_update(
+        self,
+        symbol: str,
+        result: str,
+        signal_direction: str,
+        price_change: float,
+        source: Optional[str] = None,
+    ) -> None:
+        timestamp_now = datetime.now(timezone.utc).isoformat()
+        source_label = source or self.last_signal.get(symbol, {}).get("source", "COMBINED")
+        with self.bias_lock:
+            bias_state = self.biases.setdefault(symbol, {"RSI": 0.0, "EMA": 0.0})
+            rsi_bias = float(bias_state.get("RSI", 0.0))
+            ema_bias = float(bias_state.get("EMA", 0.0))
+        self._ensure_csv()
+        row = {field: "" for field in self.csv_fields}
+        row.update(
+            {
+                "timestamp": timestamp_now,
+                "asset": symbol,
+                "result": str(result).upper(),
+                "signal_source": source_label,
+                "direction": signal_direction,
+                "signal_direction": signal_direction,
+                "price_change": f"{float(price_change):.6f}",
+                "rsi_bias": f"{rsi_bias:.6f}",
+                "ema_bias": f"{ema_bias:.6f}",
+            }
+        )
+        try:
+            with self.csv_path.open("a", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=self.csv_fields)
+                writer.writerow(row)
+        except Exception as exc:  # pragma: no cover
+            logging.debug(f"No se pudo registrar ajuste de sesgos: {exc}")
 
     def _learning_loop(self) -> None:
         while True:
@@ -1626,12 +1707,34 @@ class TradingEngine:
         return "UNKNOWN", 0.0
 
 
-    def execute_cycle(self, symbol: str) -> None:
-        global operation_active
-        now = datetime.now(timezone.utc)
-        if operation_active:
-            time.sleep(2)
-            return
+    def _determine_signal_source(
+        self,
+        signal: str,
+        consensus: Dict[str, Any],
+        results: List[Tuple[str, StrategyResult]],
+    ) -> str:
+        if signal not in {"CALL", "PUT"}:
+            return "COMBINED"
+        if consensus.get("override"):
+            reason = str(consensus.get("override_reason", "")).upper()
+            if "RSI" in reason:
+                return "RSI"
+            if "EMA" in reason:
+                return "EMA"
+        matching = [name for name, outcome in results if outcome.signal == signal]
+        if not matching:
+            return "COMBINED"
+        if matching == ["RSI"]:
+            return "RSI"
+        if matching == ["EMA Trend"]:
+            return "EMA"
+        if "RSI" in matching and all(name == "RSI" for name in matching):
+            return "RSI"
+        if "EMA Trend" in matching and all(name == "EMA Trend" for name in matching):
+            return "EMA"
+        return "COMBINED"
+
+    def _evaluate_symbol(self, symbol: str) -> Optional[Dict[str, Any]]:
         auto_learn.set_active_symbol(symbol)
         try:
             candles = self.api.fetch_candles(symbol)
@@ -1647,153 +1750,225 @@ class TradingEngine:
                 logging.info(f'[{symbol}] {etiqueta}: {mensaje} (señal {resultado.signal})')
             active_total = consensus['active']
             signals_total = consensus['signals']
+            etiqueta_conf = consensus['confidence_label'].lower()
             if active_total == 0:
                 logging.info('⚠️ Sin estrategias activas configuradas')
-                self._notify_trade_state("ready")
-                return
-            if signals_total == 0:
+            elif signals_total == 0:
                 logging.info('⚠️ Ninguna de las estrategias activas generó señal')
                 logging.info(f"Estrategias activas: {active_total}/{TOTAL_STRATEGY_COUNT}")
-                self._notify_trade_state("ready")
-                return
-            logging.info(f"Estrategias con señal: {signals_total}/{active_total}")
-            etiqueta_conf = consensus['confidence_label'].lower()
-            if signal == 'NONE':
+            elif signal == 'NONE':
                 logging.info(f"⚠️ Confianza {etiqueta_conf} ({confidence:.2f}) → {consensus['main_reason']}")
                 logging.info(f"Estrategias activas: {active_total}/{TOTAL_STRATEGY_COUNT}")
                 if consensus['low_volatility']:
                     valor_vol = consensus['volatility_value']
                     detalle = f" ({valor_vol:.4f})" if valor_vol is not None else ''
                     logging.info(f"⚠️ Volatilidad baja detectada{detalle}")
-                self._notify_trade_state("ready")
-                return
-            logging.info(f"📊 Confianza {etiqueta_conf} ({confidence:.2f}) → {consensus['main_reason']}")
-            logging.info(f"Estrategias alineadas: {consensus['aligned']}/{signals_total}")
-            logging.info(f"Estrategias activas: {active_total}/{TOTAL_STRATEGY_COUNT}")
-            if consensus['low_volatility']:
-                valor_vol = consensus['volatility_value']
-                detalle = f" ({valor_vol:.4f})" if valor_vol is not None else ''
-                if consensus['override']:
-                    if 'RSI' in consensus['override_reason']:
-                        logging.info('🚫 Volatilidad baja pero señal fuerte RSI → operación anticipada')
+            else:
+                logging.info(f"📊 Confianza {etiqueta_conf} ({confidence:.2f}) → {consensus['main_reason']}")
+                logging.info(f"Estrategias alineadas: {consensus['aligned']}/{signals_total}")
+                logging.info(f"Estrategias activas: {active_total}/{TOTAL_STRATEGY_COUNT}")
+                if consensus['low_volatility']:
+                    valor_vol = consensus['volatility_value']
+                    detalle = f" ({valor_vol:.4f})" if valor_vol is not None else ''
+                    if consensus['override']:
+                        if 'RSI' in consensus['override_reason']:
+                            logging.info('🚫 Volatilidad baja pero señal fuerte RSI → operación anticipada')
+                        else:
+                            logging.info(f"🚫 Volatilidad baja pero {consensus['override_reason'].lower()} → operación anticipada")
                     else:
-                        logging.info(f"🚫 Volatilidad baja pero {consensus['override_reason'].lower()} → operación anticipada")
-                else:
-                    logging.info(f"⚠️ Volatilidad baja detectada{detalle}")
-            logging.info(
-                f"✅ Señal final: {signal} | Confianza {confidence:.2f} | Estrategias activas: {active_total}/{TOTAL_STRATEGY_COUNT}"
-            )
-            features = build_feature_vector(df, reasons, results)
-            ai_prob = None
-            if AI_ENABLED:
-                api_prob = query_ai_backend(features)
-                if api_prob is not None:
-                    ai_prob = api_prob
-            ai_confidence = confidence
-            ai_notes: List[str] = []
-            internal_prob, internal_notes = self.ai.predict(features)
-            if internal_notes:
-                ai_notes.extend(internal_notes)
-            if ai_prob is not None:
-                if internal_prob != 0.5:
-                    ai_prob = (ai_prob + internal_prob) / 2
-                    ai_notes.append('Mezcla adaptativa aplicada')
-                fused = self.ai.fuse_with_technical(confidence, ai_prob)
-                ai_confidence = fused
-                ai_notes.append(f'Mezcla IA {ai_prob:.2f}')
-            elif internal_prob != 0.5:
-                fused = self.ai.fuse_with_technical(confidence, internal_prob)
-                ai_confidence = fused
-                ai_notes.append(f'Núcleo adaptativo {internal_prob:.2f}')
-            if not self.risk.can_trade(ai_confidence):
-                self._notify_trade_state("ready")
-                return
-            if operation_active:
-                return
-            auto_learn.register_trade_context(symbol, signal, ai_confidence)
-            contract_id, duration_seconds = self.api.buy(symbol, signal, self.trade_amount)
-            if contract_id is None:
-                logging.warning('No se pudo abrir la operación, se reanuda el análisis.')
-                self._notify_trade_state("ready")
-                return
-            operation_active = True
-            self.active_trade_symbol = symbol
-            self._notify_trade_state('active')
-            dur_seconds = duration_seconds if duration_seconds > 0 else TRADE_DURATION_SECONDS
-            logging.info(f"🟢 Operación abierta — Contrato #{contract_id} | Duración: {dur_seconds}s")
-            try:
-                result_status = self._wait_for_contract_result(contract_id, dur_seconds)
-                trade_result, pnl = self._resolve_trade_result(result_status)
-                self.risk.register_trade(pnl)
-                self.ai.log_trade(features, 1 if trade_result == 'WIN' else 0)
-                record_metadata = {
-                    'confidence_label': consensus['confidence_label'],
-                    'confidence_value': consensus['confidence'],
-                    'aligned': consensus['aligned'],
-                    'active': consensus['active'],
-                    'signals': consensus['signals'],
-                    'direction': signal,
-                    'main_reason': consensus['main_reason'],
-                    'low_volatility': consensus['low_volatility'],
-                    'volatility_value': consensus['volatility_value'],
-                    'override': consensus['override'],
-                    'override_reason': consensus['override_reason'],
-                    'dominant': consensus['dominant'],
-                    'total_weight': consensus['total_weight'],
-                    'active_weight': consensus.get('active_weight', 0.0),
-                    'contract_id': contract_id,
-                }
-                record = TradeRecord(
-                    timestamp=datetime.now(timezone.utc),
-                    symbol=symbol,
-                    decision=signal,
-                    confidence=ai_confidence,
-                    result=trade_result,
-                    pnl=pnl,
-                    reasons=reasons + ai_notes,
-                    metadata=record_metadata,
+                        logging.info(f"⚠️ Volatilidad baja detectada{detalle}")
+                logging.info(
+                    f"✅ Señal final: {signal} | Confianza {confidence:.2f} | Estrategias activas: {active_total}/{TOTAL_STRATEGY_COUNT}"
                 )
-                log_trade(record)
-                if trade_result == 'WIN':
-                    self.win_count += 1
-                elif trade_result == 'LOSS':
-                    self.loss_count += 1
-                with self.lock:
-                    self.trade_history.append(record)
-                ema_diff = df['close'].iloc[-1] - df['close'].iloc[-2]
-                latest_rsi = float(rsi(df['close']).iloc[-1])
-                ema_corto_valor = float(ema(df['close'], 9).iloc[-1])
-                ema_largo_valor = float(ema(df['close'], 21).iloc[-1])
+            entry_price = float(df['close'].iloc[-1]) if not df.empty else 0.0
+            evaluation: Dict[str, Any] = {
+                'symbol': symbol,
+                'signal': signal,
+                'base_confidence': confidence,
+                'ai_confidence': confidence,
+                'final_confidence': 0.0,
+                'reasons': reasons,
+                'ai_notes': [],
+                'consensus': consensus,
+                'results': results,
+                'features': None,
+                'entry_price': entry_price,
+                'latest_rsi': 0.0,
+                'ema_spread': 0.0,
+                'boll_width': 0.0,
+                'volatility': 0.0,
+                'signal_source': 'COMBINED',
+                'ema_diff': float(df['close'].iloc[-1] - df['close'].iloc[-2]) if len(df) > 1 else 0.0,
+            }
+            if signal in {'CALL', 'PUT'}:
+                features = build_feature_vector(df, reasons, results)
+                ai_prob = None
+                if AI_ENABLED:
+                    api_prob = query_ai_backend(features)
+                    if api_prob is not None:
+                        ai_prob = api_prob
+                ai_confidence = confidence
+                ai_notes: List[str] = []
+                internal_prob, internal_notes = self.ai.predict(features)
+                if internal_notes:
+                    ai_notes.extend(internal_notes)
+                if ai_prob is not None:
+                    if internal_prob != 0.5:
+                        ai_prob = (ai_prob + internal_prob) / 2
+                        ai_notes.append('Mezcla adaptativa aplicada')
+                    fused = self.ai.fuse_with_technical(confidence, ai_prob)
+                    ai_confidence = fused
+                    ai_notes.append(f'Mezcla IA {ai_prob:.2f}')
+                elif internal_prob != 0.5:
+                    fused = self.ai.fuse_with_technical(confidence, internal_prob)
+                    ai_confidence = fused
+                    ai_notes.append(f'Núcleo adaptativo {internal_prob:.2f}')
+                latest_rsi_series = rsi(df['close'])
+                latest_rsi = float(latest_rsi_series.iloc[-1]) if not latest_rsi_series.empty else 0.0
+                ema_corto_valor = float(ema(df['close'], 9).iloc[-1]) if len(df) else 0.0
+                ema_largo_valor = float(ema(df['close'], 21).iloc[-1]) if len(df) else 0.0
                 ema_spread = ema_corto_valor - ema_largo_valor
                 bandas_inferior, bandas_superior = bollinger_bands(df['close'])
                 boll_width = float(bandas_superior.iloc[-1] - bandas_inferior.iloc[-1]) if len(bandas_superior) else 0.0
                 volatilidad_serie = df['close'].pct_change().rolling(20).std()
                 volatilidad_actual = float(np.nan_to_num(volatilidad_serie.iloc[-1], nan=0.0)) if len(volatilidad_serie) else 0.0
-                auto_learn.update_history(trade_result, symbol, latest_rsi, ema_spread, boll_width, volatilidad_actual)
-                auto_learn.adjust_bias()
-                auto_learn.predict_next(latest_rsi, ema_spread, boll_width, volatilidad_actual)
-                logging.info(
-                    f"{record.timestamp:%Y-%m-%d %H:%M:%S} INFO: [{symbol}] {signal} @{ai_confidence:.2f} | EMA:{ema_diff:.2f} RSI:{latest_rsi:.2f} | Motivos: {'; '.join(reasons)}"
+                signal_source = self._determine_signal_source(signal, consensus, results)
+                auto_learn.record_signal_source(symbol, signal_source)
+                weight = auto_learn.weights.get(symbol, 1.0)
+                final_confidence = float(np.clip(ai_confidence * weight, 0.0, 1.0))
+                evaluation.update(
+                    {
+                        'ai_confidence': ai_confidence,
+                        'final_confidence': final_confidence,
+                        'ai_notes': ai_notes,
+                        'features': features,
+                        'latest_rsi': latest_rsi,
+                        'ema_spread': ema_spread,
+                        'boll_width': boll_width,
+                        'volatility': volatilidad_actual,
+                        'signal_source': signal_source,
+                    }
                 )
-                if ai_notes:
-                    logging.info(f"📊 Aviso IA → {'; '.join(ai_notes)}")
-                self._notify_trade(record)
-                if (
-                    self.auto_shutdown_enabled
-                    and not self.auto_shutdown_triggered
-                    and trade_result == 'LOSS'
-                    and self.auto_shutdown_limit > 0
-                    and self.risk.consecutive_losses >= self.auto_shutdown_limit
-                ):
-                    self._handle_auto_shutdown()
-            except Exception as exc:
-                logging.warning(f"Error al gestionar la operación #{contract_id}: {exc}")
-            finally:
-                operation_active = False
-                self.active_trade_symbol = None
-                logging.info(RESUME_MESSAGE)
+            return evaluation
+        except Exception as exc:
+            logging.warning(f"Error en ciclo para {symbol}: {exc}")
+            return None
         finally:
             auto_learn.set_active_symbol(None)
+
+    def _fetch_exit_price(self, symbol: str, fallback: float) -> float:
+        try:
+            candles = self.api.fetch_candles(symbol)
+            if candles:
+                return float(candles[-1].close)
+        except Exception as exc:
+            logging.debug(f"No se pudo obtener precio de salida para {symbol}: {exc}")
+        return fallback
+
+    def _execute_selected_trade(self, evaluation: Dict[str, Any]) -> None:
+        global operation_active
+        symbol = evaluation['symbol']
+        signal = evaluation['signal']
+        ai_confidence = float(evaluation['ai_confidence'])
+        reasons = evaluation['reasons']
+        ai_notes = evaluation['ai_notes']
+        consensus = evaluation['consensus']
+        features = evaluation['features']
+        entry_price = float(evaluation['entry_price'])
+        signal_source = evaluation['signal_source']
+        if not self.risk.can_trade(ai_confidence):
+            return
+        if operation_active:
+            return
+        auto_learn.register_trade_context(symbol, signal, ai_confidence, entry_price, signal_source)
+        contract_id, duration_seconds = self.api.buy(symbol, signal, self.trade_amount)
+        if contract_id is None:
+            logging.warning('No se pudo abrir la operación, se reanuda el análisis.')
+            self._notify_trade_state("ready")
+            return
+        operation_active = True
+        self.active_trade_symbol = symbol
+        self._notify_trade_state('active')
+        dur_seconds = duration_seconds if duration_seconds > 0 else TRADE_DURATION_SECONDS
+        logging.info(f"🟢 Operación abierta — Contrato #{contract_id} | Duración: {dur_seconds}s")
+        try:
+            result_status = self._wait_for_contract_result(contract_id, dur_seconds)
+            trade_result, pnl = self._resolve_trade_result(result_status)
+            self.risk.register_trade(pnl)
+            if features is not None:
+                self.ai.log_trade(features, 1 if trade_result == 'WIN' else 0)
+            record_metadata = {
+                'confidence_label': consensus['confidence_label'],
+                'confidence_value': consensus['confidence'],
+                'aligned': consensus['aligned'],
+                'active': consensus['active'],
+                'signals': consensus['signals'],
+                'direction': signal,
+                'main_reason': consensus['main_reason'],
+                'low_volatility': consensus['low_volatility'],
+                'volatility_value': consensus['volatility_value'],
+                'override': consensus['override'],
+                'override_reason': consensus['override_reason'],
+                'dominant': consensus['dominant'],
+                'total_weight': consensus['total_weight'],
+                'active_weight': consensus.get('active_weight', 0.0),
+                'contract_id': contract_id,
+            }
+            record = TradeRecord(
+                timestamp=datetime.now(timezone.utc),
+                symbol=symbol,
+                decision=signal,
+                confidence=ai_confidence,
+                result=trade_result,
+                pnl=pnl,
+                reasons=reasons + ai_notes,
+                metadata=record_metadata,
+            )
+            log_trade(record)
+            if trade_result == 'WIN':
+                self.win_count += 1
+            elif trade_result == 'LOSS':
+                self.loss_count += 1
+            with self.lock:
+                self.trade_history.append(record)
+            latest_rsi = float(evaluation['latest_rsi'])
+            ema_spread = float(evaluation['ema_spread'])
+            boll_width = float(evaluation['boll_width'])
+            volatilidad_actual = float(evaluation['volatility'])
+            exit_price = self._fetch_exit_price(symbol, entry_price)
+            price_change = float(exit_price - entry_price)
+            auto_learn.update_history(
+                trade_result,
+                symbol,
+                latest_rsi,
+                ema_spread,
+                boll_width,
+                volatilidad_actual,
+                price_change,
+            )
+            auto_learn.adjust_bias(symbol, trade_result, signal, price_change)
+            auto_learn.predict_next(latest_rsi, ema_spread, boll_width, volatilidad_actual)
+            logging.info(
+                f"{record.timestamp:%Y-%m-%d %H:%M:%S} INFO: [{symbol}] {signal} @{ai_confidence:.2f} | EMA:{evaluation['ema_diff']:.2f} RSI:{latest_rsi:.2f} | Motivos: {'; '.join(reasons)}"
+            )
+            if ai_notes:
+                logging.info(f"📊 Aviso IA → {'; '.join(ai_notes)}")
+            self._notify_trade(record)
+            if (
+                self.auto_shutdown_enabled
+                and not self.auto_shutdown_triggered
+                and trade_result == 'LOSS'
+                and self.auto_shutdown_limit > 0
+                and self.risk.consecutive_losses >= self.auto_shutdown_limit
+            ):
+                self._handle_auto_shutdown()
+        except Exception as exc:
+            logging.warning(f"Error al gestionar la operación #{contract_id}: {exc}")
+        finally:
+            operation_active = False
+            self.active_trade_symbol = None
+            logging.info(RESUME_MESSAGE)
+            self._notify_trade_state("ready")
 
     def run(self) -> None:
         global operation_active
@@ -1805,16 +1980,37 @@ class TradingEngine:
         self._notify_trade_state("ready")
         try:
             while self.running.is_set():
+                evaluations: List[Dict[str, Any]] = []
+                confidence_lines: List[str] = []
                 for symbol in SYMBOLS:
                     if not self.running.is_set():
                         break
-                    try:
-                        self.execute_cycle(symbol)
-                    except Exception as exc:
-                        logging.warning(f"Error en ciclo para {symbol}: {exc}")
+                    evaluation = self._evaluate_symbol(symbol)
+                    if evaluation is not None:
+                        evaluations.append(evaluation)
+                        confidence_lines.append(f"{symbol}: {float(evaluation['final_confidence']):.2f}")
                     if not self.running.is_set():
                         break
                     time.sleep(1)
+                if not self.running.is_set():
+                    break
+                if not evaluations:
+                    continue
+                best = max(evaluations, key=lambda item: float(item['final_confidence']))
+                summary_line = " | ".join(confidence_lines)
+                selected_text = (
+                    f"{best['symbol']} ({float(best['final_confidence']):.2f})"
+                    if best['signal'] in {'CALL', 'PUT'}
+                    else "ninguno"
+                )
+                if summary_line:
+                    logging.info(f"{summary_line} → Selected: {selected_text}")
+                if best['signal'] not in {'CALL', 'PUT'} or float(best['final_confidence']) < MIN_TRADE_CONFIDENCE:
+                    logging.info(
+                        f"⚠️ Confianza máxima {float(best['final_confidence']):.2f} inferior al mínimo {MIN_TRADE_CONFIDENCE:.2f} → sin operación"
+                    )
+                    continue
+                self._execute_selected_trade(best)
         finally:
             self._notify_status("stopped")
 
