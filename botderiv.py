@@ -20,6 +20,15 @@ from ta.trend import EMAIndicator, SMAIndicator
 from ta.volatility import BollingerBands, AverageTrueRange
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier
+try:
+    from joblib import dump, load
+except ImportError:  # pragma: no cover
+    dump = None  # type: ignore
+    load = None  # type: ignore
+try:
+    from skopt import gp_minimize
+except ImportError:  # pragma: no cover
+    gp_minimize = None  # type: ignore
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 
@@ -211,6 +220,8 @@ class auto_learning:
             "volatility",
             "confidence",
             "indicator_confidence",
+            "ml_probability",
+            "stake",
             "rsi_bias",
             "ema_bias",
             "rsi_adjusted",
@@ -220,6 +231,7 @@ class auto_learning:
         self.lock = threading.Lock()
         self.model_lock = threading.Lock()
         self.bias_lock = threading.Lock()
+        self.memory_lock = threading.Lock()
         self.executor = ThreadPoolExecutor(max_workers=2)
         self.asset_stats: Dict[str, Dict[str, int]] = defaultdict(lambda: {"wins": 0, "total": 0})
         self.global_totals = {"wins": 0, "total": 0}
@@ -248,6 +260,16 @@ class auto_learning:
         self.batch_size = 10
         self.adx_prev: Dict[str, float] = {}
         self.last_prediction = 0.5
+        self.memory: List[Dict[str, Any]] = []
+        self.memory_limit = 5000
+        self.recent_results: deque = deque(maxlen=200)
+        self.learning_rate = 0.02
+        self.min_confidence = MIN_TRADE_CONFIDENCE
+        self.rsi_high_threshold = 70.0
+        self.adx_min_threshold = 20.0
+        self.predictive_model_path = Path("predictive_model.pkl")
+        self.reinforce_batches = 0
+        self.optimize_batches = 0
         self.learning_event = threading.Event()
         self.learning_thread = threading.Thread(target=self._learning_loop, daemon=True)
         self.learning_thread.start()
@@ -255,6 +277,8 @@ class auto_learning:
         self.symbol_profiles: Dict[str, Dict[str, Any]] = {
             symbol: self._default_symbol_profile() for symbol in SYMBOLS
         }
+        for profile in self.symbol_profiles.values():
+            profile["learning_rate"] = self.learning_rate
         self._current_symbol: Optional[str] = None
         self._ensure_csv()
 
@@ -640,6 +664,8 @@ class auto_learning:
         entry_price: float,
         signal_source: str,
         indicator_confidence: float = 0.0,
+        ml_probability: float = 0.0,
+        stake: float = 0.0,
     ) -> None:
         with self.lock:
             self._get_symbol_profile(asset)
@@ -649,6 +675,8 @@ class auto_learning:
                 "entry_price": float(entry_price),
                 "signal_source": signal_source,
                 "indicator_confidence": float(indicator_confidence),
+                "ml_probability": float(ml_probability),
+                "stake": float(stake),
             }
 
     def record_signal_source(self, asset: str, source: str) -> None:
@@ -691,6 +719,8 @@ class auto_learning:
         direction = context.get("direction", "NONE")
         confidence = context.get("confidence", 0.0)
         indicator_confidence = context.get("indicator_confidence", 0.0)
+        ml_probability = context.get("ml_probability", 0.0)
+        stake_value = context.get("stake", 0.0)
         signal_source = context.get("signal_source") or self.last_signal.get(asset, {}).get("source", "COMBINED")
         timestamp_now = datetime.now(timezone.utc).isoformat()
         resultado = str(result).upper()
@@ -739,6 +769,8 @@ class auto_learning:
                 "volatility": volatility_value,
                 "confidence": confidence,
                 "indicator_confidence": indicator_confidence,
+                "ml_probability": ml_probability,
+                "stake": stake_value,
                 "label": etiqueta,
                 "rsi_adjusted": ajustes.get("rsi_period", snapshot.get("rsi_period", 14.0)) if ajustes else snapshot.get("rsi_period", 14.0),
                 "ema_fast": ajustes.get("ema_fast", snapshot.get("ema_fast", 9.0)) if ajustes else snapshot.get("ema_fast", 9.0),
@@ -778,6 +810,8 @@ class auto_learning:
                 "volatility": f"{volatility_value:.6f}",
                 "confidence": f"{confidence:.6f}",
                 "indicator_confidence": f"{indicator_confidence:.6f}",
+                "ml_probability": f"{ml_probability:.6f}",
+                "stake": f"{stake_value:.6f}",
                 "rsi_bias": f"{rsi_bias:.6f}",
                 "ema_bias": f"{ema_bias:.6f}",
                 "rsi_adjusted": f"{trade_entry['rsi_adjusted']:.6f}",
@@ -866,6 +900,226 @@ class auto_learning:
                 writer.writerow(row)
         except Exception as exc:  # pragma: no cover
             logging.debug(f"No se pudo registrar ajuste de sesgos: {exc}")
+
+    def store_context(
+        self,
+        symbol: str,
+        rsi: float,
+        ema: float,
+        macd: float,
+        adx: float,
+        hour: int,
+        result: str,
+    ) -> None:
+        entry = {
+            "symbol": symbol,
+            "RSI": float(rsi),
+            "EMA": float(ema),
+            "MACD": float(macd),
+            "ADX": float(adx),
+            "hour": int(hour),
+            "result": str(result).upper(),
+        }
+        trigger_reinforce = False
+        trigger_optimize = False
+        with self.memory_lock:
+            self.memory.append(entry)
+            if len(self.memory) > self.memory_limit:
+                self.memory = self.memory[-self.memory_limit :]
+            outcome_flag = 1 if entry["result"] == "WIN" else 0 if entry["result"] == "LOSS" else None
+            if outcome_flag is not None:
+                self.recent_results.append(outcome_flag)
+            length = len(self.memory)
+            reinforce_batches = length // 50
+            optimize_batches = length // 200
+            trigger_reinforce = reinforce_batches > self.reinforce_batches
+            trigger_optimize = optimize_batches > self.optimize_batches
+            if trigger_reinforce:
+                self.reinforce_batches = reinforce_batches
+            if trigger_optimize:
+                self.optimize_batches = optimize_batches
+        if trigger_reinforce or trigger_optimize:
+            self.executor.submit(self._run_periodic_learning, trigger_optimize)
+
+    def _run_periodic_learning(self, optimize: bool) -> None:
+        try:
+            self.reinforce_patterns()
+            recent, historical = self.compute_winrates()
+            self.stability_guard(recent, historical)
+            if optimize:
+                self.train_predictive_model()
+                self.optimize_thresholds()
+        except Exception as exc:  # pragma: no cover
+            logging.debug(f"Error en aprendizaje periódico: {exc}")
+
+    def compute_winrates(self) -> Tuple[float, float]:
+        with self.memory_lock:
+            recent_values = list(self.recent_results)
+        recent_winrate = sum(recent_values) / len(recent_values) if recent_values else 0.0
+        with self.lock:
+            total = self.global_totals.get("total", 0)
+            wins = self.global_totals.get("wins", 0)
+        historical = (wins / total) if total else 0.0
+        return float(recent_winrate), float(historical)
+
+    def reinforce_patterns(self) -> None:
+        with self.memory_lock:
+            if not self.memory:
+                return
+            snapshot = list(self.memory)
+        stats: Dict[Tuple[str, int, int], Dict[str, int]] = {}
+        for item in snapshot:
+            symbol = item.get("symbol")
+            rsi_bucket = int(round(float(item.get("RSI", 0.0)) / 10.0) * 10)
+            hour = int(item.get("hour", 0))
+            key = (symbol, rsi_bucket, hour)
+            entry = stats.setdefault(key, {"w": 0, "l": 0})
+            if str(item.get("result", "")).upper() == "WIN":
+                entry["w"] += 1
+            else:
+                entry["l"] += 1
+        adjustments_made = False
+        for data in stats.values():
+            total = data["w"] + data["l"]
+            if total < 5:
+                continue
+            win_rate = data["w"] / total
+            with self.weights_lock:
+                if win_rate > 0.65:
+                    self.weights["RSI"] *= 1.01
+                    self.weights["MACD"] *= 1.01
+                    adjustments_made = True
+                elif win_rate < 0.45:
+                    self.weights["RSI"] *= 0.99
+                    self.weights["MACD"] *= 0.99
+                    adjustments_made = True
+        if adjustments_made:
+            self._clamp_weights()
+
+    def stability_guard(self, recent_winrate: float, historical_winrate: float) -> None:
+        if recent_winrate - historical_winrate <= 0.20:
+            return
+        logging.warning("⚠️ Overfitting detected – lowering learning rate")
+        self.learning_rate = max(0.005, self.learning_rate * 0.8)
+        with self.lock:
+            for profile in self.symbol_profiles.values():
+                profile_rate = float(profile.get("learning_rate", self.learning_rate))
+                profile["learning_rate"] = max(0.005, profile_rate * 0.8)
+
+    def train_predictive_model(self) -> None:
+        with self.memory_lock:
+            if len(self.memory) < 200:
+                return
+            data_frame = pd.DataFrame(self.memory)
+        try:
+            features = data_frame[["RSI", "EMA", "MACD", "ADX", "hour"]]
+            labels = (data_frame["result"].str.upper() == "WIN").astype(int)
+            model = RandomForestClassifier(n_estimators=50, max_depth=5, random_state=42)
+            model.fit(features, labels)
+            with self.model_lock:
+                self.model = model
+            if dump is not None:
+                try:
+                    dump(model, self.predictive_model_path)
+                except Exception:
+                    pass
+            logging.info("🧠 Predictive model trained and saved.")
+        except Exception as exc:  # pragma: no cover
+            logging.debug(f"Fallo al entrenar modelo predictivo: {exc}")
+
+    def predict_win_probability(
+        self,
+        rsi: float,
+        ema: float,
+        macd: float,
+        adx: float,
+        hour: int,
+    ) -> float:
+        with self.model_lock:
+            model = self.model
+        if model is None and load is not None and self.predictive_model_path.exists():
+            try:
+                model = load(self.predictive_model_path)
+                with self.model_lock:
+                    self.model = model
+            except Exception:  # pragma: no cover
+                model = None
+        if model is None:
+            return 0.5
+        try:
+            prob = model.predict_proba([[rsi, ema, macd, adx, hour]])[0][1]
+            return float(prob)
+        except Exception:
+            return 0.5
+
+    def optimize_thresholds(self) -> None:
+        if gp_minimize is None:
+            return
+        with self.memory_lock:
+            if len(self.memory) < 200:
+                return
+
+        def objective(params: Tuple[float, float, float]) -> float:
+            min_conf, rsi_high, adx_min = params
+            winrate = self.simulate_trades_thresholds(min_conf, rsi_high, adx_min)
+            return -float(winrate)
+
+        try:
+            result = gp_minimize(
+                objective,
+                [(0.5, 0.9), (60.0, 80.0), (10.0, 40.0)],
+                n_calls=20,
+                random_state=42,
+            )
+        except Exception as exc:  # pragma: no cover
+            logging.debug(f"Bayesian optimization failed: {exc}")
+            return
+        self.min_confidence = float(np.clip(result.x[0], 0.4, 0.95))
+        self.rsi_high_threshold = float(np.clip(result.x[1], 55.0, 85.0))
+        self.adx_min_threshold = float(np.clip(result.x[2], 5.0, 60.0))
+        logging.info(
+            f"🎯 Bayesian optimization finished: min_conf={self.min_confidence:.2f}, RSI_high={self.rsi_high_threshold:.2f}, ADX_min={self.adx_min_threshold:.2f}"
+        )
+
+    def simulate_trades_thresholds(
+        self,
+        min_confidence: float,
+        rsi_high: float,
+        adx_min: float,
+    ) -> float:
+        with self.memory_lock:
+            snapshot = list(self.memory)
+        if not snapshot:
+            return 0.0
+        considered = 0
+        wins = 0
+        for item in snapshot:
+            rsi_value = float(item.get("RSI", 0.0))
+            ema_value = float(item.get("EMA", 0.0))
+            macd_value = float(item.get("MACD", 0.0))
+            adx_value = float(item.get("ADX", 0.0))
+            confidence = self.calculate_confidence(rsi_value, ema_value, 0.5, adx_value, macd_value)
+            if confidence < min_confidence:
+                continue
+            if adx_value < adx_min:
+                continue
+            if rsi_value > rsi_high and macd_value > 0:
+                continue
+            considered += 1
+            if str(item.get("result", "")).upper() == "WIN":
+                wins += 1
+        if considered == 0:
+            return 0.0
+        return wins / considered
+
+    def get_min_confidence(self) -> float:
+        return float(self.min_confidence)
+
+    def get_adx_min_threshold(self) -> float:
+        return float(self.adx_min_threshold)
+
+    def get_rsi_high_threshold(self) -> float:
+        return float(self.rsi_high_threshold)
 
     def _learning_loop(self) -> None:
         while True:
@@ -997,6 +1251,11 @@ class auto_learning:
         with self.model_lock:
             self.model = None
         self.last_prediction = 0.5
+        with self.memory_lock:
+            self.memory = []
+            self.recent_results.clear()
+            self.reinforce_batches = 0
+            self.optimize_batches = 0
         self._ensure_csv()
 
 
@@ -1796,6 +2055,9 @@ class TradingEngine:
         self.auto_shutdown_limit = 0
         self.auto_shutdown_triggered = False
         self.active_trade_symbol: Optional[str] = None
+        self.kelly_enabled = False
+        self.initial_balance = 1000.0
+        self.base_trade_amount = STAKE
 
     def add_trade_listener(self, callback: Callable[[TradeRecord, Dict[str, float]], None]) -> None:
         self._trade_listeners.append(callback)
@@ -1811,6 +2073,7 @@ class TradingEngine:
 
     def set_trade_amount(self, value: float) -> None:
         self.trade_amount = max(0.1, float(value))
+        self.base_trade_amount = self.trade_amount
 
     def set_daily_loss_limit(self, value: float) -> None:
         self.risk.set_daily_loss_limit(float(value))
@@ -1835,6 +2098,24 @@ class TradingEngine:
     def get_strategy_states(self) -> Dict[str, bool]:
         with self._strategy_lock:
             return dict(self.strategy_states)
+
+    def set_kelly_enabled(self, enabled: bool) -> None:
+        self.kelly_enabled = bool(enabled)
+
+    def _estimate_balance(self) -> float:
+        return max(100.0, self.initial_balance + self.risk.total_pnl)
+
+    def _calculate_kelly_stake(self, probability: float) -> float:
+        if not self.kelly_enabled:
+            return self.trade_amount
+        balance = self._estimate_balance()
+        payout_ratio = PAYOUT if PAYOUT > 0 else 1.0
+        edge = float(probability)
+        f_star = edge - (1.0 - edge) / payout_ratio
+        f_star = max(0.01, min(f_star, 0.05))
+        stake = balance * f_star
+        stake = float(np.clip(stake, 0.1, balance * 0.1))
+        return stake
 
     def _notify_trade(self, record: TradeRecord) -> None:
         stats = {
@@ -1924,11 +2205,11 @@ class TradingEngine:
                 logging.info(f"⚠️ Contrato #{contract_id} continúa sin resultado tras múltiples intentos")
         return status
 
-    def _resolve_trade_result(self, status: str) -> Tuple[str, float]:
+    def _resolve_trade_result(self, status: str, stake: float) -> Tuple[str, float]:
         if status == "won":
-            return "WIN", self.trade_amount * PAYOUT
+            return "WIN", float(stake) * PAYOUT
         if status == "lost":
-            return "LOSS", -self.trade_amount
+            return "LOSS", -float(stake)
         return "UNKNOWN", 0.0
 
 
@@ -2027,7 +2308,70 @@ class TradingEngine:
                 'indicator_confidence': 0.0,
                 'adx': 0.0,
                 'macd': 0.0,
+                'predicted_probability': 0.5,
+                'confluence_direction': 'NONE',
+                'confluence_confirmed': False,
+                'eligible': False,
+                'rsi_signal': 'NONE',
+                'ema_signal': 'NONE',
+                'macd_signal': 'NONE',
             }
+            latest_rsi_series = rsi(df['close'])
+            latest_rsi = float(latest_rsi_series.iloc[-1]) if not latest_rsi_series.empty else 0.0
+            ema_corto_valor = float(ema(df['close'], 9).iloc[-1]) if len(df) else 0.0
+            ema_largo_valor = float(ema(df['close'], 21).iloc[-1]) if len(df) else 0.0
+            ema_spread = ema_corto_valor - ema_largo_valor
+            bandas_inferior, bandas_superior = bollinger_bands(df['close'])
+            boll_width = float(bandas_superior.iloc[-1] - bandas_inferior.iloc[-1]) if len(bandas_superior) else 0.0
+            volatilidad_serie = df['close'].pct_change().rolling(20).std()
+            volatilidad_actual = float(np.nan_to_num(volatilidad_serie.iloc[-1], nan=0.0)) if len(volatilidad_serie) else 0.0
+            adx_value = auto_learn.calculate_adx(symbol, df['high'].values, df['low'].values, df['close'].values)
+            macd_value = auto_learn.calculate_macd(df['close'].values)
+            price_reference = entry_price if entry_price else 1.0
+            boll_ratio = boll_width / price_reference if price_reference else 0.0
+            indicator_conf = auto_learn.calculate_confidence(
+                latest_rsi,
+                ema_spread,
+                max(0.0, min(1.0, boll_ratio)),
+                adx_value,
+                macd_value,
+            )
+            rsi_signal = next((out.signal for name, out in results if name == 'RSI'), 'NONE')
+            ema_signal = next((out.signal for name, out in results if name == 'EMA Trend'), 'NONE')
+            macd_signal = 'CALL' if macd_value > 0 else 'PUT' if macd_value < 0 else 'NONE'
+            evaluation.update(
+                {
+                    'latest_rsi': latest_rsi,
+                    'ema_spread': ema_spread,
+                    'boll_width': boll_width,
+                    'volatility': volatilidad_actual,
+                    'indicator_confidence': indicator_conf,
+                    'adx': adx_value,
+                    'macd': macd_value,
+                    'rsi_signal': rsi_signal,
+                    'ema_signal': ema_signal,
+                    'macd_signal': macd_signal,
+                }
+            )
+            signals = [rsi_signal, ema_signal, macd_signal]
+            if signals.count('CALL') >= 2:
+                evaluation['confluence_direction'] = 'CALL'
+                evaluation['confluence_confirmed'] = True
+            elif signals.count('PUT') >= 2:
+                evaluation['confluence_direction'] = 'PUT'
+                evaluation['confluence_confirmed'] = True
+            current_hour = datetime.now(timezone.utc).hour
+            ml_probability = auto_learn.predict_win_probability(
+                latest_rsi,
+                ema_spread,
+                macd_value,
+                adx_value,
+                current_hour,
+            )
+            evaluation['predicted_probability'] = ml_probability
+            ai_confidence = confidence
+            ai_notes: List[str] = []
+            features: Optional[List[float]] = None
             if signal in {'CALL', 'PUT'}:
                 features = build_feature_vector(df, reasons, results)
                 ai_prob = None
@@ -2035,8 +2379,6 @@ class TradingEngine:
                     api_prob = query_ai_backend(features)
                     if api_prob is not None:
                         ai_prob = api_prob
-                ai_confidence = confidence
-                ai_notes: List[str] = []
                 internal_prob, internal_notes = self.ai.predict(features)
                 if internal_notes:
                     ai_notes.extend(internal_notes)
@@ -2051,53 +2393,69 @@ class TradingEngine:
                     fused = self.ai.fuse_with_technical(confidence, internal_prob)
                     ai_confidence = fused
                     ai_notes.append(f'Núcleo adaptativo {internal_prob:.2f}')
-                latest_rsi_series = rsi(df['close'])
-                latest_rsi = float(latest_rsi_series.iloc[-1]) if not latest_rsi_series.empty else 0.0
-                ema_corto_valor = float(ema(df['close'], 9).iloc[-1]) if len(df) else 0.0
-                ema_largo_valor = float(ema(df['close'], 21).iloc[-1]) if len(df) else 0.0
-                ema_spread = ema_corto_valor - ema_largo_valor
-                bandas_inferior, bandas_superior = bollinger_bands(df['close'])
-                boll_width = float(bandas_superior.iloc[-1] - bandas_inferior.iloc[-1]) if len(bandas_superior) else 0.0
-                volatilidad_serie = df['close'].pct_change().rolling(20).std()
-                volatilidad_actual = float(np.nan_to_num(volatilidad_serie.iloc[-1], nan=0.0)) if len(volatilidad_serie) else 0.0
-                adx_value = auto_learn.calculate_adx(symbol, df['high'].values, df['low'].values, df['close'].values)
-                macd_value = auto_learn.calculate_macd(df['close'].values)
-                price_reference = entry_price if entry_price else 1.0
-                boll_ratio = boll_width / price_reference if price_reference else 0.0
-                indicator_conf = auto_learn.calculate_confidence(
-                    latest_rsi,
-                    ema_spread,
-                    max(0.0, min(1.0, boll_ratio)),
-                    adx_value,
-                    macd_value,
-                )
                 signal_source = self._determine_signal_source(signal, consensus, results)
                 auto_learn.record_signal_source(symbol, signal_source)
-                symbol_weight = auto_learn.get_symbol_weight(symbol)
-                combined_confidence = (ai_confidence + indicator_conf) / 2.0
-                final_confidence = float(np.clip(combined_confidence * symbol_weight, 0.0, 1.0))
-                evaluation.update(
-                    {
-                        'ai_confidence': ai_confidence,
-                        'final_confidence': final_confidence,
-                        'ai_notes': ai_notes,
-                        'features': features,
-                        'latest_rsi': latest_rsi,
-                        'ema_spread': ema_spread,
-                        'boll_width': boll_width,
-                        'volatility': volatilidad_actual,
-                        'signal_source': signal_source,
-                        'indicator_confidence': indicator_conf,
-                        'adx': adx_value,
-                        'macd': macd_value,
-                    }
-                )
+                evaluation['signal_source'] = signal_source
+            symbol_weight = auto_learn.get_symbol_weight(symbol)
+            final_mix = (ai_confidence + indicator_conf + ml_probability) / 3.0
+            final_confidence = float(np.clip(final_mix * symbol_weight, 0.0, 1.0))
+            min_confidence = auto_learn.get_min_confidence()
+            adx_threshold = auto_learn.get_adx_min_threshold()
+            rsi_high_threshold = auto_learn.get_rsi_high_threshold()
+            call_floor = max(0.0, 100.0 - rsi_high_threshold)
+            eligible = (
+                final_confidence >= min_confidence
+                and ml_probability >= 0.55
+                and adx_value >= adx_threshold
+            )
+            if signal == 'PUT' and latest_rsi < rsi_high_threshold:
+                eligible = False
+            if signal == 'CALL' and latest_rsi > call_floor:
+                eligible = False
+            if signal not in {'CALL', 'PUT'}:
+                eligible = False
+            if not eligible:
+                final_confidence = 0.0
+            evaluation.update(
+                {
+                    'ai_confidence': ai_confidence,
+                    'final_confidence': final_confidence,
+                    'ai_notes': ai_notes,
+                    'features': features,
+                    'eligible': eligible,
+                }
+            )
             return evaluation
         except Exception as exc:
             logging.warning(f"Error en ciclo para {symbol}: {exc}")
             return None
         finally:
             auto_learn.set_active_symbol(None)
+
+    def confirm_and_execute(self, evaluation: Dict[str, Any]) -> bool:
+        direction = evaluation.get('confluence_direction')
+        if direction not in {'CALL', 'PUT'}:
+            return False
+        symbol = evaluation.get('symbol', 'UNKNOWN')
+        logging.info(f"✅ Confluence confirmed for {symbol}: {direction}")
+        enriched = dict(evaluation)
+        enriched['signal'] = direction
+        reasons = list(enriched.get('reasons', []))
+        reasons.append('Multi-indicator confirmation')
+        enriched['reasons'] = reasons
+        consensus_snapshot = dict(enriched.get('consensus', {}))
+        consensus_snapshot['confidence_label'] = 'Alta'
+        consensus_snapshot['confidence'] = 1.0
+        consensus_snapshot['main_reason'] = 'multi-confirmation'
+        consensus_snapshot['override'] = True
+        consensus_snapshot['override_reason'] = 'multi-confirmation'
+        enriched['consensus'] = consensus_snapshot
+        enriched['ai_confidence'] = max(float(enriched.get('ai_confidence', 0.0)), 1.0)
+        enriched['final_confidence'] = 1.0
+        enriched['eligible'] = True
+        probability = float(enriched.get('predicted_probability', 0.6))
+        enriched['stake'] = self._calculate_kelly_stake(probability)
+        return self._execute_selected_trade(enriched)
 
     def _fetch_exit_price(self, symbol: str, fallback: float) -> float:
         try:
@@ -2108,7 +2466,7 @@ class TradingEngine:
             logging.debug(f"No se pudo obtener precio de salida para {symbol}: {exc}")
         return fallback
 
-    def _execute_selected_trade(self, evaluation: Dict[str, Any]) -> None:
+    def _execute_selected_trade(self, evaluation: Dict[str, Any]) -> bool:
         global operation_active
         symbol = evaluation['symbol']
         signal = evaluation['signal']
@@ -2119,10 +2477,15 @@ class TradingEngine:
         features = evaluation['features']
         entry_price = float(evaluation['entry_price'])
         signal_source = evaluation['signal_source']
+        if 'stake' not in evaluation:
+            evaluation['stake'] = self._calculate_kelly_stake(evaluation.get('predicted_probability', 0.5))
+        stake_amount = float(max(0.1, evaluation.get('stake', self.trade_amount)))
+        ml_probability = float(evaluation.get('predicted_probability', 0.5))
+        trade_initiated = False
         if not self.risk.can_trade(ai_confidence):
-            return
+            return False
         if operation_active:
-            return
+            return False
         auto_learn.register_trade_context(
             symbol,
             signal,
@@ -2130,20 +2493,23 @@ class TradingEngine:
             entry_price,
             signal_source,
             evaluation.get('indicator_confidence', 0.0),
+            ml_probability,
+            stake_amount,
         )
-        contract_id, duration_seconds = self.api.buy(symbol, signal, self.trade_amount)
+        contract_id, duration_seconds = self.api.buy(symbol, signal, stake_amount)
         if contract_id is None:
             logging.warning('No se pudo abrir la operación, se reanuda el análisis.')
             self._notify_trade_state("ready")
-            return
+            return False
         operation_active = True
         self.active_trade_symbol = symbol
         self._notify_trade_state('active')
         dur_seconds = duration_seconds if duration_seconds > 0 else TRADE_DURATION_SECONDS
         logging.info(f"🟢 Operación abierta — Contrato #{contract_id} | Duración: {dur_seconds}s")
+        trade_initiated = True
         try:
             result_status = self._wait_for_contract_result(contract_id, dur_seconds)
-            trade_result, pnl = self._resolve_trade_result(result_status)
+            trade_result, pnl = self._resolve_trade_result(result_status, stake_amount)
             self.risk.register_trade(pnl)
             if features is not None:
                 self.ai.log_trade(features, 1 if trade_result == 'WIN' else 0)
@@ -2163,6 +2529,8 @@ class TradingEngine:
                 'total_weight': consensus['total_weight'],
                 'active_weight': consensus.get('active_weight', 0.0),
                 'contract_id': contract_id,
+                'stake': stake_amount,
+                'ml_probability': ml_probability,
             }
             record = TradeRecord(
                 timestamp=datetime.now(timezone.utc),
@@ -2197,9 +2565,18 @@ class TradingEngine:
                 price_change,
             )
             auto_learn.adjust_bias(symbol, trade_result, signal, price_change)
+            auto_learn.store_context(
+                symbol,
+                latest_rsi,
+                ema_spread,
+                evaluation.get('macd', 0.0),
+                evaluation.get('adx', 0.0),
+                datetime.now(timezone.utc).hour,
+                trade_result,
+            )
             auto_learn.predict_next(latest_rsi, ema_spread, boll_width, volatilidad_actual)
             logging.info(
-                f"{record.timestamp:%Y-%m-%d %H:%M:%S} INFO: [{symbol}] {signal} @{ai_confidence:.2f} | EMA:{evaluation['ema_diff']:.2f} RSI:{latest_rsi:.2f} | Motivos: {'; '.join(reasons)}"
+                f"{record.timestamp:%Y-%m-%d %H:%M:%S} INFO: [{symbol}] {signal} @{ai_confidence:.2f} | Stake:{stake_amount:.2f} | EMA:{evaluation['ema_diff']:.2f} RSI:{latest_rsi:.2f} | Motivos: {'; '.join(reasons)}"
             )
             if ai_notes:
                 logging.info(f"📊 Aviso IA → {'; '.join(ai_notes)}")
@@ -2219,6 +2596,7 @@ class TradingEngine:
             self.active_trade_symbol = None
             logging.info(RESUME_MESSAGE)
             self._notify_trade_state("ready")
+        return trade_initiated
 
     def run(self) -> None:
         global operation_active
@@ -2232,16 +2610,27 @@ class TradingEngine:
             while self.running.is_set():
                 evaluations: List[Dict[str, Any]] = []
                 confidence_lines: List[str] = []
+                trade_executed = False
                 for symbol in SYMBOLS:
                     if not self.running.is_set():
                         break
                     evaluation = self._evaluate_symbol(symbol)
                     if evaluation is not None:
+                        probability = float(evaluation.get('predicted_probability', 0.5))
+                        evaluation['stake'] = self._calculate_kelly_stake(probability)
+                        confidence_lines.append(
+                            f"{symbol}: {float(evaluation['final_confidence']):.2f} (p={probability:.2f})"
+                        )
+                        if evaluation.get('confluence_confirmed'):
+                            if self.confirm_and_execute(evaluation):
+                                trade_executed = True
+                                break
                         evaluations.append(evaluation)
-                        confidence_lines.append(f"{symbol}: {float(evaluation['final_confidence']):.2f}")
                     if not self.running.is_set():
                         break
                     time.sleep(1)
+                if trade_executed:
+                    continue
                 if not self.running.is_set():
                     break
                 if not evaluations:
@@ -2255,9 +2644,14 @@ class TradingEngine:
                 )
                 if summary_line:
                     logging.info(f"{summary_line} → Selected: {selected_text}")
-                if best['signal'] not in {'CALL', 'PUT'} or float(best['final_confidence']) < MIN_TRADE_CONFIDENCE:
+                min_required = auto_learn.get_min_confidence()
+                if (
+                    best['signal'] not in {'CALL', 'PUT'}
+                    or float(best['final_confidence']) < min_required
+                    or not best.get('eligible', False)
+                ):
                     logging.info(
-                        f"⚠️ Confianza máxima {float(best['final_confidence']):.2f} inferior al mínimo {MIN_TRADE_CONFIDENCE:.2f} → sin operación"
+                        f"⚠️ Confianza máxima {float(best['final_confidence']):.2f} inferior al mínimo {min_required:.2f} → sin operación"
                     )
                     continue
                 self._execute_selected_trade(best)
@@ -2586,6 +2980,11 @@ class BotWindow(QtWidgets.QWidget):
         self.auto_shutdown_spin.valueChanged.connect(self._update_auto_shutdown)
         self._update_auto_shutdown()
 
+        self.kelly_checkbox = QtWidgets.QCheckBox("Enable Kelly Fraction")
+        self.kelly_checkbox.setChecked(False)
+        self.kelly_checkbox.toggled.connect(self._on_kelly_toggled)
+        form.addRow("Gestión de capital", self.kelly_checkbox)
+
     def _build_history_tab(self) -> None:
         tab = QtWidgets.QWidget()
         self.tabs.addTab(tab, "History & Learning")
@@ -2696,6 +3095,9 @@ class BotWindow(QtWidgets.QWidget):
             self.auto_shutdown_active = False
             if self.thread is None:
                 self.start_button.setEnabled(True)
+
+    def _on_kelly_toggled(self, checked: bool) -> None:
+        self.engine.set_kelly_enabled(bool(checked))
 
     def _reset_history_data(self) -> None:
         auto_learn.reset_history()
