@@ -210,6 +210,7 @@ class auto_learning:
             "bollinger",
             "volatility",
             "confidence",
+            "indicator_confidence",
             "rsi_bias",
             "ema_bias",
             "rsi_adjusted",
@@ -233,7 +234,19 @@ class auto_learning:
         self.last_signal: Dict[str, Dict[str, str]] = {
             symbol: {"source": "COMBINED"} for symbol in SYMBOLS
         }
-        self.weights: Dict[str, float] = {symbol: 1.0 for symbol in SYMBOLS}
+        self.weights_lock = threading.Lock()
+        self.weights: Dict[str, float] = {
+            "RSI": 1.0,
+            "EMA": 1.0,
+            "BOLL": 1.0,
+            "ADX": 0.8,
+            "MACD": 0.8,
+        }
+        self.symbol_weights: Dict[str, float] = {symbol: 1.0 for symbol in SYMBOLS}
+        self.batch_lock = threading.Lock()
+        self.batch_results: List[Tuple[str, str, str, float, str]] = []
+        self.batch_size = 10
+        self.adx_prev: Dict[str, float] = {}
         self.last_prediction = 0.5
         self.learning_event = threading.Event()
         self.learning_thread = threading.Thread(target=self._learning_loop, daemon=True)
@@ -305,6 +318,207 @@ class auto_learning:
         with self.lock:
             profile = self._get_symbol_profile(asset)
             return self._symbol_snapshot(profile)
+
+    def get_symbol_weight(self, asset: str) -> float:
+        with self.lock:
+            return float(self.symbol_weights.get(asset, 1.0))
+
+    def normalize(self, value: float, min_val: float, max_val: float) -> float:
+        if max_val == min_val:
+            return 0.0
+        scaled = (value - min_val) / (max_val - min_val)
+        return float(max(0.0, min(1.0, scaled)))
+
+    def calculate_confidence(
+        self,
+        rsi_value: float,
+        ema_value: float,
+        boll_value: float,
+        adx_value: float,
+        macd_value: float,
+    ) -> float:
+        rsi_n = self.normalize(rsi_value, 0.0, 100.0)
+        ema_n = self.normalize(ema_value, -0.5, 0.5)
+        boll_n = self.normalize(boll_value, 0.0, 1.0)
+        adx_n = self.normalize(adx_value, 0.0, 50.0)
+        macd_n = self.normalize(macd_value, -2.0, 2.0)
+        with self.weights_lock:
+            weights_snapshot = dict(self.weights)
+        total_weight = float(sum(weights_snapshot.values())) or 1.0
+        confidence = (
+            rsi_n * weights_snapshot.get("RSI", 1.0)
+            + ema_n * weights_snapshot.get("EMA", 1.0)
+            + boll_n * weights_snapshot.get("BOLL", 1.0)
+            + adx_n * weights_snapshot.get("ADX", 0.8)
+            + macd_n * weights_snapshot.get("MACD", 0.8)
+        ) / total_weight
+        return float(max(0.0, min(1.0, confidence)))
+
+    def calculate_adx(
+        self,
+        symbol: str,
+        highs: Iterable[float],
+        lows: Iterable[float],
+        closes: Iterable[float],
+        period: int = 14,
+    ) -> float:
+        highs_list = list(highs)
+        lows_list = list(lows)
+        closes_list = list(closes)
+        if len(highs_list) < 2 or len(lows_list) < 2 or len(closes_list) < 2:
+            return 0.0
+        plus_dm = highs_list[-1] - highs_list[-2] if highs_list[-1] > highs_list[-2] else 0.0
+        minus_dm = lows_list[-2] - lows_list[-1] if lows_list[-1] < lows_list[-2] else 0.0
+        plus_dm = max(0.0, float(plus_dm))
+        minus_dm = max(0.0, float(minus_dm))
+        tr_components = [
+            highs_list[-1] - lows_list[-1],
+            abs(highs_list[-1] - closes_list[-2]),
+            abs(lows_list[-1] - closes_list[-2]),
+        ]
+        true_range = max(tr_components) if tr_components else 0.0
+        denominator = plus_dm + minus_dm + 1e-9
+        dx = (abs(plus_dm - minus_dm) / denominator) * 100.0
+        prev_adx = self.adx_prev.get(symbol)
+        if prev_adx is None:
+            adx = dx
+        else:
+            adx = (prev_adx * (period - 1) + dx) / period
+        if true_range <= 0.0:
+            adx = max(0.0, min(100.0, adx))
+        self.adx_prev[symbol] = float(adx)
+        return float(max(0.0, min(100.0, adx)))
+
+    def calculate_macd(
+        self,
+        closes: Iterable[float],
+        fast: int = 12,
+        slow: int = 26,
+        signal: int = 9,
+    ) -> float:
+        close_list = list(closes)
+        if len(close_list) < 3:
+            return 0.0
+        series = pd.Series(close_list, dtype=float)
+        ema_fast_series = series.ewm(span=fast, adjust=False).mean()
+        ema_slow_series = series.ewm(span=slow, adjust=False).mean()
+        macd_line = ema_fast_series - ema_slow_series
+        signal_line = macd_line.ewm(span=signal, adjust=False).mean()
+        macd_hist = float(macd_line.iloc[-1] - signal_line.iloc[-1]) if not macd_line.empty else 0.0
+        return macd_hist
+
+    def _clamp_weights(self) -> None:
+        with self.weights_lock:
+            for key, value in list(self.weights.items()):
+                self.weights[key] = float(np.clip(value, 0.2, 3.0))
+
+    def record_result(
+        self,
+        symbol: str,
+        result: str,
+        signal_direction: str,
+        price_change: float,
+        source: str,
+    ) -> None:
+        entry = (
+            symbol,
+            str(result).upper(),
+            str(signal_direction).upper(),
+            float(price_change),
+            source,
+        )
+        with self.batch_lock:
+            self.batch_results.append(entry)
+            if len(self.batch_results) >= self.batch_size:
+                batch = list(self.batch_results)
+                self.batch_results.clear()
+            else:
+                batch = None
+        if batch:
+            self.executor.submit(self.process_batch, batch)
+
+    def process_batch(self, entries: Optional[List[Tuple[str, str, str, float, str]]] = None) -> None:
+        if entries is None:
+            with self.batch_lock:
+                entries = list(self.batch_results)
+                self.batch_results.clear()
+        if not entries:
+            return
+        results_by_symbol: Dict[str, List[Tuple[str, str, float, str]]] = defaultdict(list)
+        for symbol, result, direction, price_change, source in entries:
+            if result not in {"WIN", "LOSS"}:
+                continue
+            results_by_symbol[symbol].append((result, direction, price_change, source))
+        for symbol, symbol_entries in results_by_symbol.items():
+            total = len(symbol_entries)
+            if total == 0:
+                continue
+            wins = sum(1 for result, _, _, _ in symbol_entries if result == "WIN")
+            win_rate = wins / total
+            with self.lock:
+                current_weight = self.symbol_weights.get(symbol, 1.0)
+                if win_rate < 0.45:
+                    current_weight *= 0.97
+                elif win_rate > 0.65:
+                    current_weight *= 1.03
+                self.symbol_weights[symbol] = float(np.clip(current_weight, 0.5, 1.5))
+            with self.weights_lock:
+                if win_rate < 0.55:
+                    self.weights["RSI"] *= 0.99
+                    self.weights["EMA"] *= 0.99
+                    self.weights["BOLL"] *= 0.99
+                    self.weights["ADX"] *= 0.98
+                    self.weights["MACD"] *= 0.98
+                elif win_rate > 0.65:
+                    self.weights["RSI"] *= 1.01
+                    self.weights["EMA"] *= 1.01
+                    self.weights["BOLL"] *= 1.01
+                    self.weights["ADX"] *= 1.02
+                    self.weights["MACD"] *= 1.02
+            self._clamp_weights()
+            with self.weights_lock:
+                weights_snapshot = dict(self.weights)
+            logging.info(
+                f"Batch update for {symbol}: win_rate={win_rate:.2f}, weights={weights_snapshot}, symbol_weight={self.get_symbol_weight(symbol):.2f}"
+            )
+
+    def backtest_adaptive(self, historical_data: Iterable[Dict[str, Any]], window: int = 1000) -> None:
+        data_list = list(historical_data)
+        if not data_list or window <= 0 or len(data_list) <= window:
+            return
+        step = 250
+        for start in range(0, len(data_list) - window, step):
+            train_slice = data_list[start : start + window - step]
+            test_slice = data_list[start + window - step : start + window]
+            if not train_slice or not test_slice:
+                continue
+            self.optimize_on_data(train_slice)
+            win_rate = self.simulate_trades(test_slice)
+            logging.info(
+                f"Walk-forward segment {start}–{start + window}: winrate={win_rate:.2f}"
+            )
+
+    def optimize_on_data(self, data_slice: Iterable[Dict[str, Any]]) -> None:
+        results = [str(item.get("result", "")).upper() for item in data_slice if str(item.get("result", "")).upper() in {"WIN", "LOSS"}]
+        total = len(results)
+        if total == 0:
+            return
+        wins = sum(1 for item in results if item == "WIN")
+        ratio = wins / total
+        adjustment = 1.0 + (ratio - 0.5) * 0.02
+        with self.weights_lock:
+            for key in list(self.weights.keys()):
+                self.weights[key] *= adjustment
+        self._clamp_weights()
+
+    def simulate_trades(self, data_slice: Iterable[Dict[str, Any]]) -> float:
+        outcomes = [str(item.get("result", "")).upper() for item in data_slice if str(item.get("result", "")).upper() in {"WIN", "LOSS"}]
+        if not outcomes:
+            return 0.0
+        wins = sum(1 for outcome in outcomes if outcome == "WIN")
+        total = len(outcomes)
+        return wins / total if total else 0.0
+
 
     def _apply_symbol_learning(
         self,
@@ -425,6 +639,7 @@ class auto_learning:
         confidence: float,
         entry_price: float,
         signal_source: str,
+        indicator_confidence: float = 0.0,
     ) -> None:
         with self.lock:
             self._get_symbol_profile(asset)
@@ -433,6 +648,7 @@ class auto_learning:
                 "confidence": float(confidence),
                 "entry_price": float(entry_price),
                 "signal_source": signal_source,
+                "indicator_confidence": float(indicator_confidence),
             }
 
     def record_signal_source(self, asset: str, source: str) -> None:
@@ -474,6 +690,7 @@ class auto_learning:
         context = self._pop_context(asset)
         direction = context.get("direction", "NONE")
         confidence = context.get("confidence", 0.0)
+        indicator_confidence = context.get("indicator_confidence", 0.0)
         signal_source = context.get("signal_source") or self.last_signal.get(asset, {}).get("source", "COMBINED")
         timestamp_now = datetime.now(timezone.utc).isoformat()
         resultado = str(result).upper()
@@ -521,6 +738,7 @@ class auto_learning:
                 "boll": boll_value,
                 "volatility": volatility_value,
                 "confidence": confidence,
+                "indicator_confidence": indicator_confidence,
                 "label": etiqueta,
                 "rsi_adjusted": ajustes.get("rsi_period", snapshot.get("rsi_period", 14.0)) if ajustes else snapshot.get("rsi_period", 14.0),
                 "ema_fast": ajustes.get("ema_fast", snapshot.get("ema_fast", 9.0)) if ajustes else snapshot.get("ema_fast", 9.0),
@@ -559,6 +777,7 @@ class auto_learning:
                 "bollinger": f"{boll_value:.6f}",
                 "volatility": f"{volatility_value:.6f}",
                 "confidence": f"{confidence:.6f}",
+                "indicator_confidence": f"{indicator_confidence:.6f}",
                 "rsi_bias": f"{rsi_bias:.6f}",
                 "ema_bias": f"{ema_bias:.6f}",
                 "rsi_adjusted": f"{trade_entry['rsi_adjusted']:.6f}",
@@ -580,18 +799,18 @@ class auto_learning:
             return self._pending_context.pop(asset, {}).copy()
 
     def adjust_bias(self, symbol: str, result: str, signal_direction: str, price_change: float) -> None:
-        if str(result).upper() != "LOSS":
-            return
-        source = self.last_signal.get(symbol, {}).get("source", "COMBINED")
+        outcome = str(result).upper()
         direction = str(signal_direction).upper()
+        source = self.last_signal.get(symbol, {}).get("source", "COMBINED")
         price_delta = float(price_change)
+        self.record_result(symbol, outcome, direction, price_delta, source)
+        if outcome != "LOSS":
+            return
         direction_error = False
         if direction == "CALL" and price_delta < 0:
             direction_error = True
         elif direction == "PUT" and price_delta > 0:
             direction_error = True
-        else:
-            direction_error = False
         with self.bias_lock:
             bias_state = self.biases.setdefault(symbol, {"RSI": 0.0, "EMA": 0.0})
             if source == "RSI":
@@ -609,7 +828,7 @@ class auto_learning:
         logging.info(
             f"🧠 Bias adjusted [{symbol}] Source={source} RSI={rsi_bias:.2f} EMA={ema_bias:.2f}"
         )
-        self.log_bias_update(symbol, result, direction, price_delta, source)
+        self.log_bias_update(symbol, outcome, direction, price_delta, source)
         self.learning_event.set()
 
     def log_bias_update(
@@ -737,6 +956,10 @@ class auto_learning:
                 }
                 for symbol, state in self.biases.items()
             }
+        with self.weights_lock:
+            weights_snapshot = {key: float(value) for key, value in self.weights.items()}
+        with self.lock:
+            symbol_weight_snapshot = {key: float(value) for key, value in self.symbol_weights.items()}
         resumen = {
             "per_asset": per_asset,
             "global_accuracy": global_accuracy,
@@ -745,6 +968,8 @@ class auto_learning:
             "biases": bias_snapshot,
             "last_prediction": self.last_prediction,
             "symbol_tuning": tuning,
+            "indicator_weights": weights_snapshot,
+            "symbol_weights": symbol_weight_snapshot,
         }
         return resumen
 
@@ -1799,6 +2024,9 @@ class TradingEngine:
                 'volatility': 0.0,
                 'signal_source': 'COMBINED',
                 'ema_diff': float(df['close'].iloc[-1] - df['close'].iloc[-2]) if len(df) > 1 else 0.0,
+                'indicator_confidence': 0.0,
+                'adx': 0.0,
+                'macd': 0.0,
             }
             if signal in {'CALL', 'PUT'}:
                 features = build_feature_vector(df, reasons, results)
@@ -1832,10 +2060,22 @@ class TradingEngine:
                 boll_width = float(bandas_superior.iloc[-1] - bandas_inferior.iloc[-1]) if len(bandas_superior) else 0.0
                 volatilidad_serie = df['close'].pct_change().rolling(20).std()
                 volatilidad_actual = float(np.nan_to_num(volatilidad_serie.iloc[-1], nan=0.0)) if len(volatilidad_serie) else 0.0
+                adx_value = auto_learn.calculate_adx(symbol, df['high'].values, df['low'].values, df['close'].values)
+                macd_value = auto_learn.calculate_macd(df['close'].values)
+                price_reference = entry_price if entry_price else 1.0
+                boll_ratio = boll_width / price_reference if price_reference else 0.0
+                indicator_conf = auto_learn.calculate_confidence(
+                    latest_rsi,
+                    ema_spread,
+                    max(0.0, min(1.0, boll_ratio)),
+                    adx_value,
+                    macd_value,
+                )
                 signal_source = self._determine_signal_source(signal, consensus, results)
                 auto_learn.record_signal_source(symbol, signal_source)
-                weight = auto_learn.weights.get(symbol, 1.0)
-                final_confidence = float(np.clip(ai_confidence * weight, 0.0, 1.0))
+                symbol_weight = auto_learn.get_symbol_weight(symbol)
+                combined_confidence = (ai_confidence + indicator_conf) / 2.0
+                final_confidence = float(np.clip(combined_confidence * symbol_weight, 0.0, 1.0))
                 evaluation.update(
                     {
                         'ai_confidence': ai_confidence,
@@ -1847,6 +2087,9 @@ class TradingEngine:
                         'boll_width': boll_width,
                         'volatility': volatilidad_actual,
                         'signal_source': signal_source,
+                        'indicator_confidence': indicator_conf,
+                        'adx': adx_value,
+                        'macd': macd_value,
                     }
                 )
             return evaluation
@@ -1880,7 +2123,14 @@ class TradingEngine:
             return
         if operation_active:
             return
-        auto_learn.register_trade_context(symbol, signal, ai_confidence, entry_price, signal_source)
+        auto_learn.register_trade_context(
+            symbol,
+            signal,
+            ai_confidence,
+            entry_price,
+            signal_source,
+            evaluation.get('indicator_confidence', 0.0),
+        )
         contract_id, duration_seconds = self.api.buy(symbol, signal, self.trade_amount)
         if contract_id is None:
             logging.warning('No se pudo abrir la operación, se reanuda el análisis.')
