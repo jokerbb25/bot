@@ -205,6 +205,8 @@ class auto_learning:
             "bollinger",
             "volatility",
             "confidence",
+            "rsi_bias",
+            "ema_bias",
             "rsi_adjusted",
             "ema_fast_adjusted",
             "ema_slow_adjusted",
@@ -220,7 +222,9 @@ class auto_learning:
         self.training_labels: List[int] = []
         self.trade_counter = 0
         self.model: Optional[RandomForestClassifier] = None
-        self.biases = {"RSI": 0.0, "EMA": 0.0}
+        self.biases: Dict[str, Dict[str, float]] = {
+            symbol: {"RSI": 0.0, "EMA": 0.0} for symbol in SYMBOLS
+        }
         self.last_prediction = 0.5
         self.learning_event = threading.Event()
         self.learning_thread = threading.Thread(target=self._learning_loop, daemon=True)
@@ -292,6 +296,35 @@ class auto_learning:
         with self.lock:
             profile = self._get_symbol_profile(asset)
             return self._symbol_snapshot(profile)
+
+    def _update_bias_for_trade(
+        self,
+        asset: str,
+        etiqueta: Optional[int],
+        direction: str,
+        confidence: float,
+        volatility_value: float,
+    ) -> Tuple[float, float]:
+        with self.bias_lock:
+            if asset not in self.biases:
+                self.biases[asset] = {"RSI": 0.0, "EMA": 0.0}
+            bias_state = self.biases[asset]
+            if etiqueta == 0:
+                base_step = 0.02
+                confidence_modifier = np.clip((0.55 - confidence) * 0.05, -0.01, 0.01)
+                volatility_modifier = np.clip(abs(volatility_value) * 5.0, 0.0, 0.01)
+                step = np.clip(base_step + confidence_modifier + volatility_modifier, 0.01, 0.03)
+                if direction == "CALL":
+                    bias_state["RSI"] -= step
+                    bias_state["EMA"] += step * 0.5
+                elif direction == "PUT":
+                    bias_state["RSI"] += step
+                    bias_state["EMA"] -= step * 0.5
+                else:
+                    bias_state["EMA"] += np.sign(bias_state["EMA"]) * step * 0.2
+                bias_state["RSI"] = float(np.clip(bias_state["RSI"], -2.0, 2.0))
+                bias_state["EMA"] = float(np.clip(bias_state["EMA"], -2.0, 2.0))
+            return float(bias_state["RSI"]), float(bias_state["EMA"])
 
     def _apply_symbol_learning(
         self,
@@ -428,32 +461,18 @@ class auto_learning:
         context = self._pop_context(asset)
         direction = context.get("direction", "NONE")
         confidence = context.get("confidence", 0.0)
-        self._ensure_csv()
-        with self.lock:
-            snapshot = self._symbol_snapshot(self._get_symbol_profile(asset))
-            try:
-                with self.csv_path.open("a", newline="", encoding="utf-8") as handle:
-                    writer = csv.DictWriter(handle, fieldnames=self.csv_fields)
-                    writer.writerow(
-                        {
-                            "asset": asset,
-                            "direction": direction,
-                            "result": result,
-                            "rsi": f"{rsi_value:.6f}",
-                            "ema": f"{ema_value:.6f}",
-                            "bollinger": f"{boll_value:.6f}",
-                            "volatility": f"{volatility_value:.6f}",
-                            "confidence": f"{confidence:.6f}",
-                            "rsi_adjusted": f"{snapshot['rsi_period']:.6f}",
-                            "ema_fast_adjusted": f"{snapshot['ema_fast']:.6f}",
-                            "ema_slow_adjusted": f"{snapshot['ema_slow']:.6f}",
-                        }
-                    )
-            except Exception as exc:  # pragma: no cover
-                logging.debug(f"No se pudo registrar historial de autoaprendizaje: {exc}")
         resultado = str(result).upper()
         etiqueta = 1 if resultado == "WIN" else 0 if resultado == "LOSS" else None
+        self._ensure_csv()
+        row_payload: Dict[str, str] = {}
+        should_train = False
+        adjusted_rsi_value = float(rsi_value)
+        adjusted_ema_value = float(ema_value)
+        rsi_bias = 0.0
+        ema_bias = 0.0
         with self.lock:
+            profile = self._get_symbol_profile(asset)
+            snapshot = self._symbol_snapshot(profile)
             if etiqueta is not None:
                 stats = self.asset_stats[asset]
                 stats["total"] += 1
@@ -474,36 +493,39 @@ class auto_learning:
                 ema_value,
                 volatility_value,
             )
-            self.last_trades.append(
-                {
-                    "asset": asset,
-                    "direction": direction,
-                    "result": resultado,
-                    "rsi": rsi_value,
-                    "ema": ema_value,
-                    "boll": boll_value,
-                    "volatility": volatility_value,
-                    "confidence": confidence,
-                    "label": etiqueta,
-                    "rsi_adjusted": ajustes.get("rsi_period", snapshot.get("rsi_period", 14.0)),
-                    "ema_fast": ajustes.get("ema_fast", snapshot.get("ema_fast", 9.0)),
-                    "ema_slow": ajustes.get("ema_slow", snapshot.get("ema_slow", 21.0)),
-                }
+            rsi_bias, ema_bias = self._update_bias_for_trade(
+                asset,
+                etiqueta,
+                direction,
+                float(confidence),
+                float(volatility_value),
             )
-        symbol_params = self.get_symbol_snapshot(asset)
-        adjusted_rsi_value = float(rsi_value + (symbol_params.get("rsi_period", 14.0) - 14.0) * 0.5)
-        adjusted_ema_value = float(ema_value + symbol_params.get("ema_tolerance", 0.0) * 0.1)
-        with self.bias_lock:
-            rsi_bias = self.biases["RSI"]
-            ema_bias = self.biases["EMA"]
-        features = [
-            float(adjusted_rsi_value + rsi_bias),
-            float(adjusted_ema_value + ema_bias),
-            float(boll_value),
-            float(volatility_value),
-        ]
-        should_train = False
-        with self.lock:
+            symbol_params = ajustes if ajustes else snapshot
+            adjusted_rsi_value = float(rsi_value + (symbol_params.get("rsi_period", 14.0) - 14.0) * 0.5)
+            adjusted_ema_value = float(ema_value + symbol_params.get("ema_tolerance", 0.0) * 0.1)
+            trade_entry = {
+                "asset": asset,
+                "direction": direction,
+                "result": resultado,
+                "rsi": rsi_value,
+                "ema": ema_value,
+                "boll": boll_value,
+                "volatility": volatility_value,
+                "confidence": confidence,
+                "label": etiqueta,
+                "rsi_adjusted": ajustes.get("rsi_period", snapshot.get("rsi_period", 14.0)) if ajustes else snapshot.get("rsi_period", 14.0),
+                "ema_fast": ajustes.get("ema_fast", snapshot.get("ema_fast", 9.0)) if ajustes else snapshot.get("ema_fast", 9.0),
+                "ema_slow": ajustes.get("ema_slow", snapshot.get("ema_slow", 21.0)) if ajustes else snapshot.get("ema_slow", 21.0),
+                "rsi_bias": rsi_bias,
+                "ema_bias": ema_bias,
+            }
+            self.last_trades.append(trade_entry)
+            features = [
+                float(adjusted_rsi_value + rsi_bias),
+                float(adjusted_ema_value + ema_bias),
+                float(boll_value),
+                float(volatility_value),
+            ]
             if etiqueta is not None:
                 self.training_data.append(features)
                 self.training_labels.append(etiqueta)
@@ -513,6 +535,27 @@ class auto_learning:
             self.trade_counter += 1
             if self.trade_counter % 100 == 0 and self.trade_counter > 0:
                 should_train = True
+            row_payload = {
+                "asset": asset,
+                "direction": direction,
+                "result": resultado,
+                "rsi": f"{rsi_value:.6f}",
+                "ema": f"{ema_value:.6f}",
+                "bollinger": f"{boll_value:.6f}",
+                "volatility": f"{volatility_value:.6f}",
+                "confidence": f"{confidence:.6f}",
+                "rsi_bias": f"{rsi_bias:.6f}",
+                "ema_bias": f"{ema_bias:.6f}",
+                "rsi_adjusted": f"{trade_entry['rsi_adjusted']:.6f}",
+                "ema_fast_adjusted": f"{trade_entry['ema_fast']:.6f}",
+                "ema_slow_adjusted": f"{trade_entry['ema_slow']:.6f}",
+            }
+        try:
+            with self.csv_path.open("a", newline="", encoding="utf-8") as handle:
+                writer = csv.DictWriter(handle, fieldnames=self.csv_fields)
+                writer.writerow(row_payload)
+        except Exception as exc:  # pragma: no cover
+            logging.debug(f"No se pudo registrar historial de autoaprendizaje: {exc}")
         if should_train:
             self.executor.submit(self._train_model)
         self.learning_event.set()
@@ -535,29 +578,11 @@ class auto_learning:
             time.sleep(0.2)
 
     def _compute_biases(self) -> None:
-        with self.lock:
-            recientes = [item for item in list(self.last_trades)[-30:] if item.get("label") is not None]
-        if not recientes:
-            with self.bias_lock:
-                self.biases["RSI"] *= 0.9
-                self.biases["EMA"] *= 0.9
-            return
-        ganadas = [item for item in recientes if item["label"] == 1]
-        perdidas = [item for item in recientes if item["label"] == 0]
-        if not ganadas or not perdidas:
-            with self.bias_lock:
-                self.biases["RSI"] *= 0.95
-                self.biases["EMA"] *= 0.95
-            return
-        rsi_media_ganadas = float(np.mean([item["rsi"] for item in ganadas]))
-        rsi_media_perdidas = float(np.mean([item["rsi"] for item in perdidas]))
-        ema_media_ganadas = float(np.mean([item["ema"] for item in ganadas]))
-        ema_media_perdidas = float(np.mean([item["ema"] for item in perdidas]))
-        objetivo_rsi = float(np.clip((rsi_media_ganadas - rsi_media_perdidas) / 50.0, -5.0, 5.0))
-        objetivo_ema = float(np.clip((ema_media_ganadas - ema_media_perdidas) / 10.0, -5.0, 5.0))
         with self.bias_lock:
-            self.biases["RSI"] = self.biases["RSI"] * 0.7 + objetivo_rsi * 0.3
-            self.biases["EMA"] = self.biases["EMA"] * 0.7 + objetivo_ema * 0.3
+            # Mantener el bucle activo sin realizar ajustes adicionales.
+            for bias_state in self.biases.values():
+                bias_state["RSI"] = float(np.clip(bias_state["RSI"], -2.0, 2.0))
+                bias_state["EMA"] = float(np.clip(bias_state["EMA"], -2.0, 2.0))
 
     def _train_model(self) -> None:
         with self.lock:
@@ -583,8 +608,12 @@ class auto_learning:
             except Exception:
                 pass
         with self.bias_lock:
-            rsi_bias = self.biases["RSI"]
-            ema_bias = self.biases["EMA"]
+            if simbolo and simbolo in self.biases:
+                bias_state = self.biases[simbolo]
+            else:
+                bias_state = {"RSI": 0.0, "EMA": 0.0}
+            rsi_bias = float(bias_state.get("RSI", 0.0))
+            ema_bias = float(bias_state.get("EMA", 0.0))
         features = np.array(
             [
                 float(rsi_value + rsi_bias),
@@ -617,7 +646,16 @@ class auto_learning:
             historial = list(self.last_trades)[-5:]
             tuning = {nombre: self._symbol_snapshot(self._get_symbol_profile(nombre)) for nombre in SYMBOLS}
         with self.bias_lock:
-            bias_snapshot = dict(self.biases)
+            for nombre in SYMBOLS:
+                if nombre not in self.biases:
+                    self.biases[nombre] = {"RSI": 0.0, "EMA": 0.0}
+            bias_snapshot = {
+                symbol: {
+                    "RSI": float(state.get("RSI", 0.0)),
+                    "EMA": float(state.get("EMA", 0.0)),
+                }
+                for symbol, state in self.biases.items()
+            }
         resumen = {
             "per_asset": per_asset,
             "global_accuracy": global_accuracy,
@@ -648,6 +686,8 @@ class auto_learning:
                     self.csv_path.unlink()
             except Exception as exc:  # pragma: no cover
                 logging.debug(f"No se pudo eliminar CSV de autoaprendizaje: {exc}")
+        with self.bias_lock:
+            self.biases = {symbol: {"RSI": 0.0, "EMA": 0.0} for symbol in SYMBOLS}
         with self.model_lock:
             self.model = None
         self.last_prediction = 0.5
@@ -1893,7 +1933,7 @@ class BotWindow(QtWidgets.QWidget):
         self.history_global_label: Optional[QtWidgets.QLabel] = None
         self.history_status_label: Optional[QtWidgets.QLabel] = None
         self.history_list: Optional[QtWidgets.QListWidget] = None
-        self.history_bias_label: Optional[QtWidgets.QLabel] = None
+        self.history_bias_labels: Dict[str, QtWidgets.QLabel] = {}
         self.history_prediction_label: Optional[QtWidgets.QLabel] = None
 
         self._build_ui()
@@ -2124,8 +2164,6 @@ class BotWindow(QtWidgets.QWidget):
         status_label = QtWidgets.QLabel("Aprendizaje:")
         self.history_status_label = QtWidgets.QLabel("OFF")
         self.history_status_label.setStyleSheet("color: #ef5350;")
-        bias_label = QtWidgets.QLabel("Sesgos actuales:")
-        self.history_bias_label = QtWidgets.QLabel("RSI 0.00 | EMA 0.00")
         prediction_label = QtWidgets.QLabel("Última predicción:")
         self.history_prediction_label = QtWidgets.QLabel("0.50")
         global_layout.addWidget(global_label)
@@ -2134,13 +2172,22 @@ class BotWindow(QtWidgets.QWidget):
         global_layout.addWidget(status_label)
         global_layout.addWidget(self.history_status_label)
         global_layout.addSpacing(12)
-        global_layout.addWidget(bias_label)
-        global_layout.addWidget(self.history_bias_label)
-        global_layout.addSpacing(12)
         global_layout.addWidget(prediction_label)
         global_layout.addWidget(self.history_prediction_label)
         global_layout.addStretch(1)
         layout.addWidget(global_group)
+
+        bias_group = QtWidgets.QGroupBox("Sesgos por activo")
+        bias_layout = QtWidgets.QGridLayout(bias_group)
+        for index, symbol in enumerate(SYMBOLS):
+            name_label = QtWidgets.QLabel(symbol)
+            name_label.setProperty("class", "section-title")
+            value_label = QtWidgets.QLabel("RSI +0.00 | EMA +0.00")
+            value_label.setAlignment(QtCore.Qt.AlignRight | QtCore.Qt.AlignVCenter)
+            bias_layout.addWidget(name_label, index, 0)
+            bias_layout.addWidget(value_label, index, 1)
+            self.history_bias_labels[symbol] = value_label
+        layout.addWidget(bias_group)
 
         trades_group = QtWidgets.QGroupBox("Últimas operaciones")
         trades_layout = QtWidgets.QVBoxLayout(trades_group)
@@ -2425,10 +2472,14 @@ class BotWindow(QtWidgets.QWidget):
             self.history_status_label.setText("ON" if estado_activo else "OFF")
             self.history_status_label.setStyleSheet("color: #66bb6a;" if estado_activo else "color: #ef5350;")
         biases = summary.get('biases', {})
-        if self.history_bias_label is not None:
-            rsi_bias = float(biases.get('RSI', 0.0))
-            ema_bias = float(biases.get('EMA', 0.0))
-            self.history_bias_label.setText(f"RSI {rsi_bias:.2f} | EMA {ema_bias:.2f}")
+        for symbol in SYMBOLS:
+            label = self.history_bias_labels.get(symbol)
+            if label is None:
+                continue
+            state = biases.get(symbol, {})
+            rsi_bias = float(state.get('RSI', 0.0))
+            ema_bias = float(state.get('EMA', 0.0))
+            label.setText(f"RSI {rsi_bias:+.2f} | EMA {ema_bias:+.2f}")
         if self.history_prediction_label is not None:
             self.history_prediction_label.setText(f"{float(summary.get('last_prediction', 0.5)):.2f}")
         if self.history_list is not None:
