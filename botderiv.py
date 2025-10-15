@@ -194,6 +194,10 @@ def log_trade(record: TradeRecord) -> None:
             "pnl": record.pnl,
             "reasons": "|".join(record.reasons),
         }
+        strategy_snapshot = record.metadata.get('strategy_details', {}) if record.metadata else {}
+        confidence_snapshot = record.metadata.get('strategy_confidences', {}) if record.metadata else {}
+        row["strategies"] = json.dumps(strategy_snapshot)
+        row["strategy_confidences"] = json.dumps(confidence_snapshot)
         df = pd.DataFrame([row])
         path = Path(TRADES_LOG_PATH)
         if not path.exists():
@@ -266,6 +270,8 @@ class auto_learning:
         self.recent_results: deque = deque(maxlen=200)
         self.learning_rate = 0.02
         self.weights_recalibrated = False
+        self.strategy_accuracy_snapshot: Dict[str, float] = {}
+        self._last_recalibration_total = 0
         self.min_confidence = MIN_TRADE_CONFIDENCE
         self.rsi_high_threshold = 70.0
         self.adx_min_threshold = 20.0
@@ -836,11 +842,123 @@ class auto_learning:
                 for clave, valor in list(self.weights.items()):
                     self.weights[clave] = float(np.clip(valor * (1.0 + adjustment), 0.2, 3.0))
             self.weights_recalibrated = True
+        if total_trades >= 100 and total_trades % 100 == 0 and total_trades != self._last_recalibration_total:
+            self._adaptive_recalibration(total_trades)
         self.learning_event.set()
 
     def _pop_context(self, asset: str) -> Dict[str, float]:
         with self.lock:
             return self._pending_context.pop(asset, {}).copy()
+
+    def _adaptive_recalibration(self, trade_total: int) -> None:
+        path = Path(TRADES_LOG_PATH)
+        if not path.exists():
+            self._last_recalibration_total = trade_total
+            return
+        try:
+            df = pd.read_csv(path)
+        except Exception as exc:  # pragma: no cover
+            logging.debug(f"No se pudo leer el log de operaciones para recalibración: {exc}")
+            self._last_recalibration_total = trade_total
+            return
+        if df.empty or 'strategies' not in df.columns:
+            self._last_recalibration_total = trade_total
+            return
+        accuracy_data: Dict[str, Dict[str, int]] = {}
+        for _, row in df.iterrows():
+            strategies_payload = row.get('strategies')
+            if not isinstance(strategies_payload, str) or not strategies_payload:
+                continue
+            try:
+                strategies_dict = json.loads(strategies_payload)
+            except Exception:
+                continue
+            decision = str(row.get('decision', '')).upper()
+            result = str(row.get('result', '')).upper()
+            if decision not in {'CALL', 'PUT'} or result not in {'WIN', 'LOSS'}:
+                continue
+            if decision == 'CALL':
+                opposite = 'PUT'
+            else:
+                opposite = 'CALL'
+            actual_direction = decision if result == 'WIN' else opposite
+            for strat_name, strat_info in strategies_dict.items():
+                signal = str(strat_info.get('signal', '')).upper()
+                if signal not in {'CALL', 'PUT'}:
+                    continue
+                stats = accuracy_data.setdefault(strat_name, {'wins': 0, 'total': 0})
+                stats['total'] += 1
+                if signal == actual_direction:
+                    stats['wins'] += 1
+        if not accuracy_data:
+            self._last_recalibration_total = trade_total
+            return
+        indicator_map = {
+            'RSI': 'RSI',
+            'EMA Trend': 'EMA',
+            'Bollinger Rebound': 'BOLL',
+            'Range Breakout': 'ADX',
+            'Divergence': 'MACD',
+        }
+        updated = False
+        new_indicator_weights: Dict[str, float] = {}
+        with self.weights_lock:
+            new_indicator_weights = dict(self.weights)
+        for strat_name, stats in accuracy_data.items():
+            total = stats['total']
+            if total == 0:
+                continue
+            accuracy_ratio = stats['wins'] / total
+            previous_accuracy = self.strategy_accuracy_snapshot.get(strat_name)
+            self.strategy_accuracy_snapshot[strat_name] = accuracy_ratio
+            if previous_accuracy is None:
+                continue
+            change = accuracy_ratio - previous_accuracy
+            if abs(change) < 0.01:
+                continue
+            adjustment_ratio = min(0.02, abs(change) * 0.5)
+            if adjustment_ratio <= 0.0:
+                continue
+            factor = 1.0 + adjustment_ratio if change > 0 else 1.0 - adjustment_ratio
+            if strat_name in STRATEGY_WEIGHTS:
+                with self.lock:
+                    STRATEGY_WEIGHTS[strat_name] = float(
+                        np.clip(STRATEGY_WEIGHTS[strat_name] * factor, 0.3, 3.0)
+                    )
+                updated = True
+            key = indicator_map.get(strat_name)
+            if key:
+                current_weight = new_indicator_weights.get(key)
+                if current_weight is not None:
+                    new_indicator_weights[key] = float(
+                        np.clip(current_weight * factor, 0.2, 3.0)
+                    )
+                    updated = True
+        if updated:
+            with self.weights_lock:
+                self.weights.update(new_indicator_weights)
+                self.weights_recalibrated = True
+        with self.weights_lock:
+            indicator_snapshot = {
+                'RSI': float(self.weights.get('RSI', 1.0)),
+                'EMA': float(self.weights.get('EMA', 1.0)),
+                'BOLL': float(self.weights.get('BOLL', 1.0)),
+                'ADX': float(self.weights.get('ADX', 0.8)),
+                'MACD': float(self.weights.get('MACD', 0.8)),
+            }
+        logging.info(
+            "📈 Adaptive weights updated: "
+            + ", ".join(
+                [
+                    f"RSI={indicator_snapshot['RSI']:.2f}",
+                    f"EMA={indicator_snapshot['EMA']:.2f}",
+                    f"Bollinger={indicator_snapshot['BOLL']:.2f}",
+                    f"ADX={indicator_snapshot['ADX']:.2f}",
+                    f"MACD={indicator_snapshot['MACD']:.2f}",
+                ]
+            )
+        )
+        self._last_recalibration_total = trade_total
 
     def adjust_bias(self, symbol: str, result: str, signal_direction: str, price_change: float) -> None:
         outcome = str(result).upper()
@@ -1320,14 +1438,32 @@ def strategy_rsi(df: pd.DataFrame) -> StrategyResult:
             superior = float(perfil.get("rsi_upper", superior))
         except Exception:
             pass
+    variation = 0.0
+    if len(df) > 10:
+        serie_variacion = df['close'].pct_change().rolling(10).std()
+        variation = float(np.nan_to_num(serie_variacion.iloc[-1], nan=0.0)) if len(serie_variacion) else 0.0
+    stable_threshold = 0.0012
+    high_threshold = 0.003
+    margin = 0.0
+    if variation <= stable_threshold:
+        ratio = 1.0 - variation / max(stable_threshold, 1e-9)
+        margin = ratio * 2.5
+    elif variation >= high_threshold:
+        ratio = min(1.0, (variation - high_threshold) / max(high_threshold, 1e-9))
+        margin = -ratio * 2.0
+    inferior_dinamico = float(np.clip(inferior + margin, 5.0, 45.0))
+    superior_dinamico = float(np.clip(superior - margin, 55.0, 95.0))
     extra = {
         'rsi': valor,
-        'strong_call': valor < max(20.0, inferior - 5.0),
-        'strong_put': valor > min(80.0, superior + 5.0),
+        'strong_call': valor < max(20.0, inferior_dinamico - 5.0),
+        'strong_put': valor > min(80.0, superior_dinamico + 5.0),
+        'rsi_lower_dynamic': inferior_dinamico,
+        'rsi_upper_dynamic': superior_dinamico,
+        'price_variation': variation,
     }
-    if valor < inferior:
+    if valor < inferior_dinamico:
         return StrategyResult('CALL', 2.0, [f"RSI {valor:.2f} sobrevendido → señal CALL"], extra)
-    if valor > superior:
+    if valor > superior_dinamico:
         return StrategyResult('PUT', -2.0, [f"RSI {valor:.2f} sobrecomprado → señal PUT"], extra)
     return StrategyResult('NONE', 0.0, [f"RSI {valor:.2f} sin sesgo claro"], extra)
 
@@ -1351,7 +1487,16 @@ def strategy_ema_trend(df: pd.DataFrame) -> StrategyResult:
                     tolerancia = float(perfil.get("ema_tolerance", 0.0))
                 except Exception:
                     tolerancia = 0.0
-    threshold = tolerancia / 1000.0
+    diff_series = ema_corto - ema_largo
+    recent_diff = diff_series.iloc[-5:] if len(diff_series) >= 5 else diff_series
+    diff_std = float(np.nan_to_num(recent_diff.diff().abs().mean(), nan=0.0)) if len(recent_diff) > 1 else 0.0
+    price_volatility = 0.0
+    if len(df) > 10:
+        window_vol = df['close'].pct_change().rolling(10).std()
+        price_volatility = float(np.nan_to_num(window_vol.iloc[-1], nan=0.0)) if len(window_vol) else 0.0
+    baseline_threshold = tolerancia / 1000.0
+    slope_floor = max(0.0001, baseline_threshold, diff_std * 0.5, price_volatility * 0.3)
+    threshold = baseline_threshold
     diff_prev = float(ema_corto.iloc[-2] - ema_largo.iloc[-2])
     diff_curr = float(ema_corto.iloc[-1] - ema_largo.iloc[-1])
     cruz_alcista = diff_prev <= threshold and diff_curr > threshold
@@ -1360,6 +1505,24 @@ def strategy_ema_trend(df: pd.DataFrame) -> StrategyResult:
         return StrategyResult('CALL', 1.5, ['Cruce alcista EMA9 sobre EMA21 → CALL'], {'ema_short': float(ema_corto.iloc[-1]), 'ema_long': float(ema_largo.iloc[-1])})
     if cruz_bajista:
         return StrategyResult('PUT', -1.5, ['Cruce bajista EMA9 bajo EMA21 → PUT'], {'ema_short': float(ema_corto.iloc[-1]), 'ema_long': float(ema_largo.iloc[-1])})
+    consistent_direction = False
+    if len(recent_diff) > 0:
+        signs = [np.sign(val) for val in recent_diff if abs(val) > 1e-9]
+        if signs:
+            consistent_direction = all(sign == signs[0] for sign in signs)
+    minor_threshold = slope_floor * 0.8 if slope_floor else 0.0001
+    slope_drift = float(recent_diff.iloc[-1] - recent_diff.iloc[0]) if len(recent_diff) > 1 else diff_curr
+    if consistent_direction and abs(diff_curr) >= minor_threshold and abs(slope_drift) <= abs(diff_curr) * 1.5:
+        direccion = 'CALL' if diff_curr > 0 else 'PUT'
+        puntaje = 1.1 if direccion == 'CALL' else -1.1
+        tendencia = 'alcista' if direccion == 'CALL' else 'bajista'
+        extra = {
+            'ema_short': float(ema_corto.iloc[-1]),
+            'ema_long': float(ema_largo.iloc[-1]),
+            'diff_mean': float(recent_diff.mean()) if len(recent_diff) else diff_curr,
+            'slope_floor': slope_floor,
+        }
+        return StrategyResult(direccion, puntaje, [f"Pendiente EMA consistente {tendencia} → {direccion}"], extra)
     return StrategyResult('NONE', 0.0, ['EMAs paralelas sin cruce'], {'ema_short': float(ema_corto.iloc[-1]), 'ema_long': float(ema_largo.iloc[-1])})
 
 
@@ -1386,11 +1549,40 @@ def strategy_pullback(df: pd.DataFrame) -> StrategyResult:
     rsi_series = rsi(closes)
     tramo = closes.iloc[-5:]
     rsi_tramo = rsi_series.iloc[-5:]
-    extra = {'rsi_trend': float(rsi_tramo.iloc[-1] - rsi_tramo.iloc[-2])}
+    ema_short_series = ema(closes, 9)
+    ema_long_series = ema(closes, 21)
+    ema_support_diff = float(ema_short_series.iloc[-1] - ema_long_series.iloc[-1]) if len(ema_short_series) and len(ema_long_series) else 0.0
+    extra = {
+        'rsi_trend': float(rsi_tramo.iloc[-1] - rsi_tramo.iloc[-2]) if len(rsi_tramo) > 1 else 0.0,
+        'ema_support': ema_support_diff,
+    }
     if tramo.iloc[0] > tramo.iloc[1] > tramo.iloc[2] and tramo.iloc[3] >= tramo.iloc[2] and tramo.iloc[4] > tramo.iloc[2] and rsi_tramo.iloc[-1] > rsi_tramo.iloc[-2]:
         return StrategyResult('CALL', 1.0, ['Pullback alcista con RSI recuperándose → CALL'], extra)
     if tramo.iloc[0] < tramo.iloc[1] < tramo.iloc[2] and tramo.iloc[3] <= tramo.iloc[2] and tramo.iloc[4] < tramo.iloc[2] and rsi_tramo.iloc[-1] < rsi_tramo.iloc[-2]:
         return StrategyResult('PUT', -1.0, ['Pullback bajista con RSI cayendo → PUT'], extra)
+    soporte_rsi_alcista = len(rsi_tramo) > 1 and rsi_tramo.iloc[-1] > rsi_tramo.iloc[-2]
+    soporte_rsi_bajista = len(rsi_tramo) > 1 and rsi_tramo.iloc[-1] < rsi_tramo.iloc[-2]
+    soporte_ema_alcista = ema_support_diff > 0
+    soporte_ema_bajista = ema_support_diff < 0
+    if len(tramo) >= 3:
+        recuperacion_rapida = tramo.iloc[-3] >= tramo.iloc[-2] and tramo.iloc[-1] > tramo.iloc[-2]
+        caida_rapida = tramo.iloc[-3] <= tramo.iloc[-2] and tramo.iloc[-1] < tramo.iloc[-2]
+        if recuperacion_rapida and (soporte_rsi_alcista or soporte_ema_alcista):
+            respaldos = []
+            if soporte_rsi_alcista:
+                respaldos.append('RSI')
+            if soporte_ema_alcista:
+                respaldos.append('EMA')
+            texto_respaldo = ' y '.join(respaldos)
+            return StrategyResult('CALL', 0.9, [f"Pullback rápido confirmado ({texto_respaldo}) → CALL"], extra)
+        if caida_rapida and (soporte_rsi_bajista or soporte_ema_bajista):
+            respaldos = []
+            if soporte_rsi_bajista:
+                respaldos.append('RSI')
+            if soporte_ema_bajista:
+                respaldos.append('EMA')
+            texto_respaldo = ' y '.join(respaldos)
+            return StrategyResult('PUT', -0.9, [f"Pullback rápido confirmado ({texto_respaldo}) → PUT"], extra)
     return StrategyResult('NONE', 0.0, ['Sin pullback definido'], extra)
 
 
@@ -1464,6 +1656,8 @@ STRATEGY_WEIGHTS: Dict[str, float] = {
 
 TOTAL_STRATEGY_COUNT = len(STRATEGY_WEIGHTS)
 
+MAX_STRATEGY_SCORE = 3.0
+
 STRATEGY_DISPLAY_NAMES: Dict[str, str] = {
     'RSI': 'RSI',
     'EMA Trend': 'Tendencia EMA',
@@ -1486,6 +1680,29 @@ def _clasificar_confianza(valor: float) -> str:
     return 'Baja'
 
 
+def _compute_strategy_confidence(score: float) -> float:
+    magnitude = abs(float(score))
+    normalized = magnitude / MAX_STRATEGY_SCORE if MAX_STRATEGY_SCORE else magnitude
+    return float(max(0.0, min(1.0, normalized)))
+
+
+def _compute_volatility_factor(volatility: Optional[float]) -> float:
+    if volatility is None:
+        return 1.0
+    vol = max(0.0, float(volatility))
+    low_threshold = 0.0005
+    high_threshold = 0.003
+    if vol < low_threshold:
+        ratio = vol / max(low_threshold, 1e-9)
+        reduction = (1.0 - ratio) * 0.15
+        return float(max(0.7, 1.0 - reduction))
+    if vol > high_threshold:
+        ratio_high = min(1.0, (vol - high_threshold) / max(high_threshold, 1e-9))
+        boost = ratio_high * 0.05
+        return float(min(1.1, 1.0 + boost))
+    return 1.0
+
+
 def combine_signals(results: List[Tuple[str, StrategyResult]], active_states: Dict[str, bool]) -> Dict[str, Any]:
     reasons: List[str] = []
     agreements: Dict[str, str] = {}
@@ -1498,6 +1715,9 @@ def combine_signals(results: List[Tuple[str, StrategyResult]], active_states: Di
     low_volatility = False
     volatility_value: Optional[float] = None
     active_count = 0
+    direction_confidence_sum = {'CALL': 0.0, 'PUT': 0.0}
+    direction_weight_sum = {'CALL': 0.0, 'PUT': 0.0}
+    strategy_confidences: Dict[str, float] = {}
     for name, res in results:
         if not active_states.get(name, True):
             continue
@@ -1506,6 +1726,11 @@ def combine_signals(results: List[Tuple[str, StrategyResult]], active_states: Di
         active_count += 1
         agreements[name] = res.signal
         reasons.extend(res.reasons)
+        strategy_conf = _compute_strategy_confidence(res.score)
+        strategy_confidences[name] = strategy_conf
+        logging.debug(
+            f"[Signals] {name}: señal={res.signal} score={res.score:.3f} confianza={strategy_conf:.3f}"
+        )
         if name == 'Volatility Filter':
             volatility_value = res.extra.get('volatility')
             if res.extra.get('low'):
@@ -1529,6 +1754,8 @@ def combine_signals(results: List[Tuple[str, StrategyResult]], active_states: Di
             pesos_direccion[res.signal] += weight
             conteo_direccion[res.signal] += 1
             total_weight_signals += weight
+            direction_confidence_sum[res.signal] += strategy_conf * weight
+            direction_weight_sum[res.signal] += weight
     if total_weight_signals == 0.0:
         main_reason = '⚠️ Ninguna de las estrategias activas generó señal'
         return {
@@ -1551,12 +1778,22 @@ def combine_signals(results: List[Tuple[str, StrategyResult]], active_states: Di
             'total_weight': total_weight_signals,
             'active_weight': total_weight_active,
             'strong': 0,
+            'strategy_confidences': strategy_confidences,
         }
-    dominante = 'CALL' if pesos_direccion['CALL'] >= pesos_direccion['PUT'] else 'PUT'
-    dominant_weight = pesos_direccion[dominante]
-    confidence_from_signals = dominant_weight / total_weight_signals if total_weight_signals else 0.0
-    confidence_vs_active = dominant_weight / total_weight_active if total_weight_active else 0.0
-    confianza = max(confidence_from_signals, confidence_vs_active)
+    call_support = direction_confidence_sum['CALL']
+    put_support = direction_confidence_sum['PUT']
+    if call_support == put_support:
+        dominante = 'CALL' if pesos_direccion['CALL'] >= pesos_direccion['PUT'] else 'PUT'
+    else:
+        dominante = 'CALL' if call_support > put_support else 'PUT'
+    dominant_weight = direction_weight_sum[dominante]
+    weighted_confidence = (
+        direction_confidence_sum[dominante] / dominant_weight if dominant_weight else 0.0
+    )
+    participation_factor = (
+        pesos_direccion[dominante] / total_weight_active if total_weight_active else 0.0
+    )
+    confianza = max(weighted_confidence, participation_factor)
     signal = 'NONE'
     aligned = conteo_direccion[dominante]
     if confianza >= 0.45:
@@ -1565,9 +1802,17 @@ def combine_signals(results: List[Tuple[str, StrategyResult]], active_states: Di
         signal = override_signal
         confianza = max(confianza, 0.45)
         aligned = conteo_direccion.get(override_signal, 0)
-    if low_volatility and signal != 'NONE':
-        confianza *= 0.9
-        reasons.append('Volatilidad baja → confianza limitada')
+    if signal != 'NONE':
+        factor_volatilidad = _compute_volatility_factor(volatility_value)
+        if volatility_value is not None:
+            logging.debug(
+                f"[Signals] Volatilidad previa al ajuste: {volatility_value:.6f} factor={factor_volatilidad:.3f}"
+            )
+        if factor_volatilidad < 1.0:
+            confianza *= factor_volatilidad
+            reasons.append('Volatilidad baja → confianza limitada')
+        elif factor_volatilidad > 1.0:
+            confianza *= factor_volatilidad
     confianza = min(confianza, 0.98)
     if signal != 'NONE':
         confianza = max(confianza, 0.35)
@@ -1604,6 +1849,7 @@ def combine_signals(results: List[Tuple[str, StrategyResult]], active_states: Di
         'total_weight': total_weight_signals,
         'active_weight': total_weight_active,
         'strong': strong_flag,
+        'strategy_confidences': strategy_confidences,
     }
 
 
@@ -2455,6 +2701,7 @@ class TradingEngine:
                 'ai_notes': [],
                 'consensus': consensus,
                 'results': results,
+                'strategy_confidences': consensus.get('strategy_confidences', {}),
                 'features': None,
                 'entry_price': entry_price,
                 'latest_rsi': 0.0,
@@ -2530,11 +2777,17 @@ class TradingEngine:
                 macd_value,
             )
             trend_bias = abs(ema_slope) > 0.0005 or adx_value > 25.0
-            if smoothed_volatility < 0.0005:
-                penalty = 0.95 if trend_bias else 0.9
-                indicator_conf *= penalty
-            elif smoothed_volatility > 0.003:
-                indicator_conf *= 1.05
+            volatility_factor = _compute_volatility_factor(smoothed_volatility)
+            adjusted_indicator_factor = volatility_factor
+            if volatility_factor < 1.0 and trend_bias:
+                adjusted_indicator_factor = 1.0 - (1.0 - volatility_factor) * 0.5
+            logging.debug(
+                f"[Fusion] Volatilidad suavizada: {smoothed_volatility:.6f} factor={volatility_factor:.3f}"
+            )
+            if volatility_factor < 1.0:
+                indicator_conf *= adjusted_indicator_factor
+            elif volatility_factor > 1.0:
+                indicator_conf *= volatility_factor
             indicator_conf = float(np.clip(indicator_conf, 0.0, 1.0))
             evaluation.update(
                 {
@@ -2613,11 +2866,13 @@ class TradingEngine:
                 combined_confidence = float(max(weighted_average, max(base_components)))
             else:
                 combined_confidence = 0.6
-            if smoothed_volatility < 0.0005:
-                penalty = 0.95 if trend_bias else 0.9
-                combined_confidence *= penalty
-            elif smoothed_volatility > 0.003:
-                combined_confidence *= 1.05
+            adjusted_combined_factor = volatility_factor
+            if volatility_factor < 1.0 and trend_bias:
+                adjusted_combined_factor = 1.0 - (1.0 - volatility_factor) * 0.5
+            if volatility_factor < 1.0:
+                combined_confidence *= adjusted_combined_factor
+            elif volatility_factor > 1.0:
+                combined_confidence *= volatility_factor
             combined_confidence = float(np.clip(combined_confidence, 0.0, 1.0))
             if combined_confidence == 0.0 or math.isnan(combined_confidence):
                 combined_confidence = 0.6
@@ -2631,6 +2886,9 @@ class TradingEngine:
                 final_confidence = min_confidence
             final_confidence *= symbol_weight
             final_confidence = float(np.clip(final_confidence, 0.0, 1.0))
+            logging.debug(
+                f"[Fusion] base={confidence:.3f} indicador={indicator_conf:.3f} IA={ai_confidence:.3f} final={final_confidence:.3f}"
+            )
             if final_confidence >= 0.75:
                 evaluation['strong'] = 1
             adx_threshold = auto_learn.get_adx_min_threshold()
@@ -2813,6 +3071,15 @@ class TradingEngine:
             self.risk.register_trade(pnl)
             if features is not None:
                 self.ai.log_trade(features, 1 if trade_result == 'WIN' else 0)
+            strategy_details = {
+                name: {
+                    'signal': res.signal,
+                    'score': float(res.score),
+                    'weight': float(STRATEGY_WEIGHTS.get(name, 1.0)),
+                    'confidence': float(consensus.get('strategy_confidences', {}).get(name, 0.0)),
+                }
+                for name, res in results
+            }
             record_metadata = {
                 'confidence_label': consensus['confidence_label'],
                 'confidence_value': consensus['confidence'],
@@ -2828,6 +3095,8 @@ class TradingEngine:
                 'dominant': consensus['dominant'],
                 'total_weight': consensus['total_weight'],
                 'active_weight': consensus.get('active_weight', 0.0),
+                'strategy_confidences': consensus.get('strategy_confidences', {}),
+                'strategy_details': strategy_details,
                 'contract_id': contract_id,
                 'stake': stake_amount,
                 'ml_probability': ml_probability,
