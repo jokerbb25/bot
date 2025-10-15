@@ -265,6 +265,7 @@ class auto_learning:
         self.memory_limit = 5000
         self.recent_results: deque = deque(maxlen=200)
         self.learning_rate = 0.02
+        self.weights_recalibrated = False
         self.min_confidence = MIN_TRADE_CONFIDENCE
         self.rsi_high_threshold = 70.0
         self.adx_min_threshold = 20.0
@@ -827,6 +828,14 @@ class auto_learning:
             logging.debug(f"No se pudo registrar historial de autoaprendizaje: {exc}")
         if should_train:
             self.executor.submit(self._train_model)
+        total_trades = self.global_totals['total']
+        if total_trades and total_trades % 150 == 0:
+            accuracy = self.global_totals['wins'] / max(1, total_trades)
+            adjustment = float(np.clip((accuracy - 0.55) * 0.1, -0.03, 0.03))
+            with self.weights_lock:
+                for clave, valor in list(self.weights.items()):
+                    self.weights[clave] = float(np.clip(valor * (1.0 + adjustment), 0.2, 3.0))
+            self.weights_recalibrated = True
         self.learning_event.set()
 
     def _pop_context(self, asset: str) -> Dict[str, float]:
@@ -1444,13 +1453,13 @@ STRATEGY_FUNCTIONS: List[Tuple[str, Callable[[pd.DataFrame], StrategyResult]]] =
 ]
 
 STRATEGY_WEIGHTS: Dict[str, float] = {
-    'RSI': 2.0,
-    'EMA Trend': 1.5,
-    'Bollinger Rebound': 1.2,
-    'Pullback': 1.0,
+    'RSI': 2.3,
+    'EMA Trend': 1.8,
+    'Bollinger Rebound': 1.4,
+    'Pullback': 1.1,
     'Range Breakout': 1.0,
-    'Divergence': 1.5,
-    'Volatility Filter': 0.5,
+    'Divergence': 1.7,
+    'Volatility Filter': 0.6,
 }
 
 TOTAL_STRATEGY_COUNT = len(STRATEGY_WEIGHTS)
@@ -1541,9 +1550,13 @@ def combine_signals(results: List[Tuple[str, StrategyResult]], active_states: Di
             'dominant': 'NONE',
             'total_weight': total_weight_signals,
             'active_weight': total_weight_active,
+            'strong': 0,
         }
     dominante = 'CALL' if pesos_direccion['CALL'] >= pesos_direccion['PUT'] else 'PUT'
-    confianza = pesos_direccion[dominante] / total_weight_signals
+    dominant_weight = pesos_direccion[dominante]
+    confidence_from_signals = dominant_weight / total_weight_signals if total_weight_signals else 0.0
+    confidence_vs_active = dominant_weight / total_weight_active if total_weight_active else 0.0
+    confianza = max(confidence_from_signals, confidence_vs_active)
     signal = 'NONE'
     aligned = conteo_direccion[dominante]
     if confianza >= 0.45:
@@ -1553,7 +1566,7 @@ def combine_signals(results: List[Tuple[str, StrategyResult]], active_states: Di
         confianza = max(confianza, 0.45)
         aligned = conteo_direccion.get(override_signal, 0)
     if low_volatility and signal != 'NONE':
-        confianza *= 0.85
+        confianza *= 0.9
         reasons.append('Volatilidad baja → confianza limitada')
     confianza = min(confianza, 0.98)
     if signal != 'NONE':
@@ -1570,6 +1583,7 @@ def combine_signals(results: List[Tuple[str, StrategyResult]], active_states: Di
     )
     if low_volatility and signal != 'NONE' and 'volatilidad' not in main_reason.lower():
         main_reason = f"{main_reason} + baja volatilidad"
+    strong_flag = 1 if signal != 'NONE' and confianza >= 0.75 else 0
     return {
         'signal': signal,
         'confidence': confianza,
@@ -1589,6 +1603,7 @@ def combine_signals(results: List[Tuple[str, StrategyResult]], active_states: Di
         'dominant': dominante,
         'total_weight': total_weight_signals,
         'active_weight': total_weight_active,
+        'strong': strong_flag,
     }
 
 
@@ -2096,6 +2111,13 @@ class TradingEngine:
         self.regime_cycle_count = 0
         with auto_learn.weights_lock:
             self._baseline_weights = dict(auto_learn.weights)
+        self._indicator_cache: Dict[str, Dict[str, Any]] = {symbol: {} for symbol in SYMBOLS}
+        self._volatility_history: Dict[str, deque] = {symbol: deque(maxlen=5) for symbol in SYMBOLS}
+        self._cycle_id_counter = 0
+        self._last_regime_cycle = -1
+        self._current_cycle_id = 0
+        self._latest_regime_inputs: Dict[str, Any] = {}
+        self._active_regime: Optional[str] = None
 
     def add_trade_listener(self, callback: Callable[[TradeRecord, Dict[str, float]], None]) -> None:
         self._trade_listeners.append(callback)
@@ -2227,20 +2249,36 @@ class TradingEngine:
         return results, consensus
 
     def detect_market_regime(self, adx_value: float, bollinger_width: float, volatility: float) -> str:
-        if adx_value > 25.0 and volatility < 0.02:
+        ema_slope = 0.0
+        symbol = None
+        if isinstance(self._latest_regime_inputs, dict):
+            ema_slope = float(self._latest_regime_inputs.get('ema_slope', 0.0))
+            symbol = self._latest_regime_inputs.get('symbol')
+        slope_strength = abs(ema_slope)
+        wide_bands = bollinger_width > 0.03
+        strong_trend = adx_value > 25.0 or slope_strength > 0.0005
+        calm_volatility = volatility < 0.02
+        if strong_trend and calm_volatility and not wide_bands:
             regime = "TRENDING"
-        elif adx_value < 20.0 and volatility < 0.015:
+        elif adx_value < 20.0 and slope_strength < 0.0003 and volatility < 0.015:
             regime = "RANGING"
-        elif volatility > 0.03 or bollinger_width > 0.03:
+        elif volatility > 0.03 or wide_bands:
             regime = "VOLATILE"
         else:
             regime = "CALM"
-        logging.info(f"📊 Market Regime Detected: {regime}")
+        logging.info(f"📊 Market Regime Detected: {regime}{' @ ' + symbol if symbol else ''}")
         return regime
 
     def _apply_regime_adjustments(self, regime: str) -> None:
         if not regime:
             return
+        cycle_id = getattr(self, '_current_cycle_id', 0)
+        if cycle_id == self._last_regime_cycle and regime == self._active_regime:
+            return
+        if getattr(auto_learn, 'weights_recalibrated', False):
+            with auto_learn.weights_lock:
+                self._baseline_weights = dict(auto_learn.weights)
+            auto_learn.weights_recalibrated = False
         update_weights = False
         with auto_learn.weights_lock:
             weights_snapshot = dict(auto_learn.weights)
@@ -2271,6 +2309,8 @@ class TradingEngine:
             with auto_learn.weights_lock:
                 auto_learn.weights = dict(self._baseline_weights)
             logging.info("🔄 Resetting indicator weights to baseline.")
+        self._last_regime_cycle = cycle_id
+        self._active_regime = regime
 
     def _handle_auto_shutdown(self) -> None:
         if self.auto_shutdown_triggered:
@@ -2433,23 +2473,55 @@ class TradingEngine:
                 'rsi_signal': 'NONE',
                 'ema_signal': 'NONE',
                 'macd_signal': 'NONE',
+                'strong': 0,
             }
-            latest_rsi_series = rsi(df['close'])
-            latest_rsi = float(latest_rsi_series.iloc[-1]) if not latest_rsi_series.empty else 0.0
-            ema_corto_valor = float(ema(df['close'], 9).iloc[-1]) if len(df) else 0.0
-            ema_largo_valor = float(ema(df['close'], 21).iloc[-1]) if len(df) else 0.0
-            ema_spread = ema_corto_valor - ema_largo_valor
-            bandas_inferior, bandas_superior = bollinger_bands(df['close'])
-            boll_width = float(bandas_superior.iloc[-1] - bandas_inferior.iloc[-1]) if len(bandas_superior) else 0.0
-            volatilidad_serie = df['close'].pct_change().rolling(20).std()
-            volatilidad_actual = float(np.nan_to_num(volatilidad_serie.iloc[-1], nan=0.0)) if len(volatilidad_serie) else 0.0
-            adx_value = auto_learn.calculate_adx(symbol, df['high'].values, df['low'].values, df['close'].values)
-            macd_value = auto_learn.calculate_macd(df['close'].values)
+            last_epoch = candles[-1].epoch if candles else 0
+            cache = self._indicator_cache.setdefault(symbol, {})
+            cached_epoch = cache.get('epoch')
+            if cached_epoch == last_epoch:
+                latest_rsi = float(cache.get('latest_rsi', 0.0))
+                ema_corto_valor = float(cache.get('ema_fast', 0.0))
+                ema_largo_valor = float(cache.get('ema_slow', 0.0))
+                boll_width = float(cache.get('boll_width', 0.0))
+                ema_prev_fast = float(cache.get('ema_fast_prev', ema_corto_valor))
+            else:
+                latest_rsi_series = rsi(df['close'])
+                latest_rsi = float(latest_rsi_series.iloc[-1]) if not latest_rsi_series.empty else 0.0
+                ema_fast_series = ema(df['close'], 9) if len(df) else pd.Series(dtype=float)
+                ema_slow_series = ema(df['close'], 21) if len(df) else pd.Series(dtype=float)
+                ema_corto_valor = float(ema_fast_series.iloc[-1]) if not ema_fast_series.empty else 0.0
+                ema_largo_valor = float(ema_slow_series.iloc[-1]) if not ema_slow_series.empty else 0.0
+                bandas_inferior, bandas_superior = bollinger_bands(df['close'])
+                boll_width = float(bandas_superior.iloc[-1] - bandas_inferior.iloc[-1]) if len(bandas_superior) else 0.0
+                ema_prev_fast = float(cache.get('ema_fast', ema_corto_valor))
+                cache.update({
+                    'epoch': last_epoch,
+                    'latest_rsi': latest_rsi,
+                    'ema_fast_prev': cache.get('ema_fast', ema_corto_valor),
+                    'ema_fast': ema_corto_valor,
+                    'ema_slow': ema_largo_valor,
+                    'boll_width': boll_width,
+                })
+            ema_slope = ema_corto_valor - ema_prev_fast
+            cache['ema_fast_prev'] = ema_corto_valor
+            cache['ema_fast'] = ema_corto_valor
+            cache['ema_slow'] = ema_largo_valor
+            cache['boll_width'] = boll_width
+            cache['latest_rsi'] = latest_rsi
+            cache['epoch'] = last_epoch
             price_reference = entry_price if entry_price else 1.0
             boll_ratio = boll_width / price_reference if price_reference else 0.0
+            volatilidad_serie = df['close'].pct_change().rolling(20).std()
+            volatilidad_actual = float(np.nan_to_num(volatilidad_serie.iloc[-1], nan=0.0)) if len(volatilidad_serie) else 0.0
+            historial_vol = self._volatility_history.setdefault(symbol, deque(maxlen=5))
+            historial_vol.append(volatilidad_actual)
+            smoothed_volatility = float(sum(historial_vol) / len(historial_vol)) if historial_vol else volatilidad_actual
+            adx_value = auto_learn.calculate_adx(symbol, df['high'].values, df['low'].values, df['close'].values)
+            macd_value = auto_learn.calculate_macd(df['close'].values)
             rsi_signal = next((out.signal for name, out in results if name == 'RSI'), 'NONE')
             ema_signal = next((out.signal for name, out in results if name == 'EMA Trend'), 'NONE')
             macd_signal = 'CALL' if macd_value > 0 else 'PUT' if macd_value < 0 else 'NONE'
+            ema_spread = ema_corto_valor - ema_largo_valor
             indicator_conf = auto_learn.calculate_confidence(
                 latest_rsi,
                 ema_spread,
@@ -2457,9 +2529,11 @@ class TradingEngine:
                 adx_value,
                 macd_value,
             )
-            if volatilidad_actual < 0.0005:
-                indicator_conf *= 0.85
-            elif volatilidad_actual > 0.003:
+            trend_bias = abs(ema_slope) > 0.0005 or adx_value > 25.0
+            if smoothed_volatility < 0.0005:
+                penalty = 0.95 if trend_bias else 0.9
+                indicator_conf *= penalty
+            elif smoothed_volatility > 0.003:
                 indicator_conf *= 1.05
             indicator_conf = float(np.clip(indicator_conf, 0.0, 1.0))
             evaluation.update(
@@ -2467,7 +2541,7 @@ class TradingEngine:
                     'latest_rsi': latest_rsi,
                     'ema_spread': ema_spread,
                     'boll_width': boll_width,
-                    'volatility': volatilidad_actual,
+                    'volatility': smoothed_volatility,
                     'indicator_confidence': indicator_conf,
                     'adx': adx_value,
                     'macd': macd_value,
@@ -2476,7 +2550,8 @@ class TradingEngine:
                     'macd_signal': macd_signal,
                 }
             )
-            regime = self.detect_market_regime(adx_value, boll_width, volatilidad_actual)
+            self._latest_regime_inputs = {'symbol': symbol, 'ema_slope': ema_slope, 'boll_width': boll_width}
+            regime = self.detect_market_regime(adx_value, boll_width, smoothed_volatility)
             self._apply_regime_adjustments(regime)
             signals = [rsi_signal, ema_signal, macd_signal]
             if signals.count('CALL') >= 2:
@@ -2521,11 +2596,27 @@ class TradingEngine:
                 signal_source = self._determine_signal_source(signal, consensus, results)
                 auto_learn.record_signal_source(symbol, signal_source)
                 evaluation['signal_source'] = signal_source
-            base_components = [ai_confidence, indicator_conf, confidence]
-            combined_confidence = float(np.clip(np.mean(base_components), 0.0, 1.0))
-            if volatilidad_actual < 0.0005:
-                combined_confidence *= 0.85
-            elif volatilidad_actual > 0.003:
+            base_components: List[float] = []
+            component_weights: List[float] = []
+            for value, weight in ((ai_confidence, 0.4), (indicator_conf, 0.35), (confidence, 0.25)):
+                if value is None:
+                    continue
+                val = float(value)
+                if val <= 0.0 or math.isnan(val):
+                    continue
+                base_components.append(val)
+                component_weights.append(weight)
+            if base_components:
+                weight_sum = sum(component_weights) or 1.0
+                normalized = [w / weight_sum for w in component_weights]
+                weighted_average = sum(v * w for v, w in zip(base_components, normalized))
+                combined_confidence = float(max(weighted_average, max(base_components)))
+            else:
+                combined_confidence = 0.6
+            if smoothed_volatility < 0.0005:
+                penalty = 0.95 if trend_bias else 0.9
+                combined_confidence *= penalty
+            elif smoothed_volatility > 0.003:
                 combined_confidence *= 1.05
             combined_confidence = float(np.clip(combined_confidence, 0.0, 1.0))
             if combined_confidence == 0.0 or math.isnan(combined_confidence):
@@ -2534,11 +2625,14 @@ class TradingEngine:
                 ml_probability = 0.55
             symbol_weight = auto_learn.get_symbol_weight(symbol)
             min_confidence = auto_learn.get_min_confidence()
-            final_confidence = combined_confidence * ml_probability
+            fused_probability = (combined_confidence * 0.6) + (ml_probability * 0.4)
+            final_confidence = max(combined_confidence * ml_probability, fused_probability)
             if final_confidence < min_confidence:
                 final_confidence = min_confidence
             final_confidence *= symbol_weight
             final_confidence = float(np.clip(final_confidence, 0.0, 1.0))
+            if final_confidence >= 0.75:
+                evaluation['strong'] = 1
             adx_threshold = auto_learn.get_adx_min_threshold()
             rsi_high_threshold = auto_learn.get_rsi_high_threshold()
             call_floor = max(0.0, 100.0 - rsi_high_threshold)
@@ -2572,9 +2666,14 @@ class TradingEngine:
     def scan_market(self) -> None:
         if not self.running.is_set():
             return
+        self._cycle_id_counter += 1
+        self._current_cycle_id = self._cycle_id_counter
         evaluations: List[Dict[str, Any]] = []
         confidence_lines: List[str] = []
         trade_executed = False
+        def _cycle_pause() -> None:
+            QtWidgets.QApplication.processEvents()
+            QtCore.QThread.msleep(2000)
         for symbol in SYMBOLS:
             if not self.running.is_set():
                 break
@@ -2594,15 +2693,18 @@ class TradingEngine:
                 break
             QtCore.QThread.msleep(200)
         if not self.running.is_set():
+            _cycle_pause()
             return
         if trade_executed:
+            _cycle_pause()
             return
         if not evaluations:
+            _cycle_pause()
             return
         min_required = auto_learn.get_min_confidence()
-        strong_signal_count = sum(1 for item in evaluations if item.get('eligible'))
+        strong_signal_count = sum(1 for item in evaluations if int(item.get('strong', 0)) == 1)
         if strong_signal_count > 0:
-            candidates = [item for item in evaluations if item.get('eligible')]
+            candidates = [item for item in evaluations if int(item.get('strong', 0)) == 1]
         else:
             candidates = [
                 item
@@ -2614,6 +2716,7 @@ class TradingEngine:
             summary_line = " | ".join(confidence_lines)
             if summary_line:
                 logging.info(f"{summary_line} → Selected: ninguno")
+            _cycle_pause()
             return
         best = max(candidates, key=lambda item: float(item.get('final_confidence', 0.0)))
         summary_line = " | ".join(confidence_lines)
@@ -2621,10 +2724,13 @@ class TradingEngine:
         if summary_line:
             logging.info(f"{summary_line} → Selected: {selected_text} | strong={strong_signal_count}")
         if best.get('signal') not in {'CALL', 'PUT'}:
+            _cycle_pause()
             return
         if strong_signal_count == 0 and float(best['final_confidence']) < min_required:
+            _cycle_pause()
             return
         self._execute_selected_trade(best)
+        _cycle_pause()
 
     def confirm_and_execute(self, evaluation: Dict[str, Any]) -> bool:
         direction = evaluation.get('confluence_direction')
