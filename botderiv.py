@@ -80,6 +80,8 @@ TRADE_DURATION_SECONDS = 60
 RESULT_POLL_INTERVAL = 5
 RESUME_MESSAGE = "🔁 Reanudando análisis del mercado..."
 
+CSV_LOGGED_CONTRACTS: Set[int] = set()
+
 
 # ===============================================================
 # DATA STRUCTURES
@@ -185,6 +187,19 @@ def donchian_channels(df: pd.DataFrame, period: int = 20) -> Tuple[pd.Series, pd
 
 
 def log_trade(record: TradeRecord) -> None:
+    contract_id: Optional[int] = None
+    if record.metadata:
+        raw_id = record.metadata.get('contract_id')
+        try:
+            contract_id = int(raw_id) if raw_id is not None else None
+        except (TypeError, ValueError):
+            contract_id = None
+    logged_contracts = CSV_LOGGED_CONTRACTS
+    if contract_id is not None:
+        if contract_id in logged_contracts:
+            logging.debug(f"Duplicate contract {contract_id} ignored.")
+            return
+        logged_contracts.add(contract_id)
     try:
         row = {
             "timestamp": record.timestamp.isoformat(),
@@ -2431,6 +2446,7 @@ class TradingEngine:
             self._processed_contracts.clear()
         with self._closed_lock:
             self._closed_contracts.clear()
+        CSV_LOGGED_CONTRACTS.clear()
 
     def is_running(self) -> bool:
         return self.running.is_set()
@@ -3266,6 +3282,7 @@ class TradingEngine:
             self._processed_contracts.clear()
         with self._closed_lock:
             self._closed_contracts.clear()
+        CSV_LOGGED_CONTRACTS.clear()
 
 
 # ===============================================================
@@ -3307,6 +3324,7 @@ class BotThread(QThread):
         self.engine = engine
         self._active = True
         self._closed_contracts: Set[int] = set()
+        self._result_logged_contracts: Set[int] = set()
         self._result_callback = self._handle_trade_result
         self.engine.add_result_listener(self._result_callback)
 
@@ -3321,9 +3339,11 @@ class BotThread(QThread):
     def _handle_trade_result(self, data: Dict[str, Any]) -> None:
         contract_id = self._normalize_contract_id(data.get("ticket") or data.get("contract_id"))
         if contract_id is not None:
-            if contract_id in self._closed_contracts:
-                logging.debug(f"Contract {contract_id} already closed. Skipping duplicate log.")
+            logged_contracts = self._result_logged_contracts
+            if contract_id in logged_contracts:
+                logging.debug(f"Duplicate contract {contract_id} ignored.")
                 return
+            logged_contracts.add(contract_id)
             self._closed_contracts.add(contract_id)
         ticket = data.get("ticket")
         resultado = data.get("resultado", "-")
@@ -3338,6 +3358,7 @@ class BotThread(QThread):
         logging.info("🚀 BotThread started successfully.")
         self._active = True
         self._closed_contracts.clear()
+        self._result_logged_contracts.clear()
         try:
             self.engine.start_engine()
         except Exception as exc:
@@ -3369,6 +3390,7 @@ class BotThread(QThread):
         self.engine.stop()
         self.engine.remove_result_listener(self._result_callback)
         self._closed_contracts.clear()
+        self._result_logged_contracts.clear()
 
 
 class BotWindow(QtWidgets.QWidget):
@@ -3440,6 +3462,7 @@ class BotWindow(QtWidgets.QWidget):
         self.history_prediction_label: Optional[QtWidgets.QLabel] = None
 
         self.logged_contracts: Set[int] = set()
+        self.pending_contracts: Set[int] = set()
 
         self._build_ui()
 
@@ -3719,6 +3742,8 @@ class BotWindow(QtWidgets.QWidget):
             return
         self.auto_shutdown_active = False
         self.engine.auto_shutdown_triggered = False
+        self.logged_contracts.clear()
+        self.pending_contracts.clear()
         self.bot_thread = BotThread(self.engine)
         self.bot_thread.finished.connect(self._on_thread_finished)
         self.bot_thread.log_signal.connect(self._append_log)
@@ -3745,6 +3770,8 @@ class BotWindow(QtWidgets.QWidget):
         self.status_label.setText("Estado: Detenido")
         self.auto_shutdown_active = False
         self._on_trade_state("ready")
+        self.logged_contracts.clear()
+        self.pending_contracts.clear()
 
     def _on_trade_amount_changed(self, value: float) -> None:
         self.engine.set_trade_amount(value)
@@ -3803,6 +3830,7 @@ class BotWindow(QtWidgets.QWidget):
                 stored_id = item.data(QtCore.Qt.UserRole)
                 if stored_id is not None:
                     self.logged_contracts.discard(stored_id)
+                    self.pending_contracts.discard(stored_id)
             table.removeRow(last_row)
 
     def update_result_table(self, data: Dict[str, Any]) -> None:
@@ -3810,18 +3838,16 @@ class BotWindow(QtWidgets.QWidget):
         if table is None:
             return
         contract_id = self._normalize_contract_id(data.get("ticket") or data.get("contract_id"))
+        if contract_id is not None:
+            logged_contracts = self.logged_contracts
+            if contract_id in logged_contracts:
+                logging.debug(f"Duplicate contract {contract_id} ignored.")
+                return
+            logged_contracts.add(contract_id)
         target_row = self._find_contract_row(contract_id)
         if target_row is None:
-            if contract_id is not None and contract_id in self.logged_contracts:
-                logging.debug(f"Duplicate trade {contract_id} ignored.")
-                return
             target_row = 0
             table.insertRow(target_row)
-            if contract_id is not None:
-                self.logged_contracts.add(contract_id)
-        else:
-            if contract_id is not None and contract_id not in self.logged_contracts:
-                self.logged_contracts.add(contract_id)
         confidence_value = float(data.get("confianza", 0.0))
         pnl_value = float(data.get("pnl", 0.0))
         entries = [
@@ -3841,6 +3867,8 @@ class BotWindow(QtWidgets.QWidget):
         existing_note = table.item(target_row, 6)
         if nota_text or existing_note is None:
             table.setItem(target_row, 6, QtWidgets.QTableWidgetItem(nota_text))
+        if contract_id is not None:
+            self.pending_contracts.discard(contract_id)
         if table.rowCount() > 250:
             self._trim_trade_table()
 
@@ -3849,12 +3877,12 @@ class BotWindow(QtWidgets.QWidget):
         self.latest_stats = stats
         table = self.trade_table
         contract_id = self._normalize_contract_id(record.metadata.get('contract_id') if record.metadata else None)
-        target_row = self._find_contract_row(contract_id)
-        if target_row is None:
-            if contract_id is not None and contract_id in self.logged_contracts:
-                logging.debug(f"Duplicate trade {contract_id} ignored.")
+        if contract_id is not None:
+            logged_contracts = self.logged_contracts
+            if contract_id in logged_contracts:
+                logging.debug(f"Duplicate contract {contract_id} ignored.")
                 self._update_stats_labels(stats)
-                metadata = record.metadata
+                metadata = record.metadata or {}
                 summary_data = {
                     'confidence': metadata.get('confidence_value', record.confidence),
                     'confidence_label': metadata.get('confidence_label', 'Baja'),
@@ -3868,13 +3896,11 @@ class BotWindow(QtWidgets.QWidget):
                 self._update_asset_summary_from_dict(record.symbol, summary_data)
                 self._update_history_tab()
                 return
+            logged_contracts.add(contract_id)
+        target_row = self._find_contract_row(contract_id)
+        if target_row is None:
             target_row = 0
             table.insertRow(target_row)
-            if contract_id is not None:
-                self.logged_contracts.add(contract_id)
-        else:
-            if contract_id is not None and contract_id not in self.logged_contracts:
-                self.logged_contracts.add(contract_id)
         entries = [
             record.timestamp.strftime("%H:%M:%S"),
             record.symbol,
@@ -3892,7 +3918,7 @@ class BotWindow(QtWidgets.QWidget):
         if table.rowCount() > 250:
             self._trim_trade_table()
         self._update_stats_labels(stats)
-        metadata = record.metadata
+        metadata = record.metadata or {}
         summary_data = {
             'confidence': metadata.get('confidence_value', record.confidence),
             'confidence_label': metadata.get('confidence_label', 'Baja'),
@@ -3905,6 +3931,9 @@ class BotWindow(QtWidgets.QWidget):
         }
         self._update_asset_summary_from_dict(record.symbol, summary_data)
         self._update_history_tab()
+        if contract_id is not None:
+            self.pending_contracts.add(contract_id)
+            self.logged_contracts.discard(contract_id)
 
 
     def _on_status(self, status: str) -> None:
