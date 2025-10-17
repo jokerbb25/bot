@@ -7,7 +7,7 @@ can evaluate signals in isolation.
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Dict, Iterable, Optional, Sequence
+from typing import Any, Dict, Iterable, Mapping, Optional, Sequence
 
 
 SignalType = Optional[str]
@@ -56,6 +56,16 @@ class StrategyResult:
         threshold = float(self.metadata.get("strong_threshold", 0.65))
         return abs(self.confidence) >= threshold and self.is_active()
 
+    def normalized_signal(self) -> str:
+        if self.signal is None:
+            return "NONE"
+        value = str(self.signal).strip().upper()
+        if value in {"CALL", "UP", "BUY"}:
+            return "CALL"
+        if value in {"PUT", "DOWN", "SELL"}:
+            return "PUT"
+        return "NONE"
+
 
 @dataclass(slots=True)
 class StrategySnapshot:
@@ -72,6 +82,10 @@ class StrategySnapshot:
     base_stake: float = 1.0
     result_available: bool = False
     trade_result: Optional[str] = None
+    trades_count: int = 0
+    consecutive_losses: Mapping[str, int] = field(default_factory=dict)
+    cooldowns: Mapping[str, float] = field(default_factory=dict)
+    current_time: float = 0.0
 
     def active_signals(self) -> Iterable[StrategyResult]:
         return (result for result in self.results if result.is_active())

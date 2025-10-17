@@ -8,6 +8,7 @@ elsewhere; here we only manipulate numerical confidences.
 from __future__ import annotations
 
 import logging
+import time
 from dataclasses import dataclass
 from typing import Dict, Iterable, Mapping, Optional, Sequence
 
@@ -23,7 +24,9 @@ SOFT_LOWER_BOUND = 0.55
 MOMENTUM_BOOST = 0.03
 EMA_SLOPE_MIN = 0.0001
 EMA_SLOPE_DAMP = 0.8
-LOW_VOLATILITY_THRESHOLD = 0.0005
+LOW_VOLATILITY_MIN = 0.0002
+HIGH_VOLATILITY_MAX = 0.002
+STAKE_REDUCTION_THRESHOLD = 0.0005
 LOW_VOLATILITY_STAKE_FACTOR = 0.5
 
 DEFAULT_BASE_WEIGHTS: Mapping[str, float] = {
@@ -94,6 +97,10 @@ class EvaluationResult:
     stake: float
     ai_prediction: float
     calibrated_confidence: float
+    valid_volatility: bool
+    alignment_direction: Optional[str]
+    skip_reason: Optional[str]
+    cooldown_until: Optional[float]
 
 
 def _normalise_key(name: str) -> str:
@@ -180,6 +187,12 @@ def evaluate_snapshot(snapshot: StrategySnapshot) -> EvaluationResult:
     weights = _regime_weights(snapshot.regime)
     active_results = list(snapshot.active_signals())
     base_confidence, _, strong_count = _weighted_confidence(active_results, weights)
+    directions = [result.normalized_signal() for result in active_results if result.normalized_signal() in {"CALL", "PUT"}]
+    alignment_direction: Optional[str] = None
+    for direction in ("CALL", "PUT"):
+        if directions.count(direction) >= 3:
+            alignment_direction = direction
+            break
     base_confidence = float(np.clip(base_confidence, 0.0, 1.0))
 
     momentum = _short_term_momentum(snapshot.closes)
@@ -193,7 +206,7 @@ def evaluate_snapshot(snapshot: StrategySnapshot) -> EvaluationResult:
         base_confidence *= EMA_SLOPE_DAMP
 
     calibrated_confidence = float(np.clip(base_confidence, 0.0, 1.0))
-    calibrated_confidence = calibrator.adjusted_confidence(calibrated_confidence)
+    calibrated_confidence = calibrator.adjusted_confidence(calibrated_confidence, snapshot.symbol)
     calibrated_confidence *= market_memory.bias(snapshot.symbol)
 
     features = _build_features(snapshot, momentum, ema_slope)
@@ -203,7 +216,8 @@ def evaluate_snapshot(snapshot: StrategySnapshot) -> EvaluationResult:
 
     stake = float(snapshot.base_stake)
     volatility = float(snapshot.volatility or 0.0)
-    if volatility and volatility < LOW_VOLATILITY_THRESHOLD:
+    valid_volatility = LOW_VOLATILITY_MIN < volatility < HIGH_VOLATILITY_MAX if volatility else False
+    if valid_volatility and volatility < STAKE_REDUCTION_THRESHOLD:
         stake *= LOW_VOLATILITY_STAKE_FACTOR
         logging.info(
             "⚠️ Low volatility (%s) → reducing stake to %.4f",
@@ -211,12 +225,47 @@ def evaluate_snapshot(snapshot: StrategySnapshot) -> EvaluationResult:
             stake,
         )
 
-    allow_trade = final_confidence >= MIN_CONFIDENCE
-    if not allow_trade and SOFT_LOWER_BOUND <= final_confidence < MIN_CONFIDENCE:
-        allow_trade = strong_count >= 3
+    allow_trade = True
+    skip_reason: Optional[str] = None
+    if final_confidence < 0.55:
+        allow_trade = False
+        skip_reason = "confidence_floor"
+    elif final_confidence < 0.70:
+        calibrator.passive_update(snapshot.symbol, final_confidence)
+        allow_trade = False
+        skip_reason = "confidence_soft_zone"
+
+    if allow_trade and not valid_volatility:
+        allow_trade = False
+        skip_reason = skip_reason or "invalid_volatility"
+
+    if allow_trade and alignment_direction is None:
+        allow_trade = False
+        skip_reason = skip_reason or "insufficient_alignment"
+
+    current_time = snapshot.current_time or time.time()
+    cooldown_until: Optional[float] = None
+    existing_cooldown = 0.0
+    if snapshot.cooldowns:
+        existing_cooldown = float(snapshot.cooldowns.get(snapshot.symbol, 0.0) or 0.0)
+        if existing_cooldown > current_time:
+            allow_trade = False
+            cooldown_until = existing_cooldown
+            skip_reason = skip_reason or "cooldown_active"
+
+    losses = 0
+    if snapshot.consecutive_losses:
+        losses = int(snapshot.consecutive_losses.get(snapshot.symbol, 0))
+    if losses >= 3:
+        cooldown_until = max(cooldown_until or 0.0, current_time + 120.0)
+        allow_trade = False
+        skip_reason = skip_reason or "cooldown_triggered"
+
+    if snapshot.trades_count and snapshot.trades_count % 30 == 0:
+        calibrator.rebalance()
 
     if snapshot.result_available and snapshot.trade_result:
-        calibrator.update(final_confidence, snapshot.trade_result)
+        calibrator.update(final_confidence, snapshot.trade_result, snapshot.symbol)
         market_memory.update(snapshot.symbol, snapshot.trade_result)
         outcome_value = 1.0 if snapshot.trade_result.strip().upper() == "WIN" else 0.0
         light_regressor.train([features], [outcome_value])
@@ -231,6 +280,10 @@ def evaluate_snapshot(snapshot: StrategySnapshot) -> EvaluationResult:
         stake=stake,
         ai_prediction=ai_prediction,
         calibrated_confidence=calibrated_confidence,
+        valid_volatility=valid_volatility,
+        alignment_direction=alignment_direction,
+        skip_reason=skip_reason,
+        cooldown_until=cooldown_until,
     )
 
 
