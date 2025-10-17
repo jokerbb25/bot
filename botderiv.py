@@ -3049,8 +3049,20 @@ class TradingEngine:
         if strong_signal_count == 0 and float(best['final_confidence']) < min_required:
             _cycle_pause()
             return
-        self._execute_selected_trade(best)
-        _cycle_pause(0.75)
+        selected_confidence_raw = best.get('final_confidence')
+        selected_confidence = float(selected_confidence_raw) if selected_confidence_raw is not None else 0.0
+        allow_trade_execution = True
+        if selected_confidence_raw is None or selected_confidence < MIN_CONFIDENCE:
+            logging.info(
+                f"🚫 Skipping trade on {best['symbol']} due to low confidence ({selected_confidence:.2f})"
+            )
+            allow_trade_execution = False
+        if allow_trade_execution:
+            self._execute_selected_trade(best)
+            _cycle_pause(0.75)
+        else:
+            _cycle_pause()
+        return
 
     def confirm_and_execute(self, evaluation: Dict[str, Any]) -> bool:
         direction = evaluation.get('confluence_direction')
