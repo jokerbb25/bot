@@ -3038,45 +3038,40 @@ class TradingEngine:
                 logging.info(f"{summary_line} → Selected: ninguno")
             _cycle_pause()
             return
-        best = max(candidates, key=lambda item: float(item.get('final_confidence', 0.0)))
+        selected = max(candidates, key=lambda item: float(item.get('final_confidence', 0.0)))
         summary_line = " | ".join(confidence_lines)
-        selected_text = f"{best['symbol']} ({float(best['final_confidence']):.2f})"
+        selected_text = f"{selected['symbol']} ({float(selected['final_confidence']):.2f})"
         if summary_line:
             logging.info(f"{summary_line} → Selected: {selected_text} | strong={strong_signal_count}")
-        if best.get('signal') not in {'CALL', 'PUT'}:
+        if selected.get('signal') not in {'CALL', 'PUT'}:
             _cycle_pause()
             return
-        if strong_signal_count == 0 and float(best['final_confidence']) < min_required:
+        if strong_signal_count == 0 and float(selected['final_confidence']) < min_required:
             _cycle_pause()
             return
-        selected_confidence_raw = best.get('final_confidence')
-        selected_confidence = float(selected_confidence_raw) if selected_confidence_raw is not None else 0.0
-        selected_volatility_raw = best.get('volatility')
-        selected_volatility: Optional[float] = None
-        if selected_volatility_raw is not None:
+        confidence_value_raw = selected.get('final_confidence')
+        confidence_value = float(confidence_value_raw) if confidence_value_raw is not None else 0.0
+        volatility_value_raw = selected.get('volatility')
+        volatility_value: Optional[float] = None
+        if volatility_value_raw is not None:
             try:
-                selected_volatility = float(selected_volatility_raw)
+                volatility_value = float(volatility_value_raw)
             except (TypeError, ValueError):
-                selected_volatility = None
-        allow_trade_execution = True
-        if selected_confidence_raw is None or selected_confidence < MIN_CONFIDENCE:
+                volatility_value = None
+        if confidence_value < MIN_CONFIDENCE:
             logging.info(
-                f"🚫 Skipping trade on {best['symbol']} due to low confidence ({selected_confidence:.2f})"
+                f"🚫 Skipping trade on {selected['symbol']} due to low confidence ({confidence_value:.2f})"
             )
-            allow_trade_execution = False
-            pass
-        elif selected_volatility is None or selected_volatility < MIN_VOLATILITY:
-            volatility_for_log = selected_volatility if selected_volatility is not None else 0.0
-            logging.info(
-                f"🚫 Skipping trade on {best['symbol']} due to low volatility ({volatility_for_log:.4f})"
-            )
-            allow_trade_execution = False
-            pass
-        if allow_trade_execution:
-            self._execute_selected_trade(best)
-            _cycle_pause(0.75)
-        else:
             _cycle_pause()
+            return
+        if volatility_value is not None and volatility_value < MIN_VOLATILITY:
+            logging.info(
+                f"🚫 Skipping trade on {selected['symbol']} due to low volatility ({volatility_value:.4f})"
+            )
+            _cycle_pause()
+            return
+        self._execute_selected_trade(selected)
+        _cycle_pause(0.75)
         return
 
     def confirm_and_execute(self, evaluation: Dict[str, Any]) -> bool:
