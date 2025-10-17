@@ -3051,12 +3051,27 @@ class TradingEngine:
             return
         selected_confidence_raw = best.get('final_confidence')
         selected_confidence = float(selected_confidence_raw) if selected_confidence_raw is not None else 0.0
+        selected_volatility_raw = best.get('volatility')
+        selected_volatility: Optional[float] = None
+        if selected_volatility_raw is not None:
+            try:
+                selected_volatility = float(selected_volatility_raw)
+            except (TypeError, ValueError):
+                selected_volatility = None
         allow_trade_execution = True
         if selected_confidence_raw is None or selected_confidence < MIN_CONFIDENCE:
             logging.info(
                 f"🚫 Skipping trade on {best['symbol']} due to low confidence ({selected_confidence:.2f})"
             )
             allow_trade_execution = False
+            pass
+        elif selected_volatility is None or selected_volatility < MIN_VOLATILITY:
+            volatility_for_log = selected_volatility if selected_volatility is not None else 0.0
+            logging.info(
+                f"🚫 Skipping trade on {best['symbol']} due to low volatility ({volatility_for_log:.4f})"
+            )
+            allow_trade_execution = False
+            pass
         if allow_trade_execution:
             self._execute_selected_trade(best)
             _cycle_pause(0.75)
