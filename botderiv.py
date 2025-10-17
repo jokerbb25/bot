@@ -2368,6 +2368,8 @@ class TradingEngine:
         self._active_regime: Optional[str] = None
         self._processed_lock = threading.Lock()
         self._processed_contracts: Set[int] = set()
+        self._closed_lock = threading.Lock()
+        self._closed_contracts: Set[int] = set()
         self._next_cycle_time = 0.0
 
     def add_trade_listener(self, callback: Callable[[TradeRecord, Dict[str, float]], None]) -> None:
@@ -2425,6 +2427,10 @@ class TradingEngine:
         self._notify_status("running")
         operation_active = False
         self._notify_trade_state("ready")
+        with self._processed_lock:
+            self._processed_contracts.clear()
+        with self._closed_lock:
+            self._closed_contracts.clear()
 
     def is_running(self) -> bool:
         return self.running.is_set()
@@ -2629,6 +2635,17 @@ class TradingEngine:
             self._processed_contracts.add(contract_id)
             if len(self._processed_contracts) > 5000:
                 self._processed_contracts.pop()
+            return True
+
+    def _register_contract_closure(self, contract_id: Optional[int]) -> bool:
+        if contract_id is None:
+            return True
+        with self._closed_lock:
+            if contract_id in self._closed_contracts:
+                return False
+            self._closed_contracts.add(contract_id)
+            if len(self._closed_contracts) > 5000:
+                self._closed_contracts.pop()
             return True
 
 
@@ -3162,7 +3179,12 @@ class TradingEngine:
                 "nota": "",
                 "ticket": contract_id,
             }
-            self._notify_trade_result(result_info)
+            should_notify = True
+            if contract_id is not None and not self._register_contract_closure(contract_id):
+                logging.debug(f"Contract {contract_id} already closed. Skipping duplicate log.")
+                should_notify = False
+            if should_notify:
+                self._notify_trade_result(result_info)
             latest_rsi = float(evaluation['latest_rsi'])
             ema_spread = float(evaluation['ema_spread'])
             boll_width = float(evaluation['boll_width'])
@@ -3240,6 +3262,10 @@ class TradingEngine:
         except Exception:
             pass
         self.api.socket = None
+        with self._processed_lock:
+            self._processed_contracts.clear()
+        with self._closed_lock:
+            self._closed_contracts.clear()
 
 
 # ===============================================================
@@ -3280,10 +3306,25 @@ class BotThread(QThread):
         super().__init__()
         self.engine = engine
         self._active = True
+        self._closed_contracts: Set[int] = set()
         self._result_callback = self._handle_trade_result
         self.engine.add_result_listener(self._result_callback)
 
+    def _normalize_contract_id(self, value: Any) -> Optional[int]:
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
     def _handle_trade_result(self, data: Dict[str, Any]) -> None:
+        contract_id = self._normalize_contract_id(data.get("ticket") or data.get("contract_id"))
+        if contract_id is not None:
+            if contract_id in self._closed_contracts:
+                logging.debug(f"Contract {contract_id} already closed. Skipping duplicate log.")
+                return
+            self._closed_contracts.add(contract_id)
         ticket = data.get("ticket")
         resultado = data.get("resultado", "-")
         if ticket is not None:
@@ -3296,6 +3337,7 @@ class BotThread(QThread):
     def run(self) -> None:  # type: ignore[override]
         logging.info("🚀 BotThread started successfully.")
         self._active = True
+        self._closed_contracts.clear()
         try:
             self.engine.start_engine()
         except Exception as exc:
@@ -3326,6 +3368,7 @@ class BotThread(QThread):
         self._active = False
         self.engine.stop()
         self.engine.remove_result_listener(self._result_callback)
+        self._closed_contracts.clear()
 
 
 class BotWindow(QtWidgets.QWidget):
