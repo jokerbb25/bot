@@ -57,6 +57,7 @@ COOLDOWN_AFTER_LOSS = 60
 MAX_DRAWDOWN = -150.0
 MIN_TRADE_CONFIDENCE = 0.45
 MIN_CONFIDENCE = 0.65
+MIN_VOLATILITY = 0.0005
 
 AI_ENABLED = True
 AI_PASSIVE_MODE = True
@@ -3103,166 +3104,179 @@ class TradingEngine:
         stake_amount = float(max(0.1, evaluation.get('stake', self.trade_amount)))
         ml_probability = float(evaluation.get('predicted_probability', 0.5))
         trade_initiated = False
-        if combined_confidence < MIN_CONFIDENCE:
-            logging.info(f"🚫 Trade skipped due to low confidence ({combined_confidence:.2f})")
-            return False
-        if not self.risk.can_trade(ai_confidence):
-            return False
-        if operation_active:
-            return False
-        auto_learn.register_trade_context(
-            symbol,
-            signal,
-            ai_confidence,
-            entry_price,
-            signal_source,
-            evaluation.get('indicator_confidence', 0.0),
-            ml_probability,
-            stake_amount,
-        )
-        contract_id, duration_seconds = self.api.buy(symbol, signal, stake_amount)
-        if contract_id is None:
-            logging.warning('No se pudo abrir la operación, se reanuda el análisis.')
-            self._notify_trade_state("ready")
-            return False
-        operation_active = True
-        self.active_trade_symbol = symbol
-        self._notify_trade_state('active')
-        dur_seconds = duration_seconds if duration_seconds > 0 else TRADE_DURATION_SECONDS
-        logging.info(f"🟢 Operación abierta — Contrato #{contract_id} | Duración: {dur_seconds}s")
-        trade_initiated = True
-        try:
-            result_status = self._wait_for_contract_result(contract_id, dur_seconds)
-            trade_result, pnl = self._resolve_trade_result(result_status, stake_amount)
-            if contract_id is not None and not self._register_processed_contract(contract_id):
-                logging.debug(f"Contrato #{contract_id} ya procesado, omitiendo duplicado de resultados")
-                return trade_initiated
-            self.risk.register_trade(pnl)
-            if features is not None:
-                self.ai.log_trade(features, 1 if trade_result == 'WIN' else 0)
-            strategy_details = {
-                name: {
-                    'signal': res.signal,
-                    'score': float(res.score),
-                    'weight': float(STRATEGY_WEIGHTS.get(name, 1.0)),
-                    'confidence': float(consensus.get('strategy_confidences', {}).get(name, 0.0)),
+        volatility_raw = evaluation.get('volatility')
+        volatility_value: Optional[float] = None
+        if volatility_raw is not None:
+            try:
+                volatility_value = float(volatility_raw)
+            except (TypeError, ValueError):
+                volatility_value = None
+        confidence_value = float(combined_confidence) if combined_confidence is not None else 0.0
+        can_trade = True
+        if combined_confidence is None or confidence_value < MIN_CONFIDENCE:
+            logging.info(f"🚫 Skipping trade — low confidence ({confidence_value:.2f})")
+            can_trade = False
+        if volatility_value is not None and volatility_value < MIN_VOLATILITY:
+            logging.info(f"🚫 Skipping trade — low volatility ({volatility_value:.4f})")
+            can_trade = False
+        if can_trade:
+            if not self.risk.can_trade(ai_confidence):
+                return False
+            if operation_active:
+                return False
+            auto_learn.register_trade_context(
+                symbol,
+                signal,
+                ai_confidence,
+                entry_price,
+                signal_source,
+                evaluation.get('indicator_confidence', 0.0),
+                ml_probability,
+                stake_amount,
+            )
+            contract_id, duration_seconds = self.api.buy(symbol, signal, stake_amount)
+            if contract_id is None:
+                logging.warning('No se pudo abrir la operación, se reanuda el análisis.')
+                self._notify_trade_state("ready")
+                return False
+            operation_active = True
+            self.active_trade_symbol = symbol
+            self._notify_trade_state('active')
+            dur_seconds = duration_seconds if duration_seconds > 0 else TRADE_DURATION_SECONDS
+            logging.info(f"🟢 Operación abierta — Contrato #{contract_id} | Duración: {dur_seconds}s")
+            trade_initiated = True
+            try:
+                result_status = self._wait_for_contract_result(contract_id, dur_seconds)
+                trade_result, pnl = self._resolve_trade_result(result_status, stake_amount)
+                if contract_id is not None and not self._register_processed_contract(contract_id):
+                    logging.debug(f"Contrato #{contract_id} ya procesado, omitiendo duplicado de resultados")
+                    return trade_initiated
+                self.risk.register_trade(pnl)
+                if features is not None:
+                    self.ai.log_trade(features, 1 if trade_result == 'WIN' else 0)
+                strategy_details = {
+                    name: {
+                        'signal': res.signal,
+                        'score': float(res.score),
+                        'weight': float(STRATEGY_WEIGHTS.get(name, 1.0)),
+                        'confidence': float(consensus.get('strategy_confidences', {}).get(name, 0.0)),
+                    }
+                    for name, res in results
                 }
-                for name, res in results
-            }
-            record_metadata = {
-                'confidence_label': consensus['confidence_label'],
-                'confidence_value': consensus['confidence'],
-                'aligned': consensus['aligned'],
-                'active': consensus['active'],
-                'signals': consensus['signals'],
-                'direction': signal,
-                'main_reason': consensus['main_reason'],
-                'low_volatility': consensus['low_volatility'],
-                'volatility_value': consensus['volatility_value'],
-                'override': consensus['override'],
-                'override_reason': consensus['override_reason'],
-                'dominant': consensus['dominant'],
-                'total_weight': consensus['total_weight'],
-                'active_weight': consensus.get('active_weight', 0.0),
-                'strategy_confidences': consensus.get('strategy_confidences', {}),
-                'strategy_details': strategy_details,
-                'contract_id': contract_id,
-                'stake': stake_amount,
-                'ml_probability': ml_probability,
-            }
-            record = TradeRecord(
-                timestamp=datetime.now(timezone.utc),
-                symbol=symbol,
-                decision=signal,
-                confidence=ai_confidence,
-                result=trade_result,
-                pnl=pnl,
-                reasons=reasons + ai_notes,
-                metadata=record_metadata,
-            )
-            log_trade(record)
-            if trade_result == 'WIN':
-                self.win_count += 1
-            elif trade_result == 'LOSS':
-                self.loss_count += 1
-            with self.lock:
-                self.trade_history.append(record)
-            confidence_value = combined_confidence
-            win_flag = trade_result == 'WIN'
-            profit_value = float(pnl)
-            main_reason = str(consensus.get('main_reason', 'Sin motivo disponible'))
-            reason_summary = '; '.join(reasons)
-            notes = (
-                f"{symbol} | RSI: {latest_rsi:.2f} | EMA spread: {ema_spread:.5f} | "
-                f"Volatilidad: {volatilidad_actual:.5f} | Reason: {main_reason}"
-            )
-            if reason_summary:
-                notes = f"{notes} | Motivos: {reason_summary}"
-            ema_slope_value = float(evaluation.get('ema_diff', 0.0))
-            notes = f"{notes} | EMA slope: {ema_slope_value:.5f}"
-            result_info = {
-                "hora": datetime.now().strftime("%H:%M:%S"),
-                "simbolo": symbol,
-                "decision": signal,
-                "confianza": confidence_value,
-                "resultado": "GANADA" if win_flag else "PERDIDA",
-                "pnl": profit_value,
-                "nota": notes,
-                "ticket": contract_id,
-            }
-            should_notify = True
-            if contract_id is not None and not self._register_contract_closure(contract_id):
-                logging.debug(f"Contract {contract_id} already closed. Skipping duplicate log.")
-                should_notify = False
-            if should_notify:
-                self._notify_trade_result(result_info)
-            latest_rsi = float(evaluation['latest_rsi'])
-            ema_spread = float(evaluation['ema_spread'])
-            boll_width = float(evaluation['boll_width'])
-            volatilidad_actual = float(evaluation['volatility'])
-            exit_price = self._fetch_exit_price(symbol, entry_price)
-            price_change = float(exit_price - entry_price)
-            auto_learn.update_history(
-                trade_result,
-                symbol,
-                latest_rsi,
-                ema_spread,
-                boll_width,
-                volatilidad_actual,
-                price_change,
-            )
-            auto_learn.adjust_bias(symbol, trade_result, signal, price_change)
-            auto_learn.store_context(
-                symbol,
-                latest_rsi,
-                ema_spread,
-                evaluation.get('macd', 0.0),
-                evaluation.get('adx', 0.0),
-                datetime.now(timezone.utc).hour,
-                trade_result,
-            )
-            auto_learn.predict_next(latest_rsi, ema_spread, boll_width, volatilidad_actual)
-            logging.info(
-                f"{record.timestamp:%Y-%m-%d %H:%M:%S} INFO: [{symbol}] {signal} @{ai_confidence:.2f} | Stake:{stake_amount:.2f} | EMA:{evaluation['ema_diff']:.2f} RSI:{latest_rsi:.2f} | Motivos: {'; '.join(reasons)}"
-            )
-            if ai_notes:
-                logging.info(f"📊 Aviso IA → {'; '.join(ai_notes)}")
-            self._notify_trade(record)
-            if (
-                self.auto_shutdown_enabled
-                and not self.auto_shutdown_triggered
-                and trade_result == 'LOSS'
-                and self.auto_shutdown_limit > 0
-                and self.risk.consecutive_losses >= self.auto_shutdown_limit
-            ):
-                self._handle_auto_shutdown()
-        except Exception as exc:
-            logging.warning(f"Error al gestionar la operación #{contract_id}: {exc}")
-        finally:
-            operation_active = False
-            self.active_trade_symbol = None
-            logging.info(RESUME_MESSAGE)
-            self._notify_trade_state("ready")
+                record_metadata = {
+                    'confidence_label': consensus['confidence_label'],
+                    'confidence_value': consensus['confidence'],
+                    'aligned': consensus['aligned'],
+                    'active': consensus['active'],
+                    'signals': consensus['signals'],
+                    'direction': signal,
+                    'main_reason': consensus['main_reason'],
+                    'low_volatility': consensus['low_volatility'],
+                    'volatility_value': consensus['volatility_value'],
+                    'override': consensus['override'],
+                    'override_reason': consensus['override_reason'],
+                    'dominant': consensus['dominant'],
+                    'total_weight': consensus['total_weight'],
+                    'active_weight': consensus.get('active_weight', 0.0),
+                    'strategy_confidences': consensus.get('strategy_confidences', {}),
+                    'strategy_details': strategy_details,
+                    'contract_id': contract_id,
+                    'stake': stake_amount,
+                    'ml_probability': ml_probability,
+                }
+                record = TradeRecord(
+                    timestamp=datetime.now(timezone.utc),
+                    symbol=symbol,
+                    decision=signal,
+                    confidence=ai_confidence,
+                    result=trade_result,
+                    pnl=pnl,
+                    reasons=reasons + ai_notes,
+                    metadata=record_metadata,
+                )
+                log_trade(record)
+                if trade_result == 'WIN':
+                    self.win_count += 1
+                elif trade_result == 'LOSS':
+                    self.loss_count += 1
+                with self.lock:
+                    self.trade_history.append(record)
+                latest_rsi = float(evaluation['latest_rsi'])
+                ema_spread = float(evaluation['ema_spread'])
+                boll_width = float(evaluation['boll_width'])
+                volatilidad_actual = float(evaluation['volatility'])
+                confidence_value = combined_confidence
+                win_flag = trade_result == 'WIN'
+                profit_value = float(pnl)
+                main_reason = str(consensus.get('main_reason', 'Sin motivo disponible'))
+                reason_summary = '; '.join(reasons)
+                notes = (
+                    f"{symbol} | RSI: {latest_rsi:.2f} | EMA spread: {ema_spread:.5f} | "
+                    f"Volatilidad: {volatilidad_actual:.5f} | Reason: {main_reason}"
+                )
+                if reason_summary:
+                    notes = f"{notes} | Motivos: {reason_summary}"
+                ema_slope_value = float(evaluation.get('ema_diff', 0.0))
+                notes = f"{notes} | EMA slope: {ema_slope_value:.5f}"
+                result_info = {
+                    "hora": datetime.now().strftime("%H:%M:%S"),
+                    "simbolo": symbol,
+                    "decision": signal,
+                    "confianza": confidence_value,
+                    "resultado": "GANADA" if win_flag else "PERDIDA",
+                    "pnl": profit_value,
+                    "nota": notes,
+                    "ticket": contract_id,
+                }
+                should_notify = True
+                if contract_id is not None and not self._register_contract_closure(contract_id):
+                    logging.debug(f"Contract {contract_id} already closed. Skipping duplicate log.")
+                    should_notify = False
+                if should_notify:
+                    self._notify_trade_result(result_info)
+                exit_price = self._fetch_exit_price(symbol, entry_price)
+                price_change = float(exit_price - entry_price)
+                auto_learn.update_history(
+                    trade_result,
+                    symbol,
+                    latest_rsi,
+                    ema_spread,
+                    boll_width,
+                    volatilidad_actual,
+                    price_change,
+                )
+                auto_learn.adjust_bias(symbol, trade_result, signal, price_change)
+                auto_learn.store_context(
+                    symbol,
+                    latest_rsi,
+                    ema_spread,
+                    evaluation.get('macd', 0.0),
+                    evaluation.get('adx', 0.0),
+                    datetime.now(timezone.utc).hour,
+                    trade_result,
+                )
+                auto_learn.predict_next(latest_rsi, ema_spread, boll_width, volatilidad_actual)
+                logging.info(
+                    f"{record.timestamp:%Y-%m-%d %H:%M:%S} INFO: [{symbol}] {signal} @{ai_confidence:.2f} | Stake:{stake_amount:.2f} | EMA:{evaluation['ema_diff']:.2f} RSI:{latest_rsi:.2f} | Motivos: {'; '.join(reasons)}"
+                )
+                if ai_notes:
+                    logging.info(f"📊 Aviso IA → {'; '.join(ai_notes)}")
+                self._notify_trade(record)
+                if (
+                    self.auto_shutdown_enabled
+                    and not self.auto_shutdown_triggered
+                    and trade_result == 'LOSS'
+                    and self.auto_shutdown_limit > 0
+                    and self.risk.consecutive_losses >= self.auto_shutdown_limit
+                ):
+                    self._handle_auto_shutdown()
+            except Exception as exc:
+                logging.warning(f"Error al gestionar la operación #{contract_id}: {exc}")
+            finally:
+                operation_active = False
+                self.active_trade_symbol = None
+                logging.info(RESUME_MESSAGE)
+                self._notify_trade_state("ready")
         return trade_initiated
 
     def run(self) -> None:
