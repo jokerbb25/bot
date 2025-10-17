@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 import numpy as np
 import pandas as pd
@@ -32,6 +32,7 @@ except ImportError:  # pragma: no cover
     gp_minimize = None  # type: ignore
 
 from PyQt5 import QtCore, QtGui, QtWidgets
+from PyQt5.QtCore import QThread, pyqtSignal
 
 try:
     import websocket  # type: ignore
@@ -55,6 +56,8 @@ MAX_DAILY_PROFIT = 100.0
 COOLDOWN_AFTER_LOSS = 60
 MAX_DRAWDOWN = -150.0
 MIN_TRADE_CONFIDENCE = 0.45
+MIN_CONFIDENCE = 0.65
+MIN_VOLATILITY = 0.0005
 
 AI_ENABLED = True
 AI_PASSIVE_MODE = True
@@ -78,6 +81,8 @@ operation_active = False
 TRADE_DURATION_SECONDS = 60
 RESULT_POLL_INTERVAL = 5
 RESUME_MESSAGE = "🔁 Reanudando análisis del mercado..."
+
+CSV_LOGGED_CONTRACTS: Set[int] = set()
 
 
 # ===============================================================
@@ -184,6 +189,19 @@ def donchian_channels(df: pd.DataFrame, period: int = 20) -> Tuple[pd.Series, pd
 
 
 def log_trade(record: TradeRecord) -> None:
+    contract_id: Optional[int] = None
+    if record.metadata:
+        raw_id = record.metadata.get('contract_id')
+        try:
+            contract_id = int(raw_id) if raw_id is not None else None
+        except (TypeError, ValueError):
+            contract_id = None
+    logged_contracts = CSV_LOGGED_CONTRACTS
+    if contract_id is not None:
+        if contract_id in logged_contracts:
+            logging.debug(f"Duplicate contract {contract_id} ignored.")
+            return
+        logged_contracts.add(contract_id)
     try:
         row = {
             "timestamp": record.timestamp.isoformat(),
@@ -194,6 +212,10 @@ def log_trade(record: TradeRecord) -> None:
             "pnl": record.pnl,
             "reasons": "|".join(record.reasons),
         }
+        strategy_snapshot = record.metadata.get('strategy_details', {}) if record.metadata else {}
+        confidence_snapshot = record.metadata.get('strategy_confidences', {}) if record.metadata else {}
+        row["strategies"] = json.dumps(strategy_snapshot)
+        row["strategy_confidences"] = json.dumps(confidence_snapshot)
         df = pd.DataFrame([row])
         path = Path(TRADES_LOG_PATH)
         if not path.exists():
@@ -266,6 +288,8 @@ class auto_learning:
         self.recent_results: deque = deque(maxlen=200)
         self.learning_rate = 0.02
         self.weights_recalibrated = False
+        self.strategy_accuracy_snapshot: Dict[str, float] = {}
+        self._last_recalibration_total = 0
         self.min_confidence = MIN_TRADE_CONFIDENCE
         self.rsi_high_threshold = 70.0
         self.adx_min_threshold = 20.0
@@ -836,11 +860,123 @@ class auto_learning:
                 for clave, valor in list(self.weights.items()):
                     self.weights[clave] = float(np.clip(valor * (1.0 + adjustment), 0.2, 3.0))
             self.weights_recalibrated = True
+        if total_trades >= 100 and total_trades % 100 == 0 and total_trades != self._last_recalibration_total:
+            self._adaptive_recalibration(total_trades)
         self.learning_event.set()
 
     def _pop_context(self, asset: str) -> Dict[str, float]:
         with self.lock:
             return self._pending_context.pop(asset, {}).copy()
+
+    def _adaptive_recalibration(self, trade_total: int) -> None:
+        path = Path(TRADES_LOG_PATH)
+        if not path.exists():
+            self._last_recalibration_total = trade_total
+            return
+        try:
+            df = pd.read_csv(path)
+        except Exception as exc:  # pragma: no cover
+            logging.debug(f"No se pudo leer el log de operaciones para recalibración: {exc}")
+            self._last_recalibration_total = trade_total
+            return
+        if df.empty or 'strategies' not in df.columns:
+            self._last_recalibration_total = trade_total
+            return
+        accuracy_data: Dict[str, Dict[str, int]] = {}
+        for _, row in df.iterrows():
+            strategies_payload = row.get('strategies')
+            if not isinstance(strategies_payload, str) or not strategies_payload:
+                continue
+            try:
+                strategies_dict = json.loads(strategies_payload)
+            except Exception:
+                continue
+            decision = str(row.get('decision', '')).upper()
+            result = str(row.get('result', '')).upper()
+            if decision not in {'CALL', 'PUT'} or result not in {'WIN', 'LOSS'}:
+                continue
+            if decision == 'CALL':
+                opposite = 'PUT'
+            else:
+                opposite = 'CALL'
+            actual_direction = decision if result == 'WIN' else opposite
+            for strat_name, strat_info in strategies_dict.items():
+                signal = str(strat_info.get('signal', '')).upper()
+                if signal not in {'CALL', 'PUT'}:
+                    continue
+                stats = accuracy_data.setdefault(strat_name, {'wins': 0, 'total': 0})
+                stats['total'] += 1
+                if signal == actual_direction:
+                    stats['wins'] += 1
+        if not accuracy_data:
+            self._last_recalibration_total = trade_total
+            return
+        indicator_map = {
+            'RSI': 'RSI',
+            'EMA Trend': 'EMA',
+            'Bollinger Rebound': 'BOLL',
+            'Range Breakout': 'ADX',
+            'Divergence': 'MACD',
+        }
+        updated = False
+        new_indicator_weights: Dict[str, float] = {}
+        with self.weights_lock:
+            new_indicator_weights = dict(self.weights)
+        for strat_name, stats in accuracy_data.items():
+            total = stats['total']
+            if total == 0:
+                continue
+            accuracy_ratio = stats['wins'] / total
+            previous_accuracy = self.strategy_accuracy_snapshot.get(strat_name)
+            self.strategy_accuracy_snapshot[strat_name] = accuracy_ratio
+            if previous_accuracy is None:
+                continue
+            change = accuracy_ratio - previous_accuracy
+            if abs(change) < 0.01:
+                continue
+            adjustment_ratio = min(0.02, abs(change) * 0.5)
+            if adjustment_ratio <= 0.0:
+                continue
+            factor = 1.0 + adjustment_ratio if change > 0 else 1.0 - adjustment_ratio
+            if strat_name in STRATEGY_WEIGHTS:
+                with self.lock:
+                    STRATEGY_WEIGHTS[strat_name] = float(
+                        np.clip(STRATEGY_WEIGHTS[strat_name] * factor, 0.3, 3.0)
+                    )
+                updated = True
+            key = indicator_map.get(strat_name)
+            if key:
+                current_weight = new_indicator_weights.get(key)
+                if current_weight is not None:
+                    new_indicator_weights[key] = float(
+                        np.clip(current_weight * factor, 0.2, 3.0)
+                    )
+                    updated = True
+        if updated:
+            with self.weights_lock:
+                self.weights.update(new_indicator_weights)
+                self.weights_recalibrated = True
+        with self.weights_lock:
+            indicator_snapshot = {
+                'RSI': float(self.weights.get('RSI', 1.0)),
+                'EMA': float(self.weights.get('EMA', 1.0)),
+                'BOLL': float(self.weights.get('BOLL', 1.0)),
+                'ADX': float(self.weights.get('ADX', 0.8)),
+                'MACD': float(self.weights.get('MACD', 0.8)),
+            }
+        logging.info(
+            "📈 Adaptive weights updated: "
+            + ", ".join(
+                [
+                    f"RSI={indicator_snapshot['RSI']:.2f}",
+                    f"EMA={indicator_snapshot['EMA']:.2f}",
+                    f"Bollinger={indicator_snapshot['BOLL']:.2f}",
+                    f"ADX={indicator_snapshot['ADX']:.2f}",
+                    f"MACD={indicator_snapshot['MACD']:.2f}",
+                ]
+            )
+        )
+        self._last_recalibration_total = trade_total
 
     def adjust_bias(self, symbol: str, result: str, signal_direction: str, price_change: float) -> None:
         outcome = str(result).upper()
@@ -1320,14 +1456,32 @@ def strategy_rsi(df: pd.DataFrame) -> StrategyResult:
             superior = float(perfil.get("rsi_upper", superior))
         except Exception:
             pass
+    variation = 0.0
+    if len(df) > 10:
+        serie_variacion = df['close'].pct_change().rolling(10).std()
+        variation = float(np.nan_to_num(serie_variacion.iloc[-1], nan=0.0)) if len(serie_variacion) else 0.0
+    stable_threshold = 0.0012
+    high_threshold = 0.003
+    margin = 0.0
+    if variation <= stable_threshold:
+        ratio = 1.0 - variation / max(stable_threshold, 1e-9)
+        margin = ratio * 2.5
+    elif variation >= high_threshold:
+        ratio = min(1.0, (variation - high_threshold) / max(high_threshold, 1e-9))
+        margin = -ratio * 2.0
+    inferior_dinamico = float(np.clip(inferior + margin, 5.0, 45.0))
+    superior_dinamico = float(np.clip(superior - margin, 55.0, 95.0))
     extra = {
         'rsi': valor,
-        'strong_call': valor < max(20.0, inferior - 5.0),
-        'strong_put': valor > min(80.0, superior + 5.0),
+        'strong_call': valor < max(20.0, inferior_dinamico - 5.0),
+        'strong_put': valor > min(80.0, superior_dinamico + 5.0),
+        'rsi_lower_dynamic': inferior_dinamico,
+        'rsi_upper_dynamic': superior_dinamico,
+        'price_variation': variation,
     }
-    if valor < inferior:
+    if valor < inferior_dinamico:
         return StrategyResult('CALL', 2.0, [f"RSI {valor:.2f} sobrevendido → señal CALL"], extra)
-    if valor > superior:
+    if valor > superior_dinamico:
         return StrategyResult('PUT', -2.0, [f"RSI {valor:.2f} sobrecomprado → señal PUT"], extra)
     return StrategyResult('NONE', 0.0, [f"RSI {valor:.2f} sin sesgo claro"], extra)
 
@@ -1351,7 +1505,16 @@ def strategy_ema_trend(df: pd.DataFrame) -> StrategyResult:
                     tolerancia = float(perfil.get("ema_tolerance", 0.0))
                 except Exception:
                     tolerancia = 0.0
-    threshold = tolerancia / 1000.0
+    diff_series = ema_corto - ema_largo
+    recent_diff = diff_series.iloc[-5:] if len(diff_series) >= 5 else diff_series
+    diff_std = float(np.nan_to_num(recent_diff.diff().abs().mean(), nan=0.0)) if len(recent_diff) > 1 else 0.0
+    price_volatility = 0.0
+    if len(df) > 10:
+        window_vol = df['close'].pct_change().rolling(10).std()
+        price_volatility = float(np.nan_to_num(window_vol.iloc[-1], nan=0.0)) if len(window_vol) else 0.0
+    baseline_threshold = tolerancia / 1000.0
+    slope_floor = max(0.0001, baseline_threshold, diff_std * 0.5, price_volatility * 0.3)
+    threshold = baseline_threshold
     diff_prev = float(ema_corto.iloc[-2] - ema_largo.iloc[-2])
     diff_curr = float(ema_corto.iloc[-1] - ema_largo.iloc[-1])
     cruz_alcista = diff_prev <= threshold and diff_curr > threshold
@@ -1360,6 +1523,24 @@ def strategy_ema_trend(df: pd.DataFrame) -> StrategyResult:
         return StrategyResult('CALL', 1.5, ['Cruce alcista EMA9 sobre EMA21 → CALL'], {'ema_short': float(ema_corto.iloc[-1]), 'ema_long': float(ema_largo.iloc[-1])})
     if cruz_bajista:
         return StrategyResult('PUT', -1.5, ['Cruce bajista EMA9 bajo EMA21 → PUT'], {'ema_short': float(ema_corto.iloc[-1]), 'ema_long': float(ema_largo.iloc[-1])})
+    consistent_direction = False
+    if len(recent_diff) > 0:
+        signs = [np.sign(val) for val in recent_diff if abs(val) > 1e-9]
+        if signs:
+            consistent_direction = all(sign == signs[0] for sign in signs)
+    minor_threshold = slope_floor * 0.8 if slope_floor else 0.0001
+    slope_drift = float(recent_diff.iloc[-1] - recent_diff.iloc[0]) if len(recent_diff) > 1 else diff_curr
+    if consistent_direction and abs(diff_curr) >= minor_threshold and abs(slope_drift) <= abs(diff_curr) * 1.5:
+        direccion = 'CALL' if diff_curr > 0 else 'PUT'
+        puntaje = 1.1 if direccion == 'CALL' else -1.1
+        tendencia = 'alcista' if direccion == 'CALL' else 'bajista'
+        extra = {
+            'ema_short': float(ema_corto.iloc[-1]),
+            'ema_long': float(ema_largo.iloc[-1]),
+            'diff_mean': float(recent_diff.mean()) if len(recent_diff) else diff_curr,
+            'slope_floor': slope_floor,
+        }
+        return StrategyResult(direccion, puntaje, [f"Pendiente EMA consistente {tendencia} → {direccion}"], extra)
     return StrategyResult('NONE', 0.0, ['EMAs paralelas sin cruce'], {'ema_short': float(ema_corto.iloc[-1]), 'ema_long': float(ema_largo.iloc[-1])})
 
 
@@ -1386,11 +1567,40 @@ def strategy_pullback(df: pd.DataFrame) -> StrategyResult:
     rsi_series = rsi(closes)
     tramo = closes.iloc[-5:]
     rsi_tramo = rsi_series.iloc[-5:]
-    extra = {'rsi_trend': float(rsi_tramo.iloc[-1] - rsi_tramo.iloc[-2])}
+    ema_short_series = ema(closes, 9)
+    ema_long_series = ema(closes, 21)
+    ema_support_diff = float(ema_short_series.iloc[-1] - ema_long_series.iloc[-1]) if len(ema_short_series) and len(ema_long_series) else 0.0
+    extra = {
+        'rsi_trend': float(rsi_tramo.iloc[-1] - rsi_tramo.iloc[-2]) if len(rsi_tramo) > 1 else 0.0,
+        'ema_support': ema_support_diff,
+    }
     if tramo.iloc[0] > tramo.iloc[1] > tramo.iloc[2] and tramo.iloc[3] >= tramo.iloc[2] and tramo.iloc[4] > tramo.iloc[2] and rsi_tramo.iloc[-1] > rsi_tramo.iloc[-2]:
         return StrategyResult('CALL', 1.0, ['Pullback alcista con RSI recuperándose → CALL'], extra)
     if tramo.iloc[0] < tramo.iloc[1] < tramo.iloc[2] and tramo.iloc[3] <= tramo.iloc[2] and tramo.iloc[4] < tramo.iloc[2] and rsi_tramo.iloc[-1] < rsi_tramo.iloc[-2]:
         return StrategyResult('PUT', -1.0, ['Pullback bajista con RSI cayendo → PUT'], extra)
+    soporte_rsi_alcista = len(rsi_tramo) > 1 and rsi_tramo.iloc[-1] > rsi_tramo.iloc[-2]
+    soporte_rsi_bajista = len(rsi_tramo) > 1 and rsi_tramo.iloc[-1] < rsi_tramo.iloc[-2]
+    soporte_ema_alcista = ema_support_diff > 0
+    soporte_ema_bajista = ema_support_diff < 0
+    if len(tramo) >= 3:
+        recuperacion_rapida = tramo.iloc[-3] >= tramo.iloc[-2] and tramo.iloc[-1] > tramo.iloc[-2]
+        caida_rapida = tramo.iloc[-3] <= tramo.iloc[-2] and tramo.iloc[-1] < tramo.iloc[-2]
+        if recuperacion_rapida and (soporte_rsi_alcista or soporte_ema_alcista):
+            respaldos = []
+            if soporte_rsi_alcista:
+                respaldos.append('RSI')
+            if soporte_ema_alcista:
+                respaldos.append('EMA')
+            texto_respaldo = ' y '.join(respaldos)
+            return StrategyResult('CALL', 0.9, [f"Pullback rápido confirmado ({texto_respaldo}) → CALL"], extra)
+        if caida_rapida and (soporte_rsi_bajista or soporte_ema_bajista):
+            respaldos = []
+            if soporte_rsi_bajista:
+                respaldos.append('RSI')
+            if soporte_ema_bajista:
+                respaldos.append('EMA')
+            texto_respaldo = ' y '.join(respaldos)
+            return StrategyResult('PUT', -0.9, [f"Pullback rápido confirmado ({texto_respaldo}) → PUT"], extra)
     return StrategyResult('NONE', 0.0, ['Sin pullback definido'], extra)
 
 
@@ -1464,6 +1674,8 @@ STRATEGY_WEIGHTS: Dict[str, float] = {
 
 TOTAL_STRATEGY_COUNT = len(STRATEGY_WEIGHTS)
 
+MAX_STRATEGY_SCORE = 3.0
+
 STRATEGY_DISPLAY_NAMES: Dict[str, str] = {
     'RSI': 'RSI',
     'EMA Trend': 'Tendencia EMA',
@@ -1486,6 +1698,29 @@ def _clasificar_confianza(valor: float) -> str:
     return 'Baja'
 
 
+def _compute_strategy_confidence(score: float) -> float:
+    magnitude = abs(float(score))
+    normalized = magnitude / MAX_STRATEGY_SCORE if MAX_STRATEGY_SCORE else magnitude
+    return float(max(0.0, min(1.0, normalized)))
+
+
+def _compute_volatility_factor(volatility: Optional[float]) -> float:
+    if volatility is None:
+        return 1.0
+    vol = max(0.0, float(volatility))
+    low_threshold = 0.0005
+    high_threshold = 0.003
+    if vol < low_threshold:
+        ratio = vol / max(low_threshold, 1e-9)
+        reduction = (1.0 - ratio) * 0.15
+        return float(max(0.7, 1.0 - reduction))
+    if vol > high_threshold:
+        ratio_high = min(1.0, (vol - high_threshold) / max(high_threshold, 1e-9))
+        boost = ratio_high * 0.05
+        return float(min(1.1, 1.0 + boost))
+    return 1.0
+
+
 def combine_signals(results: List[Tuple[str, StrategyResult]], active_states: Dict[str, bool]) -> Dict[str, Any]:
     reasons: List[str] = []
     agreements: Dict[str, str] = {}
@@ -1498,6 +1733,9 @@ def combine_signals(results: List[Tuple[str, StrategyResult]], active_states: Di
     low_volatility = False
     volatility_value: Optional[float] = None
     active_count = 0
+    direction_confidence_sum = {'CALL': 0.0, 'PUT': 0.0}
+    direction_weight_sum = {'CALL': 0.0, 'PUT': 0.0}
+    strategy_confidences: Dict[str, float] = {}
     for name, res in results:
         if not active_states.get(name, True):
             continue
@@ -1506,6 +1744,11 @@ def combine_signals(results: List[Tuple[str, StrategyResult]], active_states: Di
         active_count += 1
         agreements[name] = res.signal
         reasons.extend(res.reasons)
+        strategy_conf = _compute_strategy_confidence(res.score)
+        strategy_confidences[name] = strategy_conf
+        logging.debug(
+            f"[Signals] {name}: señal={res.signal} score={res.score:.3f} confianza={strategy_conf:.3f}"
+        )
         if name == 'Volatility Filter':
             volatility_value = res.extra.get('volatility')
             if res.extra.get('low'):
@@ -1529,6 +1772,8 @@ def combine_signals(results: List[Tuple[str, StrategyResult]], active_states: Di
             pesos_direccion[res.signal] += weight
             conteo_direccion[res.signal] += 1
             total_weight_signals += weight
+            direction_confidence_sum[res.signal] += strategy_conf * weight
+            direction_weight_sum[res.signal] += weight
     if total_weight_signals == 0.0:
         main_reason = '⚠️ Ninguna de las estrategias activas generó señal'
         return {
@@ -1551,12 +1796,22 @@ def combine_signals(results: List[Tuple[str, StrategyResult]], active_states: Di
             'total_weight': total_weight_signals,
             'active_weight': total_weight_active,
             'strong': 0,
+            'strategy_confidences': strategy_confidences,
         }
-    dominante = 'CALL' if pesos_direccion['CALL'] >= pesos_direccion['PUT'] else 'PUT'
-    dominant_weight = pesos_direccion[dominante]
-    confidence_from_signals = dominant_weight / total_weight_signals if total_weight_signals else 0.0
-    confidence_vs_active = dominant_weight / total_weight_active if total_weight_active else 0.0
-    confianza = max(confidence_from_signals, confidence_vs_active)
+    call_support = direction_confidence_sum['CALL']
+    put_support = direction_confidence_sum['PUT']
+    if call_support == put_support:
+        dominante = 'CALL' if pesos_direccion['CALL'] >= pesos_direccion['PUT'] else 'PUT'
+    else:
+        dominante = 'CALL' if call_support > put_support else 'PUT'
+    dominant_weight = direction_weight_sum[dominante]
+    weighted_confidence = (
+        direction_confidence_sum[dominante] / dominant_weight if dominant_weight else 0.0
+    )
+    participation_factor = (
+        pesos_direccion[dominante] / total_weight_active if total_weight_active else 0.0
+    )
+    confianza = max(weighted_confidence, participation_factor)
     signal = 'NONE'
     aligned = conteo_direccion[dominante]
     if confianza >= 0.45:
@@ -1565,9 +1820,17 @@ def combine_signals(results: List[Tuple[str, StrategyResult]], active_states: Di
         signal = override_signal
         confianza = max(confianza, 0.45)
         aligned = conteo_direccion.get(override_signal, 0)
-    if low_volatility and signal != 'NONE':
-        confianza *= 0.9
-        reasons.append('Volatilidad baja → confianza limitada')
+    if signal != 'NONE':
+        factor_volatilidad = _compute_volatility_factor(volatility_value)
+        if volatility_value is not None:
+            logging.debug(
+                f"[Signals] Volatilidad previa al ajuste: {volatility_value:.6f} factor={factor_volatilidad:.3f}"
+            )
+        if factor_volatilidad < 1.0:
+            confianza *= factor_volatilidad
+            reasons.append('Volatilidad baja → confianza limitada')
+        elif factor_volatilidad > 1.0:
+            confianza *= factor_volatilidad
     confianza = min(confianza, 0.98)
     if signal != 'NONE':
         confianza = max(confianza, 0.35)
@@ -1604,6 +1867,7 @@ def combine_signals(results: List[Tuple[str, StrategyResult]], active_states: Di
         'total_weight': total_weight_signals,
         'active_weight': total_weight_active,
         'strong': strong_flag,
+        'strategy_confidences': strategy_confidences,
     }
 
 
@@ -2096,6 +2360,7 @@ class TradingEngine:
         self._status_listeners: List[Callable[[str], None]] = []
         self._summary_listeners: List[Callable[[str, Dict[str, Any]], None]] = []
         self._trade_state_listeners: List[Callable[[str], None]] = []
+        self._result_listeners: List[Callable[[Dict[str, Any]], None]] = []
         self._strategy_lock = threading.Lock()
         self.strategy_states: Dict[str, bool] = {name: True for name, _ in STRATEGY_FUNCTIONS}
         self.strategy_states["Divergence"] = True
@@ -2118,6 +2383,11 @@ class TradingEngine:
         self._current_cycle_id = 0
         self._latest_regime_inputs: Dict[str, Any] = {}
         self._active_regime: Optional[str] = None
+        self._processed_lock = threading.Lock()
+        self._processed_contracts: Set[int] = set()
+        self._closed_lock = threading.Lock()
+        self._closed_contracts: Set[int] = set()
+        self._next_cycle_time = 0.0
 
     def add_trade_listener(self, callback: Callable[[TradeRecord, Dict[str, float]], None]) -> None:
         self._trade_listeners.append(callback)
@@ -2130,6 +2400,15 @@ class TradingEngine:
 
     def add_trade_state_listener(self, callback: Callable[[str], None]) -> None:
         self._trade_state_listeners.append(callback)
+
+    def add_result_listener(self, callback: Callable[[Dict[str, Any]], None]) -> None:
+        self._result_listeners.append(callback)
+
+    def remove_result_listener(self, callback: Callable[[Dict[str, Any]], None]) -> None:
+        try:
+            self._result_listeners.remove(callback)
+        except ValueError:
+            pass
 
     def set_trade_amount(self, value: float) -> None:
         self.trade_amount = max(0.1, float(value))
@@ -2165,6 +2444,11 @@ class TradingEngine:
         self._notify_status("running")
         operation_active = False
         self._notify_trade_state("ready")
+        with self._processed_lock:
+            self._processed_contracts.clear()
+        with self._closed_lock:
+            self._closed_contracts.clear()
+        CSV_LOGGED_CONTRACTS.clear()
 
     def is_running(self) -> bool:
         return self.running.is_set()
@@ -2210,6 +2494,13 @@ class TradingEngine:
                 callback(record, stats)
             except Exception as exc:
                 logging.debug(f"Error en escucha de operaciones: {exc}")
+
+    def _notify_trade_result(self, data: Dict[str, Any]) -> None:
+        for callback in list(self._result_listeners):
+            try:
+                callback(dict(data))
+            except Exception as exc:
+                logging.debug(f"Error en escucha de resultados: {exc}")
 
     def _notify_status(self, status: str) -> None:
         for callback in list(self._status_listeners):
@@ -2355,6 +2646,26 @@ class TradingEngine:
             return "LOSS", -float(stake)
         return "UNKNOWN", 0.0
 
+    def _register_processed_contract(self, contract_id: int) -> bool:
+        with self._processed_lock:
+            if contract_id in self._processed_contracts:
+                return False
+            self._processed_contracts.add(contract_id)
+            if len(self._processed_contracts) > 5000:
+                self._processed_contracts.pop()
+            return True
+
+    def _register_contract_closure(self, contract_id: Optional[int]) -> bool:
+        if contract_id is None:
+            return True
+        with self._closed_lock:
+            if contract_id in self._closed_contracts:
+                return False
+            self._closed_contracts.add(contract_id)
+            if len(self._closed_contracts) > 5000:
+                self._closed_contracts.pop()
+            return True
+
 
     def _determine_signal_source(
         self,
@@ -2383,24 +2694,16 @@ class TradingEngine:
             return "EMA"
         return "COMBINED"
 
-    def _get_candles_with_timeout(self, symbol: str, timeout: float = 3.0) -> List[Candle]:
-        start_time = time.time()
-        while True:
-            candles = self.api.fetch_candles(symbol)
-            if candles:
-                return candles
-            if time.time() - start_time > timeout:
-                raise TimeoutError(f"⏳ Candle fetch timeout for {symbol}")
-            if not self.running.is_set():
-                break
-            QtCore.QThread.msleep(200)
-        return []
-
     def _evaluate_symbol(self, symbol: str) -> Optional[Dict[str, Any]]:
         auto_learn.set_active_symbol(symbol)
         try:
-            candles = self._get_candles_with_timeout(symbol)
+            try:
+                candles = self.api.fetch_candles(symbol)
+            except Exception as exc:
+                logging.warning(f"Error al obtener velas de {symbol}: {exc}")
+                return None
             if not candles:
+                logging.warning(f"Sin velas disponibles para {symbol}, se omite del ciclo")
                 return None
             df = to_dataframe(candles)
             results, consensus = self._evaluate_strategies(df)
@@ -2421,14 +2724,12 @@ class TradingEngine:
                 logging.info('⚠️ Ninguna de las estrategias activas generó señal')
                 logging.info(f"Estrategias activas: {active_total}/{TOTAL_STRATEGY_COUNT}")
             elif signal == 'NONE':
-                logging.info(f"⚠️ Confianza {etiqueta_conf} ({confidence:.2f}) → {consensus['main_reason']}")
                 logging.info(f"Estrategias activas: {active_total}/{TOTAL_STRATEGY_COUNT}")
                 if consensus['low_volatility']:
                     valor_vol = consensus['volatility_value']
                     detalle = f" ({valor_vol:.4f})" if valor_vol is not None else ''
                     logging.info(f"⚠️ Volatilidad baja detectada{detalle}")
             else:
-                logging.info(f"📊 Confianza {etiqueta_conf} ({confidence:.2f}) → {consensus['main_reason']}")
                 logging.info(f"Estrategias alineadas: {consensus['aligned']}/{signals_total}")
                 logging.info(f"Estrategias activas: {active_total}/{TOTAL_STRATEGY_COUNT}")
                 if consensus['low_volatility']:
@@ -2455,6 +2756,7 @@ class TradingEngine:
                 'ai_notes': [],
                 'consensus': consensus,
                 'results': results,
+                'strategy_confidences': consensus.get('strategy_confidences', {}),
                 'features': None,
                 'entry_price': entry_price,
                 'latest_rsi': 0.0,
@@ -2530,11 +2832,17 @@ class TradingEngine:
                 macd_value,
             )
             trend_bias = abs(ema_slope) > 0.0005 or adx_value > 25.0
-            if smoothed_volatility < 0.0005:
-                penalty = 0.95 if trend_bias else 0.9
-                indicator_conf *= penalty
-            elif smoothed_volatility > 0.003:
-                indicator_conf *= 1.05
+            volatility_factor = _compute_volatility_factor(smoothed_volatility)
+            adjusted_indicator_factor = volatility_factor
+            if volatility_factor < 1.0 and trend_bias:
+                adjusted_indicator_factor = 1.0 - (1.0 - volatility_factor) * 0.5
+            logging.debug(
+                f"[Fusion] Volatilidad suavizada: {smoothed_volatility:.6f} factor={volatility_factor:.3f}"
+            )
+            if volatility_factor < 1.0:
+                indicator_conf *= adjusted_indicator_factor
+            elif volatility_factor > 1.0:
+                indicator_conf *= volatility_factor
             indicator_conf = float(np.clip(indicator_conf, 0.0, 1.0))
             evaluation.update(
                 {
@@ -2613,11 +2921,13 @@ class TradingEngine:
                 combined_confidence = float(max(weighted_average, max(base_components)))
             else:
                 combined_confidence = 0.6
-            if smoothed_volatility < 0.0005:
-                penalty = 0.95 if trend_bias else 0.9
-                combined_confidence *= penalty
-            elif smoothed_volatility > 0.003:
-                combined_confidence *= 1.05
+            adjusted_combined_factor = volatility_factor
+            if volatility_factor < 1.0 and trend_bias:
+                adjusted_combined_factor = 1.0 - (1.0 - volatility_factor) * 0.5
+            if volatility_factor < 1.0:
+                combined_confidence *= adjusted_combined_factor
+            elif volatility_factor > 1.0:
+                combined_confidence *= volatility_factor
             combined_confidence = float(np.clip(combined_confidence, 0.0, 1.0))
             if combined_confidence == 0.0 or math.isnan(combined_confidence):
                 combined_confidence = 0.6
@@ -2631,6 +2941,9 @@ class TradingEngine:
                 final_confidence = min_confidence
             final_confidence *= symbol_weight
             final_confidence = float(np.clip(final_confidence, 0.0, 1.0))
+            logging.debug(
+                f"[Fusion] base={confidence:.3f} indicador={indicator_conf:.3f} IA={ai_confidence:.3f} final={final_confidence:.3f}"
+            )
             if final_confidence >= 0.75:
                 evaluation['strong'] = 1
             adx_threshold = auto_learn.get_adx_min_threshold()
@@ -2666,15 +2979,21 @@ class TradingEngine:
     def scan_market(self) -> None:
         if not self.running.is_set():
             return
+        now = time.time()
+        if now < self._next_cycle_time:
+            QtWidgets.QApplication.processEvents(QtCore.QEventLoop.AllEvents, 50)
+            return
         self._cycle_id_counter += 1
         self._current_cycle_id = self._cycle_id_counter
         evaluations: List[Dict[str, Any]] = []
         confidence_lines: List[str] = []
         trade_executed = False
-        def _cycle_pause() -> None:
-            QtWidgets.QApplication.processEvents()
-            QtCore.QThread.msleep(2000)
-        for symbol in SYMBOLS:
+        symbols = list(SYMBOLS)
+        def _cycle_pause(delay: float = 0.5) -> None:
+            QtWidgets.QApplication.processEvents(QtCore.QEventLoop.AllEvents, 50)
+            self._next_cycle_time = time.time() + delay
+
+        for symbol in symbols:
             if not self.running.is_set():
                 break
             evaluation = self._evaluate_symbol(symbol)
@@ -2691,12 +3010,11 @@ class TradingEngine:
                 evaluations.append(evaluation)
             if not self.running.is_set():
                 break
-            QtCore.QThread.msleep(200)
         if not self.running.is_set():
             _cycle_pause()
             return
         if trade_executed:
-            _cycle_pause()
+            _cycle_pause(0.75)
             return
         if not evaluations:
             _cycle_pause()
@@ -2718,19 +3036,45 @@ class TradingEngine:
                 logging.info(f"{summary_line} → Selected: ninguno")
             _cycle_pause()
             return
-        best = max(candidates, key=lambda item: float(item.get('final_confidence', 0.0)))
+        selected = max(candidates, key=lambda item: float(item.get('final_confidence', 0.0)))
         summary_line = " | ".join(confidence_lines)
-        selected_text = f"{best['symbol']} ({float(best['final_confidence']):.2f})"
+        selected_text = f"{selected['symbol']} ({float(selected['final_confidence']):.2f})"
         if summary_line:
             logging.info(f"{summary_line} → Selected: {selected_text} | strong={strong_signal_count}")
-        if best.get('signal') not in {'CALL', 'PUT'}:
+        if selected.get('signal') not in {'CALL', 'PUT'}:
             _cycle_pause()
             return
-        if strong_signal_count == 0 and float(best['final_confidence']) < min_required:
+        if strong_signal_count == 0 and float(selected['final_confidence']) < min_required:
             _cycle_pause()
             return
-        self._execute_selected_trade(best)
-        _cycle_pause()
+        confidence_value_raw = selected.get('final_confidence')
+        confidence_value = float(confidence_value_raw) if confidence_value_raw is not None else 0.0
+        volatility_value_raw = selected.get('volatility')
+        volatility_value: Optional[float] = None
+        if volatility_value_raw is not None:
+            try:
+                volatility_value = float(volatility_value_raw)
+            except (TypeError, ValueError):
+                volatility_value = None
+        volatility_display = f"{volatility_value:.4f}" if volatility_value is not None else "N/A"
+        logging.info(
+            f"📊 Final confidence {selected['symbol']}: {confidence_value:.2f} | Volatility: {volatility_display} | Action: {selected['signal']}"
+        )
+        if confidence_value < MIN_CONFIDENCE:
+            logging.info(
+                f"🚫 Skipping trade on {selected['symbol']} due to low confidence ({confidence_value:.2f})"
+            )
+            _cycle_pause()
+            return
+        if volatility_value is not None and volatility_value < MIN_VOLATILITY:
+            logging.info(
+                f"🚫 Skipping trade on {selected['symbol']} due to low volatility ({volatility_value:.4f})"
+            )
+            _cycle_pause()
+            return
+        self._execute_selected_trade(selected)
+        _cycle_pause(0.75)
+        return
 
     def confirm_and_execute(self, evaluation: Dict[str, Any]) -> bool:
         direction = evaluation.get('confluence_direction')
@@ -2738,6 +3082,48 @@ class TradingEngine:
             return False
         symbol = evaluation.get('symbol', 'UNKNOWN')
         logging.info(f"✅ Confluence confirmed for {symbol}: {direction}")
+        skip_trade = False
+        try:
+            confidence_raw = evaluation.get('final_confidence')
+            if confidence_raw is None:
+                confidence_raw = evaluation.get('confidence')
+            confidence_value: Optional[float] = None
+            if confidence_raw is not None:
+                try:
+                    confidence_value = float(confidence_raw)
+                except (TypeError, ValueError):
+                    confidence_value = None
+            volatility_raw = evaluation.get('volatility')
+            volatility_value: Optional[float] = None
+            if volatility_raw is not None:
+                try:
+                    volatility_value = float(volatility_raw)
+                except (TypeError, ValueError):
+                    volatility_value = None
+            confidence_for_log = confidence_value if confidence_value is not None else 0.0
+            volatility_display = f"{volatility_value:.4f}" if volatility_value is not None else "N/A"
+            logging.info(
+                f"📊 Final confidence {symbol}: {confidence_for_log:.2f} | Volatility: {volatility_display} | Action: {direction}"
+            )
+            if confidence_value is None or confidence_value < MIN_CONFIDENCE:
+                logging.info(
+                    f"🚫 Skipping trade on {symbol} due to low confidence ({confidence_for_log:.2f})"
+                )
+                skip_trade = True
+                pass
+            elif volatility_value is None or volatility_value < MIN_VOLATILITY:
+                volatility_for_log = volatility_value if volatility_value is not None else 0.0
+                logging.info(
+                    f"🚫 Skipping trade on {symbol} due to low volatility ({volatility_for_log:.4f})"
+                )
+                skip_trade = True
+                pass
+        except Exception as exc:
+            logging.error(f"⚠️ Error in pre-trade validation for {symbol}: {exc}")
+            skip_trade = True
+            pass
+        if skip_trade:
+            return False
         enriched = dict(evaluation)
         enriched['signal'] = direction
         reasons = list(enriched.get('reasons', []))
@@ -2771,17 +3157,33 @@ class TradingEngine:
         symbol = evaluation['symbol']
         signal = evaluation['signal']
         ai_confidence = float(evaluation['ai_confidence'])
+        combined_confidence = float(evaluation.get('final_confidence', ai_confidence))
         reasons = evaluation['reasons']
         ai_notes = evaluation['ai_notes']
         consensus = evaluation['consensus']
         features = evaluation['features']
         entry_price = float(evaluation['entry_price'])
         signal_source = evaluation['signal_source']
+        results: List[Tuple[str, StrategyResult]] = evaluation.get('results', [])
         if 'stake' not in evaluation:
             evaluation['stake'] = self._calculate_kelly_stake(evaluation.get('predicted_probability', 0.5))
         stake_amount = float(max(0.1, evaluation.get('stake', self.trade_amount)))
         ml_probability = float(evaluation.get('predicted_probability', 0.5))
         trade_initiated = False
+        volatility_raw = evaluation.get('volatility')
+        volatility_value: Optional[float] = None
+        if volatility_raw is not None:
+            try:
+                volatility_value = float(volatility_raw)
+            except (TypeError, ValueError):
+                volatility_value = None
+        confidence_value = float(combined_confidence) if combined_confidence is not None else 0.0
+        if combined_confidence is None or confidence_value < MIN_CONFIDENCE:
+            logging.info(f"🚫 Skipping trade on {symbol} due to low confidence ({confidence_value:.2f})")
+            return False
+        if volatility_value is not None and volatility_value < MIN_VOLATILITY:
+            logging.info(f"🚫 Skipping trade on {symbol} due to low volatility ({volatility_value:.4f})")
+            return False
         if not self.risk.can_trade(ai_confidence):
             return False
         if operation_active:
@@ -2810,9 +3212,21 @@ class TradingEngine:
         try:
             result_status = self._wait_for_contract_result(contract_id, dur_seconds)
             trade_result, pnl = self._resolve_trade_result(result_status, stake_amount)
+            if contract_id is not None and not self._register_processed_contract(contract_id):
+                logging.debug(f"Contrato #{contract_id} ya procesado, omitiendo duplicado de resultados")
+                return trade_initiated
             self.risk.register_trade(pnl)
             if features is not None:
                 self.ai.log_trade(features, 1 if trade_result == 'WIN' else 0)
+            strategy_details = {
+                name: {
+                    'signal': res.signal,
+                    'score': float(res.score),
+                    'weight': float(STRATEGY_WEIGHTS.get(name, 1.0)),
+                    'confidence': float(consensus.get('strategy_confidences', {}).get(name, 0.0)),
+                }
+                for name, res in results
+            }
             record_metadata = {
                 'confidence_label': consensus['confidence_label'],
                 'confidence_value': consensus['confidence'],
@@ -2828,6 +3242,8 @@ class TradingEngine:
                 'dominant': consensus['dominant'],
                 'total_weight': consensus['total_weight'],
                 'active_weight': consensus.get('active_weight', 0.0),
+                'strategy_confidences': consensus.get('strategy_confidences', {}),
+                'strategy_details': strategy_details,
                 'contract_id': contract_id,
                 'stake': stake_amount,
                 'ml_probability': ml_probability,
@@ -2853,6 +3269,35 @@ class TradingEngine:
             ema_spread = float(evaluation['ema_spread'])
             boll_width = float(evaluation['boll_width'])
             volatilidad_actual = float(evaluation['volatility'])
+            confidence_value = combined_confidence
+            win_flag = trade_result == 'WIN'
+            profit_value = float(pnl)
+            main_reason = str(consensus.get('main_reason', 'Sin motivo disponible'))
+            reason_summary = '; '.join(reasons)
+            notes = (
+                f"{symbol} | RSI: {latest_rsi:.2f} | EMA spread: {ema_spread:.5f} | "
+                f"Volatilidad: {volatilidad_actual:.5f} | Reason: {main_reason}"
+            )
+            if reason_summary:
+                notes = f"{notes} | Motivos: {reason_summary}"
+            ema_slope_value = float(evaluation.get('ema_diff', 0.0))
+            notes = f"{notes} | EMA slope: {ema_slope_value:.5f}"
+            result_info = {
+                "hora": datetime.now().strftime("%H:%M:%S"),
+                "simbolo": symbol,
+                "decision": signal,
+                "confianza": confidence_value,
+                "resultado": "GANADA" if win_flag else "PERDIDA",
+                "pnl": profit_value,
+                "nota": notes,
+                "ticket": contract_id,
+            }
+            should_notify = True
+            if contract_id is not None and not self._register_contract_closure(contract_id):
+                logging.debug(f"Contract {contract_id} already closed. Skipping duplicate log.")
+                should_notify = False
+            if should_notify:
+                self._notify_trade_result(result_info)
             exit_price = self._fetch_exit_price(symbol, entry_price)
             price_change = float(exit_price - entry_price)
             auto_learn.update_history(
@@ -2909,7 +3354,7 @@ class TradingEngine:
                 elapsed = time.time() - cycle_start
                 if elapsed > 3.0:
                     logging.warning(f"⚠️ Cycle timeout ({elapsed:.2f}s) — forcing next iteration")
-                QtCore.QThread.msleep(1500)
+                QtCore.QThread.msleep(100)
         finally:
             self.stop()
 
@@ -2926,6 +3371,11 @@ class TradingEngine:
         except Exception:
             pass
         self.api.socket = None
+        with self._processed_lock:
+            self._processed_contracts.clear()
+        with self._closed_lock:
+            self._closed_contracts.clear()
+        CSV_LOGGED_CONTRACTS.clear()
 
 
 # ===============================================================
@@ -2958,15 +3408,51 @@ class QtLogHandler(logging.Handler):
         self.emitter.message.emit(message)
 
 
-class TradingThread(QtCore.QThread):
+class BotThread(QThread):
+    log_signal = pyqtSignal(str)
+    result_signal = pyqtSignal(dict)
+
     def __init__(self, engine: TradingEngine) -> None:
         super().__init__()
         self.engine = engine
         self._active = True
+        self._closed_contracts: Set[int] = set()
+        self.logged_contracts: Set[int] = set()
+        self._result_callback = self._handle_trade_result
+        self.engine.add_result_listener(self._result_callback)
+
+    def _normalize_contract_id(self, value: Any) -> Optional[int]:
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _handle_trade_result(self, data: Dict[str, Any]) -> None:
+        contract_id = self._normalize_contract_id(data.get("ticket") or data.get("contract_id"))
+        if contract_id is not None:
+            self.logged_contracts = getattr(self, "logged_contracts", set())
+            logged_contracts = self.logged_contracts
+            if contract_id in logged_contracts:
+                logging.debug(f"Duplicate contract {contract_id} ignored.")
+                return
+            logged_contracts.add(contract_id)
+            self._closed_contracts.add(contract_id)
+        ticket = data.get("ticket")
+        resultado = data.get("resultado", "-")
+        if ticket is not None:
+            mensaje = f"✅ Contrato #{ticket} {resultado}"
+        else:
+            mensaje = f"✅ Contrato {resultado}"
+        self.log_signal.emit(mensaje)
+        self.result_signal.emit(dict(data))
 
     def run(self) -> None:  # type: ignore[override]
         logging.info("🚀 BotThread started successfully.")
         self._active = True
+        self._closed_contracts.clear()
+        self.logged_contracts.clear()
         try:
             self.engine.start_engine()
         except Exception as exc:
@@ -2986,15 +3472,19 @@ class TradingThread(QtCore.QThread):
                     logging.warning(f"⚠️ Cycle timeout ({elapsed:.2f}s) — forcing next iteration")
                 if not self._active or not self.engine.is_running():
                     break
-                QtCore.QThread.msleep(1500)
+                QThread.msleep(100)
         finally:
             self.engine.stop()
+            self.engine.remove_result_listener(self._result_callback)
             logging.info("🧩 BotThread stopped.")
             self._active = False
 
     def stop(self) -> None:
         self._active = False
         self.engine.stop()
+        self.engine.remove_result_listener(self._result_callback)
+        self._closed_contracts.clear()
+        self.logged_contracts.clear()
 
 
 class BotWindow(QtWidgets.QWidget):
@@ -3046,7 +3536,7 @@ class BotWindow(QtWidgets.QWidget):
         for name, enabled in self.strategy_initial_state.items():
             self.engine.set_strategy_state(name, enabled)
 
-        self.thread: Optional[TradingThread] = None
+        self.bot_thread: Optional[BotThread] = None
         self.latest_stats: Dict[str, float] = {
             "operations": 0.0,
             "wins": 0.0,
@@ -3064,6 +3554,9 @@ class BotWindow(QtWidgets.QWidget):
         self.history_list: Optional[QtWidgets.QListWidget] = None
         self.history_bias_labels: Dict[str, QtWidgets.QLabel] = {}
         self.history_prediction_label: Optional[QtWidgets.QLabel] = None
+
+        self.logged_contracts: Set[int] = set()
+        self.pending_contracts: Set[int] = set()
 
         self._build_ui()
 
@@ -3339,19 +3832,23 @@ class BotWindow(QtWidgets.QWidget):
         self._update_history_tab()
 
     def start_trading(self) -> None:
-        if self.thread is not None and self.thread.isRunning():
+        if self.bot_thread is not None and self.bot_thread.isRunning():
             return
         self.auto_shutdown_active = False
         self.engine.auto_shutdown_triggered = False
-        self.thread = TradingThread(self.engine)
-        self.thread.finished.connect(self._on_thread_finished)
-        self.thread.start()
+        self.logged_contracts.clear()
+        self.pending_contracts.clear()
+        self.bot_thread = BotThread(self.engine)
+        self.bot_thread.finished.connect(self._on_thread_finished)
+        self.bot_thread.log_signal.connect(self._append_log)
+        self.bot_thread.result_signal.connect(self.update_result_table)
+        self.bot_thread.start()
         self.start_button.setEnabled(False)
         self.stop_button.setEnabled(True)
         self.status_label.setText("Estado: Iniciando...")
 
     def stop_trading(self) -> None:
-        if self.thread is None:
+        if self.bot_thread is None:
             if self.auto_shutdown_active:
                 self.auto_shutdown_active = False
                 self.start_button.setEnabled(True)
@@ -3359,14 +3856,16 @@ class BotWindow(QtWidgets.QWidget):
                 self.status_label.setText("Estado: Detenido")
                 self._on_trade_state("ready")
             return
-        self.thread.stop()
-        self.thread.wait(2000)
-        self.thread = None
+        self.bot_thread.stop()
+        self.bot_thread.wait(2000)
+        self.bot_thread = None
         self.start_button.setEnabled(True)
         self.stop_button.setEnabled(False)
         self.status_label.setText("Estado: Detenido")
         self.auto_shutdown_active = False
         self._on_trade_state("ready")
+        self.logged_contracts.clear()
+        self.pending_contracts.clear()
 
     def _on_trade_amount_changed(self, value: float) -> None:
         self.engine.set_trade_amount(value)
@@ -3382,7 +3881,7 @@ class BotWindow(QtWidgets.QWidget):
         self.engine.configure_auto_shutdown(habilitado, limite)
         if not habilitado and self.auto_shutdown_active:
             self.auto_shutdown_active = False
-            if self.thread is None:
+            if self.bot_thread is None:
                 self.start_button.setEnabled(True)
 
     def _on_kelly_toggled(self, checked: bool) -> None:
@@ -3392,9 +3891,110 @@ class BotWindow(QtWidgets.QWidget):
         auto_learn.reset_history()
         QtCore.QTimer.singleShot(350, self._update_history_tab)
 
+    def _normalize_contract_id(self, value: Any) -> Optional[int]:
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _find_contract_row(self, contract_id: Optional[int]) -> Optional[int]:
+        if contract_id is None:
+            return None
+        table = getattr(self, "trade_table", None)
+        if table is None:
+            return None
+        for index in range(table.rowCount()):
+            item = table.item(index, 0)
+            if item is not None:
+                stored_id = item.data(QtCore.Qt.UserRole)
+                if stored_id == contract_id:
+                    return index
+        return None
+
+    def _trim_trade_table(self) -> None:
+        table = getattr(self, "trade_table", None)
+        if table is None:
+            return
+        while table.rowCount() > 250:
+            last_row = table.rowCount() - 1
+            item = table.item(last_row, 0)
+            if item is not None:
+                stored_id = item.data(QtCore.Qt.UserRole)
+                if stored_id is not None:
+                    self.logged_contracts.discard(stored_id)
+                    self.pending_contracts.discard(stored_id)
+            table.removeRow(last_row)
+
+    def update_result_table(self, data: Dict[str, Any]) -> None:
+        table = getattr(self, "trade_table", None)
+        if table is None:
+            return
+        contract_id = self._normalize_contract_id(data.get("ticket") or data.get("contract_id"))
+        if contract_id is not None:
+            self.logged_contracts = getattr(self, "logged_contracts", set())
+            logged_contracts = self.logged_contracts
+            if contract_id in logged_contracts:
+                logging.debug(f"Duplicate contract {contract_id} ignored.")
+                return
+            logged_contracts.add(contract_id)
+        target_row = self._find_contract_row(contract_id)
+        if target_row is None:
+            target_row = 0
+            table.insertRow(target_row)
+        confidence_value = float(data.get("confianza", 0.0))
+        pnl_value = float(data.get("pnl", 0.0))
+        entries = [
+            str(data.get("hora", "")),
+            str(data.get("simbolo", "")),
+            str(data.get("decision", "")),
+            f"{confidence_value:.2f}",
+            str(data.get("resultado", "")),
+            f"{pnl_value:.2f}",
+        ]
+        for column, text_value in enumerate(entries):
+            item = QtWidgets.QTableWidgetItem(text_value)
+            if column == 0 and contract_id is not None:
+                item.setData(QtCore.Qt.UserRole, contract_id)
+            table.setItem(target_row, column, item)
+        nota_text = str(data.get("nota", ""))
+        table.setItem(target_row, 6, QtWidgets.QTableWidgetItem(nota_text))
+        if contract_id is not None:
+            self.pending_contracts.discard(contract_id)
+        if table.rowCount() > 250:
+            self._trim_trade_table()
+
+
     def _on_trade(self, record: TradeRecord, stats: Dict[str, float]) -> None:
         self.latest_stats = stats
-        self.trade_table.insertRow(0)
+        table = self.trade_table
+        contract_id = self._normalize_contract_id(record.metadata.get('contract_id') if record.metadata else None)
+        if contract_id is not None:
+            self.logged_contracts = getattr(self, "logged_contracts", set())
+            logged_contracts = self.logged_contracts
+            if contract_id in logged_contracts:
+                logging.debug(f"Duplicate contract {contract_id} ignored.")
+                self._update_stats_labels(stats)
+                metadata = record.metadata or {}
+                summary_data = {
+                    'confidence': metadata.get('confidence_value', record.confidence),
+                    'confidence_label': metadata.get('confidence_label', 'Baja'),
+                    'active': metadata.get('active', 0),
+                    'signals': metadata.get('signals', 0),
+                    'aligned': metadata.get('aligned', 0),
+                    'signal': metadata.get('direction', record.decision),
+                    'dominant': metadata.get('dominant', record.decision),
+                    'main_reason': metadata.get('main_reason', 'Motivo no disponible'),
+                }
+                self._update_asset_summary_from_dict(record.symbol, summary_data)
+                self._update_history_tab()
+                return
+            logged_contracts.add(contract_id)
+        target_row = self._find_contract_row(contract_id)
+        if target_row is None:
+            target_row = 0
+            table.insertRow(target_row)
         entries = [
             record.timestamp.strftime("%H:%M:%S"),
             record.symbol,
@@ -3402,14 +4002,17 @@ class BotWindow(QtWidgets.QWidget):
             f"{record.confidence:.2f}",
             record.result or "-",
             f"{record.pnl:.2f}",
-            "; ".join(record.reasons),
+            '; '.join(record.reasons),
         ]
-        for column, text in enumerate(entries):
-            self.trade_table.setItem(0, column, QtWidgets.QTableWidgetItem(text))
-        if self.trade_table.rowCount() > 250:
-            self.trade_table.removeRow(self.trade_table.rowCount() - 1)
+        for column, text_value in enumerate(entries):
+            item = QtWidgets.QTableWidgetItem(text_value)
+            if column == 0 and contract_id is not None:
+                item.setData(QtCore.Qt.UserRole, contract_id)
+            table.setItem(target_row, column, item)
+        if table.rowCount() > 250:
+            self._trim_trade_table()
         self._update_stats_labels(stats)
-        metadata = record.metadata
+        metadata = record.metadata or {}
         summary_data = {
             'confidence': metadata.get('confidence_value', record.confidence),
             'confidence_label': metadata.get('confidence_label', 'Baja'),
@@ -3422,6 +4025,10 @@ class BotWindow(QtWidgets.QWidget):
         }
         self._update_asset_summary_from_dict(record.symbol, summary_data)
         self._update_history_tab()
+        if contract_id is not None:
+            self.pending_contracts.add(contract_id)
+            self.logged_contracts.discard(contract_id)
+
 
     def _on_status(self, status: str) -> None:
         if status == "auto_shutdown":
@@ -3458,7 +4065,7 @@ class BotWindow(QtWidgets.QWidget):
             self.trade_state_label.setText(texto)
 
     def _on_thread_finished(self) -> None:
-        self.thread = None
+        self.bot_thread = None
         if self.auto_shutdown_active:
             self.start_button.setEnabled(False)
             self.stop_button.setEnabled(True)
@@ -3637,9 +4244,9 @@ class BotWindow(QtWidgets.QWidget):
                 self.history_list.addItem(item)
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # type: ignore[override]
-        if self.thread is not None and self.thread.isRunning():
-            self.thread.stop()
-            self.thread.wait(2000)
+        if self.bot_thread is not None and self.bot_thread.isRunning():
+            self.bot_thread.stop()
+            self.bot_thread.wait(2000)
         logging.getLogger().removeHandler(self.log_handler)
         super().closeEvent(event)
 
