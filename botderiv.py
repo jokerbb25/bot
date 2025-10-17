@@ -3396,6 +3396,8 @@ class BotWindow(QtWidgets.QWidget):
         self.history_bias_labels: Dict[str, QtWidgets.QLabel] = {}
         self.history_prediction_label: Optional[QtWidgets.QLabel] = None
 
+        self.logged_contracts: Set[int] = set()
+
         self._build_ui()
 
         self.refresh_timer = QtCore.QTimer(self)
@@ -3725,50 +3727,111 @@ class BotWindow(QtWidgets.QWidget):
         auto_learn.reset_history()
         QtCore.QTimer.singleShot(350, self._update_history_tab)
 
+    def _normalize_contract_id(self, value: Any) -> Optional[int]:
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _find_contract_row(self, contract_id: Optional[int]) -> Optional[int]:
+        if contract_id is None:
+            return None
+        table = getattr(self, "trade_table", None)
+        if table is None:
+            return None
+        for index in range(table.rowCount()):
+            item = table.item(index, 0)
+            if item is not None:
+                stored_id = item.data(QtCore.Qt.UserRole)
+                if stored_id == contract_id:
+                    return index
+        return None
+
+    def _trim_trade_table(self) -> None:
+        table = getattr(self, "trade_table", None)
+        if table is None:
+            return
+        while table.rowCount() > 250:
+            last_row = table.rowCount() - 1
+            item = table.item(last_row, 0)
+            if item is not None:
+                stored_id = item.data(QtCore.Qt.UserRole)
+                if stored_id is not None:
+                    self.logged_contracts.discard(stored_id)
+            table.removeRow(last_row)
+
     def update_result_table(self, data: Dict[str, Any]) -> None:
         table = getattr(self, "trade_table", None)
         if table is None:
             return
-        target_row: Optional[int] = None
-        hora_text = str(data.get("hora", ""))
-        simbolo_text = str(data.get("simbolo", ""))
-        decision_text = str(data.get("decision", ""))
-        for index in range(table.rowCount()):
-            hora_item = table.item(index, 0)
-            simbolo_item = table.item(index, 1)
-            decision_item = table.item(index, 2)
-            if (
-                hora_item is not None
-                and simbolo_item is not None
-                and decision_item is not None
-                and hora_item.text() == hora_text
-                and simbolo_item.text() == simbolo_text
-                and decision_item.text() == decision_text
-            ):
-                target_row = index
-                break
+        contract_id = self._normalize_contract_id(data.get("ticket") or data.get("contract_id"))
+        target_row = self._find_contract_row(contract_id)
         if target_row is None:
-            target_row = table.rowCount()
+            if contract_id is not None and contract_id in self.logged_contracts:
+                logging.debug(f"Duplicate trade {contract_id} ignored.")
+                return
+            target_row = 0
             table.insertRow(target_row)
+            if contract_id is not None:
+                self.logged_contracts.add(contract_id)
+        else:
+            if contract_id is not None and contract_id not in self.logged_contracts:
+                self.logged_contracts.add(contract_id)
         confidence_value = float(data.get("confianza", 0.0))
         pnl_value = float(data.get("pnl", 0.0))
         entries = [
-            hora_text,
-            simbolo_text,
-            decision_text,
+            str(data.get("hora", "")),
+            str(data.get("simbolo", "")),
+            str(data.get("decision", "")),
             f"{confidence_value:.2f}",
             str(data.get("resultado", "")),
             f"{pnl_value:.2f}",
         ]
-        for column, text in enumerate(entries):
-            table.setItem(target_row, column, QtWidgets.QTableWidgetItem(text))
+        for column, text_value in enumerate(entries):
+            item = QtWidgets.QTableWidgetItem(text_value)
+            if column == 0 and contract_id is not None:
+                item.setData(QtCore.Qt.UserRole, contract_id)
+            table.setItem(target_row, column, item)
         nota_text = str(data.get("nota", ""))
-        if nota_text or table.item(target_row, 6) is None:
+        existing_note = table.item(target_row, 6)
+        if nota_text or existing_note is None:
             table.setItem(target_row, 6, QtWidgets.QTableWidgetItem(nota_text))
+        if table.rowCount() > 250:
+            self._trim_trade_table()
+
 
     def _on_trade(self, record: TradeRecord, stats: Dict[str, float]) -> None:
         self.latest_stats = stats
-        self.trade_table.insertRow(0)
+        table = self.trade_table
+        contract_id = self._normalize_contract_id(record.metadata.get('contract_id') if record.metadata else None)
+        target_row = self._find_contract_row(contract_id)
+        if target_row is None:
+            if contract_id is not None and contract_id in self.logged_contracts:
+                logging.debug(f"Duplicate trade {contract_id} ignored.")
+                self._update_stats_labels(stats)
+                metadata = record.metadata
+                summary_data = {
+                    'confidence': metadata.get('confidence_value', record.confidence),
+                    'confidence_label': metadata.get('confidence_label', 'Baja'),
+                    'active': metadata.get('active', 0),
+                    'signals': metadata.get('signals', 0),
+                    'aligned': metadata.get('aligned', 0),
+                    'signal': metadata.get('direction', record.decision),
+                    'dominant': metadata.get('dominant', record.decision),
+                    'main_reason': metadata.get('main_reason', 'Motivo no disponible'),
+                }
+                self._update_asset_summary_from_dict(record.symbol, summary_data)
+                self._update_history_tab()
+                return
+            target_row = 0
+            table.insertRow(target_row)
+            if contract_id is not None:
+                self.logged_contracts.add(contract_id)
+        else:
+            if contract_id is not None and contract_id not in self.logged_contracts:
+                self.logged_contracts.add(contract_id)
         entries = [
             record.timestamp.strftime("%H:%M:%S"),
             record.symbol,
@@ -3776,12 +3839,15 @@ class BotWindow(QtWidgets.QWidget):
             f"{record.confidence:.2f}",
             record.result or "-",
             f"{record.pnl:.2f}",
-            "; ".join(record.reasons),
+            '; '.join(record.reasons),
         ]
-        for column, text in enumerate(entries):
-            self.trade_table.setItem(0, column, QtWidgets.QTableWidgetItem(text))
-        if self.trade_table.rowCount() > 250:
-            self.trade_table.removeRow(self.trade_table.rowCount() - 1)
+        for column, text_value in enumerate(entries):
+            item = QtWidgets.QTableWidgetItem(text_value)
+            if column == 0 and contract_id is not None:
+                item.setData(QtCore.Qt.UserRole, contract_id)
+            table.setItem(target_row, column, item)
+        if table.rowCount() > 250:
+            self._trim_trade_table()
         self._update_stats_labels(stats)
         metadata = record.metadata
         summary_data = {
@@ -3796,6 +3862,7 @@ class BotWindow(QtWidgets.QWidget):
         }
         self._update_asset_summary_from_dict(record.symbol, summary_data)
         self._update_history_tab()
+
 
     def _on_status(self, status: str) -> None:
         if status == "auto_shutdown":
