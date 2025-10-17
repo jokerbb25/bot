@@ -3070,6 +3070,44 @@ class TradingEngine:
             return False
         symbol = evaluation.get('symbol', 'UNKNOWN')
         logging.info(f"✅ Confluence confirmed for {symbol}: {direction}")
+        skip_trade = False
+        try:
+            confidence_raw = evaluation.get('final_confidence')
+            if confidence_raw is None:
+                confidence_raw = evaluation.get('confidence')
+            confidence_value: Optional[float] = None
+            if confidence_raw is not None:
+                try:
+                    confidence_value = float(confidence_raw)
+                except (TypeError, ValueError):
+                    confidence_value = None
+            volatility_raw = evaluation.get('volatility')
+            volatility_value: Optional[float] = None
+            if volatility_raw is not None:
+                try:
+                    volatility_value = float(volatility_raw)
+                except (TypeError, ValueError):
+                    volatility_value = None
+            confidence_for_log = confidence_value if confidence_value is not None else 0.0
+            if confidence_value is None or confidence_value < MIN_CONFIDENCE:
+                logging.info(
+                    f"🚫 Skipping trade on {symbol} due to low confidence ({confidence_for_log:.2f})"
+                )
+                skip_trade = True
+                pass
+            elif volatility_value is None or volatility_value < MIN_VOLATILITY:
+                volatility_for_log = volatility_value if volatility_value is not None else 0.0
+                logging.info(
+                    f"🚫 Skipping trade on {symbol} due to low volatility ({volatility_for_log:.4f})"
+                )
+                skip_trade = True
+                pass
+        except Exception as exc:
+            logging.error(f"⚠️ Error in pre-trade validation for {symbol}: {exc}")
+            skip_trade = True
+            pass
+        if skip_trade:
+            return False
         enriched = dict(evaluation)
         enriched['signal'] = direction
         reasons = list(enriched.get('reasons', []))
