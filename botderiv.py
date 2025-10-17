@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 import numpy as np
 import pandas as pd
@@ -2366,6 +2366,12 @@ class TradingEngine:
         self._current_cycle_id = 0
         self._latest_regime_inputs: Dict[str, Any] = {}
         self._active_regime: Optional[str] = None
+        self._prefetch_lock = threading.Lock()
+        self._prefetched_candles: Dict[str, List[Candle]] = {}
+        self._prefetch_workers = max(1, min(8, len(SYMBOLS)))
+        self._processed_lock = threading.Lock()
+        self._processed_contracts: Set[int] = set()
+        self._next_cycle_time = 0.0
 
     def add_trade_listener(self, callback: Callable[[TradeRecord, Dict[str, float]], None]) -> None:
         self._trade_listeners.append(callback)
@@ -2619,6 +2625,15 @@ class TradingEngine:
             return "LOSS", -float(stake)
         return "UNKNOWN", 0.0
 
+    def _register_processed_contract(self, contract_id: int) -> bool:
+        with self._processed_lock:
+            if contract_id in self._processed_contracts:
+                return False
+            self._processed_contracts.add(contract_id)
+            if len(self._processed_contracts) > 5000:
+                self._processed_contracts.pop()
+            return True
+
 
     def _determine_signal_source(
         self,
@@ -2647,7 +2662,30 @@ class TradingEngine:
             return "EMA"
         return "COMBINED"
 
+    def _prefetch_symbol_data(self, symbol: str, timeout: float = 3.0) -> Tuple[str, List[Candle]]:
+        if not self.running.is_set():
+            return symbol, []
+        start_time = time.time()
+        candles: List[Candle] = []
+        while self.running.is_set():
+            try:
+                candles = self.api.fetch_candles(symbol) or []
+            except Exception as exc:
+                logging.debug(f"No se pudo prefetchear velas para {symbol}: {exc}")
+                candles = []
+            if candles:
+                break
+            if time.time() - start_time > timeout:
+                logging.warning(f"⏳ Prefetch timeout para {symbol}")
+                break
+            QtCore.QThread.msleep(100)
+        return symbol, candles
+
     def _get_candles_with_timeout(self, symbol: str, timeout: float = 3.0) -> List[Candle]:
+        with self._prefetch_lock:
+            prefetched = self._prefetched_candles.pop(symbol, None)
+        if prefetched:
+            return prefetched
         start_time = time.time()
         while True:
             candles = self.api.fetch_candles(symbol)
@@ -2657,7 +2695,7 @@ class TradingEngine:
                 raise TimeoutError(f"⏳ Candle fetch timeout for {symbol}")
             if not self.running.is_set():
                 break
-            QtCore.QThread.msleep(200)
+            QtCore.QThread.msleep(50)
         return []
 
     def _evaluate_symbol(self, symbol: str) -> Optional[Dict[str, Any]]:
@@ -2942,15 +2980,30 @@ class TradingEngine:
     def scan_market(self) -> None:
         if not self.running.is_set():
             return
+        now = time.time()
+        if now < self._next_cycle_time:
+            QtWidgets.QApplication.processEvents(QtCore.QEventLoop.AllEvents, 50)
+            return
         self._cycle_id_counter += 1
         self._current_cycle_id = self._cycle_id_counter
         evaluations: List[Dict[str, Any]] = []
         confidence_lines: List[str] = []
         trade_executed = False
-        def _cycle_pause() -> None:
-            QtWidgets.QApplication.processEvents()
-            QtCore.QThread.msleep(2000)
-        for symbol in SYMBOLS:
+        symbols = list(SYMBOLS)
+        if symbols:
+            with ThreadPoolExecutor(max_workers=self._prefetch_workers) as executor:
+                prefetched_batches = list(executor.map(self._prefetch_symbol_data, symbols))
+            with self._prefetch_lock:
+                self._prefetched_candles.clear()
+                for sym, data in prefetched_batches:
+                    if data:
+                        self._prefetched_candles[sym] = data
+
+        def _cycle_pause(delay: float = 0.5) -> None:
+            QtWidgets.QApplication.processEvents(QtCore.QEventLoop.AllEvents, 50)
+            self._next_cycle_time = time.time() + delay
+
+        for symbol in symbols:
             if not self.running.is_set():
                 break
             evaluation = self._evaluate_symbol(symbol)
@@ -2967,12 +3020,11 @@ class TradingEngine:
                 evaluations.append(evaluation)
             if not self.running.is_set():
                 break
-            QtCore.QThread.msleep(200)
         if not self.running.is_set():
             _cycle_pause()
             return
         if trade_executed:
-            _cycle_pause()
+            _cycle_pause(0.75)
             return
         if not evaluations:
             _cycle_pause()
@@ -3006,7 +3058,7 @@ class TradingEngine:
             _cycle_pause()
             return
         self._execute_selected_trade(best)
-        _cycle_pause()
+        _cycle_pause(0.75)
 
     def confirm_and_execute(self, evaluation: Dict[str, Any]) -> bool:
         direction = evaluation.get('confluence_direction')
@@ -3087,6 +3139,9 @@ class TradingEngine:
         try:
             result_status = self._wait_for_contract_result(contract_id, dur_seconds)
             trade_result, pnl = self._resolve_trade_result(result_status, stake_amount)
+            if contract_id is not None and not self._register_processed_contract(contract_id):
+                logging.debug(f"Contrato #{contract_id} ya procesado, omitiendo duplicado de resultados")
+                return trade_initiated
             self.risk.register_trade(pnl)
             if features is not None:
                 self.ai.log_trade(features, 1 if trade_result == 'WIN' else 0)
@@ -3211,7 +3266,7 @@ class TradingEngine:
                 elapsed = time.time() - cycle_start
                 if elapsed > 3.0:
                     logging.warning(f"⚠️ Cycle timeout ({elapsed:.2f}s) — forcing next iteration")
-                QtCore.QThread.msleep(1500)
+                QtCore.QThread.msleep(100)
         finally:
             self.stop()
 
@@ -3303,7 +3358,7 @@ class BotThread(QThread):
                     logging.warning(f"⚠️ Cycle timeout ({elapsed:.2f}s) — forcing next iteration")
                 if not self._active or not self.engine.is_running():
                     break
-                QThread.msleep(1500)
+                QThread.msleep(100)
         finally:
             self.engine.stop()
             self.engine.remove_result_listener(self._result_callback)
