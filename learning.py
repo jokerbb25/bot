@@ -5,6 +5,8 @@ from collections import defaultdict
 from dataclasses import dataclass, field
 from typing import DefaultDict
 
+import numpy as np
+
 
 @dataclass(slots=True)
 class StrategyBiasTracker:
@@ -17,6 +19,7 @@ class StrategyBiasTracker:
 
     rsi_bias: DefaultDict[str, float] = field(default_factory=lambda: defaultdict(float))
     ema_bias: DefaultDict[str, float] = field(default_factory=lambda: defaultdict(float))
+    confidence_memory: DefaultDict[str, float] = field(default_factory=lambda: defaultdict(lambda: 0.5))
 
     def update(self, symbol: str, final_confidence: float, result: str) -> None:
         outcome = (result or "").strip().upper()
@@ -31,11 +34,20 @@ class StrategyBiasTracker:
         self.rsi_bias[symbol] *= 0.98
         self.ema_bias[symbol] *= 0.98
 
+        if outcome == "WIN":
+            self.confidence_memory[symbol] += 0.05
+        elif outcome == "LOSS":
+            self.confidence_memory[symbol] -= 0.05
+        self.confidence_memory[symbol] = float(np.clip(self.confidence_memory[symbol], 0.0, 1.0))
+
     def bias_snapshot(self, symbol: str) -> dict[str, float]:
         return {
             "RSI": float(self.rsi_bias[symbol]),
             "EMA": float(self.ema_bias[symbol]),
         }
+
+    def confidence_snapshot(self, symbol: str) -> float:
+        return float(self.confidence_memory[symbol])
 
 
 __all__ = ["StrategyBiasTracker"]

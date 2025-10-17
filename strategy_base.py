@@ -67,6 +67,11 @@ class StrategySnapshot:
     volatility: Optional[float]
     closes: Sequence[float]
     ema_short: Optional[Sequence[float]] = None
+    rsi_value: Optional[float] = None
+    ema_slope_value: Optional[float] = None
+    base_stake: float = 1.0
+    result_available: bool = False
+    trade_result: Optional[str] = None
 
     def active_signals(self) -> Iterable[StrategyResult]:
         return (result for result in self.results if result.is_active())
