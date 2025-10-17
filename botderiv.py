@@ -2366,12 +2366,6 @@ class TradingEngine:
         self._current_cycle_id = 0
         self._latest_regime_inputs: Dict[str, Any] = {}
         self._active_regime: Optional[str] = None
-        self._prefetch_lock = threading.Lock()
-        self._prefetched_candles: Dict[str, List[Candle]] = {}
-        self._api_fetch_lock = threading.Lock()
-        self._prefetch_thread: Optional[threading.Thread] = None
-        self._prefetch_active = threading.Event()
-        self._prefetch_timestamps: Dict[str, float] = {symbol: 0.0 for symbol in SYMBOLS}
         self._processed_lock = threading.Lock()
         self._processed_contracts: Set[int] = set()
         self._next_cycle_time = 0.0
@@ -2429,10 +2423,6 @@ class TradingEngine:
             self._notify_status("stopped")
             raise
         self._notify_status("running")
-        with self._prefetch_lock:
-            self._prefetched_candles.clear()
-            self._prefetch_timestamps = {symbol: 0.0 for symbol in SYMBOLS}
-        self._ensure_prefetch_thread()
         operation_active = False
         self._notify_trade_state("ready")
 
@@ -2669,112 +2659,16 @@ class TradingEngine:
             return "EMA"
         return "COMBINED"
 
-    def _safe_fetch_candles(
-        self,
-        symbol: str,
-        retries: int = 3,
-        delay: float = 1.0,
-        timeout: float = 6.0,
-        enforce_running: bool = True,
-    ) -> List[Candle]:
-        last_exception: Optional[Exception] = None
-        for attempt in range(1, retries + 1):
-            if enforce_running and not self.running.is_set():
-                break
-            try:
-                with self._api_fetch_lock:
-                    if self.api.socket is not None:
-                        try:
-                            self.api.socket.settimeout(timeout)
-                        except Exception:
-                            pass
-                    candles = self.api.fetch_candles(symbol) or []
-                if candles:
-                    return candles
-                logging.warning(
-                    f"⏳ Prefetch timeout para {symbol}, reintento {attempt}/{retries}"
-                )
-            except TimeoutError as exc:
-                last_exception = exc
-                logging.warning(
-                    f"⏳ Prefetch timeout para {symbol}, reintento {attempt}/{retries}"
-                )
-            except Exception as exc:  # pragma: no cover - network dependent
-                last_exception = exc
-                logging.warning(
-                    f"⏳ Error al obtener velas de {symbol} (intento {attempt}/{retries}): {exc}"
-                )
-            if enforce_running and not self.running.is_set():
-                break
-            if attempt < retries:
-                time.sleep(delay)
-        if last_exception is not None:
-            logging.error(
-                f"❌ Falló la descarga de velas para {symbol} tras {retries} intentos: {last_exception}"
-            )
-        else:
-            logging.error(
-                f"❌ Falló la descarga de velas para {symbol} tras {retries} intentos sin respuesta"
-            )
-        return []
-
-    def _prefetch_symbol_data(self, symbol: str, timeout: float = 6.0) -> Tuple[str, List[Candle]]:
-        if not self.running.is_set():
-            return symbol, []
-        candles = self._safe_fetch_candles(symbol, timeout=timeout)
-        if candles:
-            with self._prefetch_lock:
-                self._prefetched_candles[symbol] = candles
-                self._prefetch_timestamps[symbol] = time.time()
-        return symbol, candles
-
-    def _get_candles_with_timeout(self, symbol: str, timeout: float = 6.0) -> List[Candle]:
-        deadline = time.time() + timeout
-        while time.time() < deadline and self.running.is_set():
-            with self._prefetch_lock:
-                prefetched = self._prefetched_candles.pop(symbol, None)
-            if prefetched:
-                return prefetched
-            QtCore.QThread.msleep(50)
-        candles = self._safe_fetch_candles(symbol, timeout=timeout)
-        return candles
-
-    def _prefetch_loop(self) -> None:
-        while True:
-            if not self._prefetch_active.is_set():
-                time.sleep(0.2)
-                continue
-            if not self.running.is_set():
-                time.sleep(0.2)
-                continue
-            for symbol in SYMBOLS:
-                if not self.running.is_set():
-                    break
-                with self._prefetch_lock:
-                    last_fetch = self._prefetch_timestamps.get(symbol, 0.0)
-                if time.time() - last_fetch < 1.0:
-                    continue
-                self._prefetch_symbol_data(symbol)
-                if not self.running.is_set():
-                    break
-            time.sleep(0.2)
-
-    def _ensure_prefetch_thread(self) -> None:
-        self._prefetch_active.set()
-        if self._prefetch_thread is not None and self._prefetch_thread.is_alive():
-            return
-        self._prefetch_thread = threading.Thread(
-            target=self._prefetch_loop,
-            name="PrefetchWorker",
-            daemon=True,
-        )
-        self._prefetch_thread.start()
-
     def _evaluate_symbol(self, symbol: str) -> Optional[Dict[str, Any]]:
         auto_learn.set_active_symbol(symbol)
         try:
-            candles = self._get_candles_with_timeout(symbol)
+            try:
+                candles = self.api.fetch_candles(symbol)
+            except Exception as exc:
+                logging.warning(f"Error al obtener velas de {symbol}: {exc}")
+                return None
             if not candles:
+                logging.warning(f"Sin velas disponibles para {symbol}, se omite del ciclo")
                 return None
             df = to_dataframe(candles)
             results, consensus = self._evaluate_strategies(df)
@@ -3062,16 +2956,6 @@ class TradingEngine:
         confidence_lines: List[str] = []
         trade_executed = False
         symbols = list(SYMBOLS)
-        if symbols:
-            self._ensure_prefetch_thread()
-            self._prefetch_active.set()
-            current_time = time.time()
-            with self._prefetch_lock:
-                for sym in symbols:
-                    last_fetch = self._prefetch_timestamps.get(sym, 0.0)
-                    if current_time - last_fetch > 2.0:
-                        self._prefetch_timestamps[sym] = 0.0
-
         def _cycle_pause(delay: float = 0.5) -> None:
             QtWidgets.QApplication.processEvents(QtCore.QEventLoop.AllEvents, 50)
             self._next_cycle_time = time.time() + delay
@@ -3160,7 +3044,7 @@ class TradingEngine:
 
     def _fetch_exit_price(self, symbol: str, fallback: float) -> float:
         try:
-            candles = self._safe_fetch_candles(symbol, retries=2, timeout=6.0, enforce_running=False)
+            candles = self.api.fetch_candles(symbol)
             if candles:
                 return float(candles[-1].close)
         except Exception as exc:
@@ -3346,10 +3230,6 @@ class TradingEngine:
     def stop(self) -> None:
         global operation_active
         self.running.clear()
-        self._prefetch_active.clear()
-        with self._prefetch_lock:
-            self._prefetched_candles.clear()
-            self._prefetch_timestamps = {symbol: 0.0 for symbol in SYMBOLS}
         operation_active = False
         self.active_trade_symbol = None
         self._notify_trade_state("ready")
