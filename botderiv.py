@@ -56,6 +56,7 @@ MAX_DAILY_PROFIT = 100.0
 COOLDOWN_AFTER_LOSS = 60
 MAX_DRAWDOWN = -150.0
 MIN_TRADE_CONFIDENCE = 0.45
+MIN_CONFIDENCE = 0.65
 
 AI_ENABLED = True
 AI_PASSIVE_MODE = True
@@ -3089,6 +3090,7 @@ class TradingEngine:
         symbol = evaluation['symbol']
         signal = evaluation['signal']
         ai_confidence = float(evaluation['ai_confidence'])
+        combined_confidence = float(evaluation.get('final_confidence', ai_confidence))
         reasons = evaluation['reasons']
         ai_notes = evaluation['ai_notes']
         consensus = evaluation['consensus']
@@ -3101,6 +3103,9 @@ class TradingEngine:
         stake_amount = float(max(0.1, evaluation.get('stake', self.trade_amount)))
         ml_probability = float(evaluation.get('predicted_probability', 0.5))
         trade_initiated = False
+        if combined_confidence < MIN_CONFIDENCE:
+            logging.info(f"🚫 Trade skipped due to low confidence ({combined_confidence:.2f})")
+            return False
         if not self.risk.can_trade(ai_confidence):
             return False
         if operation_active:
@@ -3182,9 +3187,19 @@ class TradingEngine:
                 self.loss_count += 1
             with self.lock:
                 self.trade_history.append(record)
-            confidence_value = float(evaluation.get('final_confidence', ai_confidence))
+            confidence_value = combined_confidence
             win_flag = trade_result == 'WIN'
             profit_value = float(pnl)
+            main_reason = str(consensus.get('main_reason', 'Sin motivo disponible'))
+            reason_summary = '; '.join(reasons)
+            notes = (
+                f"{symbol} | RSI: {latest_rsi:.2f} | EMA spread: {ema_spread:.5f} | "
+                f"Volatilidad: {volatilidad_actual:.5f} | Reason: {main_reason}"
+            )
+            if reason_summary:
+                notes = f"{notes} | Motivos: {reason_summary}"
+            ema_slope_value = float(evaluation.get('ema_diff', 0.0))
+            notes = f"{notes} | EMA slope: {ema_slope_value:.5f}"
             result_info = {
                 "hora": datetime.now().strftime("%H:%M:%S"),
                 "simbolo": symbol,
@@ -3192,7 +3207,7 @@ class TradingEngine:
                 "confianza": confidence_value,
                 "resultado": "GANADA" if win_flag else "PERDIDA",
                 "pnl": profit_value,
-                "nota": "",
+                "nota": notes,
                 "ticket": contract_id,
             }
             should_notify = True
@@ -3324,7 +3339,7 @@ class BotThread(QThread):
         self.engine = engine
         self._active = True
         self._closed_contracts: Set[int] = set()
-        self._result_logged_contracts: Set[int] = set()
+        self.logged_contracts: Set[int] = set()
         self._result_callback = self._handle_trade_result
         self.engine.add_result_listener(self._result_callback)
 
@@ -3339,7 +3354,8 @@ class BotThread(QThread):
     def _handle_trade_result(self, data: Dict[str, Any]) -> None:
         contract_id = self._normalize_contract_id(data.get("ticket") or data.get("contract_id"))
         if contract_id is not None:
-            logged_contracts = self._result_logged_contracts
+            self.logged_contracts = getattr(self, "logged_contracts", set())
+            logged_contracts = self.logged_contracts
             if contract_id in logged_contracts:
                 logging.debug(f"Duplicate contract {contract_id} ignored.")
                 return
@@ -3358,7 +3374,7 @@ class BotThread(QThread):
         logging.info("🚀 BotThread started successfully.")
         self._active = True
         self._closed_contracts.clear()
-        self._result_logged_contracts.clear()
+        self.logged_contracts.clear()
         try:
             self.engine.start_engine()
         except Exception as exc:
@@ -3390,7 +3406,7 @@ class BotThread(QThread):
         self.engine.stop()
         self.engine.remove_result_listener(self._result_callback)
         self._closed_contracts.clear()
-        self._result_logged_contracts.clear()
+        self.logged_contracts.clear()
 
 
 class BotWindow(QtWidgets.QWidget):
@@ -3839,6 +3855,7 @@ class BotWindow(QtWidgets.QWidget):
             return
         contract_id = self._normalize_contract_id(data.get("ticket") or data.get("contract_id"))
         if contract_id is not None:
+            self.logged_contracts = getattr(self, "logged_contracts", set())
             logged_contracts = self.logged_contracts
             if contract_id in logged_contracts:
                 logging.debug(f"Duplicate contract {contract_id} ignored.")
@@ -3864,9 +3881,7 @@ class BotWindow(QtWidgets.QWidget):
                 item.setData(QtCore.Qt.UserRole, contract_id)
             table.setItem(target_row, column, item)
         nota_text = str(data.get("nota", ""))
-        existing_note = table.item(target_row, 6)
-        if nota_text or existing_note is None:
-            table.setItem(target_row, 6, QtWidgets.QTableWidgetItem(nota_text))
+        table.setItem(target_row, 6, QtWidgets.QTableWidgetItem(nota_text))
         if contract_id is not None:
             self.pending_contracts.discard(contract_id)
         if table.rowCount() > 250:
@@ -3878,6 +3893,7 @@ class BotWindow(QtWidgets.QWidget):
         table = self.trade_table
         contract_id = self._normalize_contract_id(record.metadata.get('contract_id') if record.metadata else None)
         if contract_id is not None:
+            self.logged_contracts = getattr(self, "logged_contracts", set())
             logged_contracts = self.logged_contracts
             if contract_id in logged_contracts:
                 logging.debug(f"Duplicate contract {contract_id} ignored.")
