@@ -32,6 +32,7 @@ except ImportError:  # pragma: no cover
     gp_minimize = None  # type: ignore
 
 from PyQt5 import QtCore, QtGui, QtWidgets
+from PyQt5.QtCore import QThread, pyqtSignal
 
 try:
     import websocket  # type: ignore
@@ -2342,6 +2343,7 @@ class TradingEngine:
         self._status_listeners: List[Callable[[str], None]] = []
         self._summary_listeners: List[Callable[[str, Dict[str, Any]], None]] = []
         self._trade_state_listeners: List[Callable[[str], None]] = []
+        self._result_listeners: List[Callable[[Dict[str, Any]], None]] = []
         self._strategy_lock = threading.Lock()
         self.strategy_states: Dict[str, bool] = {name: True for name, _ in STRATEGY_FUNCTIONS}
         self.strategy_states["Divergence"] = True
@@ -2376,6 +2378,15 @@ class TradingEngine:
 
     def add_trade_state_listener(self, callback: Callable[[str], None]) -> None:
         self._trade_state_listeners.append(callback)
+
+    def add_result_listener(self, callback: Callable[[Dict[str, Any]], None]) -> None:
+        self._result_listeners.append(callback)
+
+    def remove_result_listener(self, callback: Callable[[Dict[str, Any]], None]) -> None:
+        try:
+            self._result_listeners.remove(callback)
+        except ValueError:
+            pass
 
     def set_trade_amount(self, value: float) -> None:
         self.trade_amount = max(0.1, float(value))
@@ -2456,6 +2467,13 @@ class TradingEngine:
                 callback(record, stats)
             except Exception as exc:
                 logging.debug(f"Error en escucha de operaciones: {exc}")
+
+    def _notify_trade_result(self, data: Dict[str, Any]) -> None:
+        for callback in list(self._result_listeners):
+            try:
+                callback(dict(data))
+            except Exception as exc:
+                logging.debug(f"Error en escucha de resultados: {exc}")
 
     def _notify_status(self, status: str) -> None:
         for callback in list(self._status_listeners):
@@ -3035,6 +3053,7 @@ class TradingEngine:
         features = evaluation['features']
         entry_price = float(evaluation['entry_price'])
         signal_source = evaluation['signal_source']
+        results: List[Tuple[str, StrategyResult]] = evaluation.get('results', [])
         if 'stake' not in evaluation:
             evaluation['stake'] = self._calculate_kelly_stake(evaluation.get('predicted_probability', 0.5))
         stake_amount = float(max(0.1, evaluation.get('stake', self.trade_amount)))
@@ -3118,6 +3137,20 @@ class TradingEngine:
                 self.loss_count += 1
             with self.lock:
                 self.trade_history.append(record)
+            confidence_value = float(evaluation.get('final_confidence', ai_confidence))
+            win_flag = trade_result == 'WIN'
+            profit_value = float(pnl)
+            result_info = {
+                "hora": datetime.now().strftime("%H:%M:%S"),
+                "simbolo": symbol,
+                "decision": signal,
+                "confianza": confidence_value,
+                "resultado": "GANADA" if win_flag else "PERDIDA",
+                "pnl": profit_value,
+                "nota": "",
+                "ticket": contract_id,
+            }
+            self._notify_trade_result(result_info)
             latest_rsi = float(evaluation['latest_rsi'])
             ema_spread = float(evaluation['ema_spread'])
             boll_width = float(evaluation['boll_width'])
@@ -3227,11 +3260,26 @@ class QtLogHandler(logging.Handler):
         self.emitter.message.emit(message)
 
 
-class TradingThread(QtCore.QThread):
+class BotThread(QThread):
+    log_signal = pyqtSignal(str)
+    result_signal = pyqtSignal(dict)
+
     def __init__(self, engine: TradingEngine) -> None:
         super().__init__()
         self.engine = engine
         self._active = True
+        self._result_callback = self._handle_trade_result
+        self.engine.add_result_listener(self._result_callback)
+
+    def _handle_trade_result(self, data: Dict[str, Any]) -> None:
+        ticket = data.get("ticket")
+        resultado = data.get("resultado", "-")
+        if ticket is not None:
+            mensaje = f"✅ Contrato #{ticket} {resultado}"
+        else:
+            mensaje = f"✅ Contrato {resultado}"
+        self.log_signal.emit(mensaje)
+        self.result_signal.emit(dict(data))
 
     def run(self) -> None:  # type: ignore[override]
         logging.info("🚀 BotThread started successfully.")
@@ -3255,15 +3303,17 @@ class TradingThread(QtCore.QThread):
                     logging.warning(f"⚠️ Cycle timeout ({elapsed:.2f}s) — forcing next iteration")
                 if not self._active or not self.engine.is_running():
                     break
-                QtCore.QThread.msleep(1500)
+                QThread.msleep(1500)
         finally:
             self.engine.stop()
+            self.engine.remove_result_listener(self._result_callback)
             logging.info("🧩 BotThread stopped.")
             self._active = False
 
     def stop(self) -> None:
         self._active = False
         self.engine.stop()
+        self.engine.remove_result_listener(self._result_callback)
 
 
 class BotWindow(QtWidgets.QWidget):
@@ -3315,7 +3365,7 @@ class BotWindow(QtWidgets.QWidget):
         for name, enabled in self.strategy_initial_state.items():
             self.engine.set_strategy_state(name, enabled)
 
-        self.thread: Optional[TradingThread] = None
+        self.bot_thread: Optional[BotThread] = None
         self.latest_stats: Dict[str, float] = {
             "operations": 0.0,
             "wins": 0.0,
@@ -3608,19 +3658,21 @@ class BotWindow(QtWidgets.QWidget):
         self._update_history_tab()
 
     def start_trading(self) -> None:
-        if self.thread is not None and self.thread.isRunning():
+        if self.bot_thread is not None and self.bot_thread.isRunning():
             return
         self.auto_shutdown_active = False
         self.engine.auto_shutdown_triggered = False
-        self.thread = TradingThread(self.engine)
-        self.thread.finished.connect(self._on_thread_finished)
-        self.thread.start()
+        self.bot_thread = BotThread(self.engine)
+        self.bot_thread.finished.connect(self._on_thread_finished)
+        self.bot_thread.log_signal.connect(self._append_log)
+        self.bot_thread.result_signal.connect(self.update_result_table)
+        self.bot_thread.start()
         self.start_button.setEnabled(False)
         self.stop_button.setEnabled(True)
         self.status_label.setText("Estado: Iniciando...")
 
     def stop_trading(self) -> None:
-        if self.thread is None:
+        if self.bot_thread is None:
             if self.auto_shutdown_active:
                 self.auto_shutdown_active = False
                 self.start_button.setEnabled(True)
@@ -3628,9 +3680,9 @@ class BotWindow(QtWidgets.QWidget):
                 self.status_label.setText("Estado: Detenido")
                 self._on_trade_state("ready")
             return
-        self.thread.stop()
-        self.thread.wait(2000)
-        self.thread = None
+        self.bot_thread.stop()
+        self.bot_thread.wait(2000)
+        self.bot_thread = None
         self.start_button.setEnabled(True)
         self.stop_button.setEnabled(False)
         self.status_label.setText("Estado: Detenido")
@@ -3651,7 +3703,7 @@ class BotWindow(QtWidgets.QWidget):
         self.engine.configure_auto_shutdown(habilitado, limite)
         if not habilitado and self.auto_shutdown_active:
             self.auto_shutdown_active = False
-            if self.thread is None:
+            if self.bot_thread is None:
                 self.start_button.setEnabled(True)
 
     def _on_kelly_toggled(self, checked: bool) -> None:
@@ -3660,6 +3712,47 @@ class BotWindow(QtWidgets.QWidget):
     def _reset_history_data(self) -> None:
         auto_learn.reset_history()
         QtCore.QTimer.singleShot(350, self._update_history_tab)
+
+    def update_result_table(self, data: Dict[str, Any]) -> None:
+        table = getattr(self, "trade_table", None)
+        if table is None:
+            return
+        target_row: Optional[int] = None
+        hora_text = str(data.get("hora", ""))
+        simbolo_text = str(data.get("simbolo", ""))
+        decision_text = str(data.get("decision", ""))
+        for index in range(table.rowCount()):
+            hora_item = table.item(index, 0)
+            simbolo_item = table.item(index, 1)
+            decision_item = table.item(index, 2)
+            if (
+                hora_item is not None
+                and simbolo_item is not None
+                and decision_item is not None
+                and hora_item.text() == hora_text
+                and simbolo_item.text() == simbolo_text
+                and decision_item.text() == decision_text
+            ):
+                target_row = index
+                break
+        if target_row is None:
+            target_row = table.rowCount()
+            table.insertRow(target_row)
+        confidence_value = float(data.get("confianza", 0.0))
+        pnl_value = float(data.get("pnl", 0.0))
+        entries = [
+            hora_text,
+            simbolo_text,
+            decision_text,
+            f"{confidence_value:.2f}",
+            str(data.get("resultado", "")),
+            f"{pnl_value:.2f}",
+        ]
+        for column, text in enumerate(entries):
+            table.setItem(target_row, column, QtWidgets.QTableWidgetItem(text))
+        nota_text = str(data.get("nota", ""))
+        if nota_text or table.item(target_row, 6) is None:
+            table.setItem(target_row, 6, QtWidgets.QTableWidgetItem(nota_text))
 
     def _on_trade(self, record: TradeRecord, stats: Dict[str, float]) -> None:
         self.latest_stats = stats
@@ -3727,7 +3820,7 @@ class BotWindow(QtWidgets.QWidget):
             self.trade_state_label.setText(texto)
 
     def _on_thread_finished(self) -> None:
-        self.thread = None
+        self.bot_thread = None
         if self.auto_shutdown_active:
             self.start_button.setEnabled(False)
             self.stop_button.setEnabled(True)
@@ -3906,9 +3999,9 @@ class BotWindow(QtWidgets.QWidget):
                 self.history_list.addItem(item)
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # type: ignore[override]
-        if self.thread is not None and self.thread.isRunning():
-            self.thread.stop()
-            self.thread.wait(2000)
+        if self.bot_thread is not None and self.bot_thread.isRunning():
+            self.bot_thread.stop()
+            self.bot_thread.wait(2000)
         logging.getLogger().removeHandler(self.log_handler)
         super().closeEvent(event)
 
