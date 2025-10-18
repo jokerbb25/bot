@@ -341,8 +341,7 @@ class auto_learning:
         self.reinforce_batches = 0
         self.optimize_batches = 0
         self.learning_event = threading.Event()
-        self.learning_thread = threading.Thread(target=self._learning_loop, daemon=True)
-        self.learning_thread.start()
+        self.learning_thread: Optional[threading.Thread] = None
         self._pending_context: Dict[str, Dict[str, float]] = {}
         self.symbol_profiles: Dict[str, Dict[str, Any]] = {
             symbol: self._default_symbol_profile() for symbol in SYMBOLS
@@ -382,11 +381,43 @@ class auto_learning:
                     state["RSI"] = 0.0
                     state["EMA"] = 0.0
                     state["last_result"] = "LOSS"
+        self.maintain_selective_memory()
         save_biases(self.biases)
 
     def _persist_biases(self) -> None:
         with self.bias_lock:
             save_biases(self.biases)
+
+    def start_background_services(self) -> None:
+        if self.learning_thread is None or not self.learning_thread.is_alive():
+            self.learning_thread = threading.Thread(
+                target=self._learning_loop,
+                daemon=True,
+            )
+            self.learning_thread.start()
+        if self._telegram_thread is None or not self._telegram_thread.is_alive():
+            self._telegram_thread = threading.Thread(
+                target=telegram_listener,
+                args=(self,),
+                daemon=True,
+            )
+            self._telegram_thread.start()
+
+    def maintain_selective_memory(self) -> None:
+        preserved = 0
+        with self.bias_lock:
+            for state in self.biases.values():
+                if str(state.get("last_result", "")).upper() == "WIN":
+                    preserved += 1
+                else:
+                    state["RSI"] = 0.0
+                    state["EMA"] = 0.0
+                    state["last_result"] = "LOSS"
+        save_biases(self.biases)
+        logging.info(
+            "🧠 Selective memory active: %d winning biases preserved",
+            preserved,
+        )
 
     def _default_symbol_profile(self) -> Dict[str, Any]:
         return {
@@ -907,7 +938,7 @@ class auto_learning:
                             state["RSI"] = 0.0
                             state["EMA"] = 0.0
                             state["last_result"] = "LOSS"
-                save_biases(self.biases)
+                self.maintain_selective_memory()
                 logging.info(
                     "✅ Selective memory cleanup complete — losing biases removed."
                 )
@@ -1475,7 +1506,7 @@ class auto_learning:
             "per_asset": per_asset,
             "global_accuracy": global_accuracy,
             "last_trades": list(reversed(historial)),
-            "status": self.learning_thread.is_alive(),
+            "status": bool(self.learning_thread and self.learning_thread.is_alive()),
             "biases": bias_snapshot,
             "last_prediction": self.last_prediction,
             "symbol_tuning": tuning,
@@ -2505,12 +2536,7 @@ class TradingEngine:
         self.last_symbol: Optional[str] = None
         self.last_result: Optional[str] = None
         self.last_confidence: float = 0.0
-        self._telegram_thread = threading.Thread(
-            target=telegram_listener,
-            args=(self,),
-            daemon=True,
-        )
-        self._telegram_thread.start()
+        self._telegram_thread: Optional[threading.Thread] = None
 
     def add_trade_listener(self, callback: Callable[[TradeRecord, Dict[str, float]], None]) -> None:
         self._trade_listeners.append(callback)
@@ -3682,6 +3708,9 @@ class BotWindow(QtWidgets.QWidget):
             """
         )
 
+        self.log_view = QtWidgets.QPlainTextEdit()
+        self.log_view.setReadOnly(True)
+
         self.bridge = EngineBridge()
         self.bridge.trade.connect(self._on_trade)
         self.bridge.status.connect(self._on_status)
@@ -3729,6 +3758,7 @@ class BotWindow(QtWidgets.QWidget):
         self.logged_contracts: Set[int] = set()
         self.pending_contracts: Set[int] = set()
         self.learning_enabled = True
+        self._background_initialized = False
 
         self._build_ui()
 
@@ -3752,6 +3782,12 @@ class BotWindow(QtWidgets.QWidget):
         self._build_settings_tab()
         self._build_learning_tab()
         self._initialize_asset_summary()
+
+    def initialize_background_services(self) -> None:
+        if self._background_initialized:
+            return
+        self.engine.start_background_services()
+        self._background_initialized = True
 
     def _build_general_tab(self) -> None:
         tab = QtWidgets.QWidget()
@@ -3823,8 +3859,6 @@ class BotWindow(QtWidgets.QWidget):
         self.trade_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         vbox.addWidget(self.trade_table, 1)
 
-        self.log_view = QtWidgets.QPlainTextEdit()
-        self.log_view.setReadOnly(True)
         vbox.addWidget(self.log_view, 1)
 
     def _build_strategies_tab(self) -> None:
@@ -4345,8 +4379,16 @@ class BotWindow(QtWidgets.QWidget):
         self._on_trade_state("ready")
 
     def _append_log(self, message: str) -> None:
-        self.log_view.appendPlainText(message)
-        self.log_view.verticalScrollBar().setValue(self.log_view.verticalScrollBar().maximum())
+        try:
+            if hasattr(self, "log_view") and self.log_view:
+                self.log_view.appendPlainText(message)
+                self.log_view.verticalScrollBar().setValue(
+                    self.log_view.verticalScrollBar().maximum()
+                )
+            else:
+                print(message)
+        except Exception as exc:
+            print(f"[LogError] {exc}: {message}")
 
     def _update_stats_labels(self, stats: Dict[str, float]) -> None:
         self.stats_values["Operaciones"].setText(str(int(stats.get("operations", 0.0))))
@@ -4526,6 +4568,7 @@ def main() -> None:
     app = QtWidgets.QApplication(sys.argv)
     window = BotWindow()
     window.show()
+    window.initialize_background_services()
     app.exec_()
 
 
