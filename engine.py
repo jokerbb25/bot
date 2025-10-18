@@ -1,0 +1,228 @@
+"""Adaptive confidence evaluation engine.
+
+This module computes the trade confidence by combining strategy alignment
+with adaptive adjustments driven by volatility, market regime, and
+historical performance. The surrounding trading logic, GUI, and threading
+layers consume the resulting metrics without alteration.
+"""
+from __future__ import annotations
+
+import json
+import logging
+import time
+from dataclasses import dataclass
+from pathlib import Path
+from typing import Dict, Iterable, Optional, Sequence, Tuple
+
+import numpy as np
+
+from ai_calibrator import ConfidenceCalibrator
+from strategy_base import StrategyResult, StrategySnapshot
+
+MIN_CONFIDENCE = 0.65
+SOFT_LOWER_BOUND = 0.55
+CONFIDENCE_THRESHOLD = 0.70
+VOLATILITY_MIN = 0.0002
+VOLATILITY_MAX = 0.002
+VOLATILITY_LOW_INFLUENCE = 0.0005
+VOLATILITY_HIGH_INFLUENCE = 0.0012
+STAKE_REDUCTION_THRESHOLD = 0.0005
+LOW_VOLATILITY_STAKE_FACTOR = 0.5
+DEFAULT_SUCCESS_RATE = 0.5
+CONFIDENCE_MEMORY_PATH = Path("confidence_memory.json")
+
+calibrator = ConfidenceCalibrator()
+
+
+def _load_confidence_memory() -> Dict[str, float]:
+    if not CONFIDENCE_MEMORY_PATH.exists():
+        return {}
+    try:
+        with CONFIDENCE_MEMORY_PATH.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (json.JSONDecodeError, OSError):
+        return {}
+    cleaned: Dict[str, float] = {}
+    for symbol, value in data.items():
+        try:
+            cleaned[symbol] = float(np.clip(float(value), 0.0, 1.0))
+        except (TypeError, ValueError):
+            continue
+    return cleaned
+
+
+def _save_confidence_memory(memory: Dict[str, float]) -> None:
+    try:
+        with CONFIDENCE_MEMORY_PATH.open("w", encoding="utf-8") as handle:
+            json.dump(memory, handle, ensure_ascii=False, indent=2)
+    except OSError:
+        pass
+
+
+_confidence_memory: Dict[str, float] = _load_confidence_memory()
+
+
+@dataclass(slots=True)
+class EvaluationResult:
+    final_confidence: float
+    base_confidence: float
+    allow_trade: bool
+    strong_signals: int
+    aligned_strategies: int
+    active_strategies: int
+    volatility_weight: float
+    regime_weight: float
+    historical_weight: float
+    valid_volatility: bool
+    consensus_direction: Optional[str]
+    skip_reason: Optional[str]
+    stake: float
+    cooldown_until: Optional[float]
+
+
+def _consensus_direction(results: Sequence[StrategyResult]) -> Tuple[Optional[str], int]:
+    call_count = sum(1 for result in results if result.normalized_signal() == "CALL")
+    put_count = sum(1 for result in results if result.normalized_signal() == "PUT")
+    if call_count == 0 and put_count == 0:
+        return None, 0
+    if call_count >= put_count:
+        return "CALL", call_count
+    return "PUT", put_count
+
+
+def _volatility_weight(volatility: float) -> float:
+    if volatility < VOLATILITY_LOW_INFLUENCE:
+        return 0.9
+    if volatility > VOLATILITY_HIGH_INFLUENCE:
+        return 1.05
+    return 1.0
+
+
+def _regime_weight(regime: str) -> float:
+    normalized = regime.strip().upper()
+    if normalized in {"TRENDING", "TREND"}:
+        return 1.05
+    if normalized in {"RANGING", "RANGE"}:
+        return 0.95
+    return 1.0
+
+
+def _success_rate(symbol: str) -> float:
+    return float(_confidence_memory.get(symbol, DEFAULT_SUCCESS_RATE))
+
+
+def _update_success_memory(symbol: str, result: str) -> None:
+    normalized = (result or "").strip().upper()
+    if normalized not in {"WIN", "LOSS"}:
+        return
+    current = _confidence_memory.get(symbol, DEFAULT_SUCCESS_RATE)
+    if normalized == "WIN":
+        updated = current * 1.02
+    else:
+        updated = current * 0.98
+    updated = float(np.clip(updated, 0.0, 1.0))
+    _confidence_memory[symbol] = updated
+    _save_confidence_memory(_confidence_memory)
+
+
+def _strong_signal_count(results: Iterable[StrategyResult]) -> int:
+    return sum(1 for result in results if result.strong_alignment())
+
+
+def evaluate_snapshot(snapshot: StrategySnapshot) -> EvaluationResult:
+    active_results = list(snapshot.active_signals())
+    active_count = len(active_results)
+    strong_count = _strong_signal_count(active_results)
+    consensus_direction, aligned_count = _consensus_direction(active_results)
+
+    if active_count == 0:
+        base_confidence = 0.0
+    else:
+        base_confidence = float(aligned_count / active_count)
+
+    volatility = float(snapshot.volatility or 0.0)
+    volatility_weight = _volatility_weight(volatility) if volatility else 1.0
+    regime_weight = _regime_weight(snapshot.regime)
+    success_rate = _success_rate(snapshot.symbol)
+    historical_weight = 0.9 + (0.2 * success_rate)
+
+    try:
+        final_confidence = base_confidence * volatility_weight * regime_weight * historical_weight
+    except Exception:
+        final_confidence = base_confidence
+
+    final_confidence = float(np.clip(final_confidence, 0.0, 1.0))
+
+    valid_volatility = False
+    if volatility:
+        valid_volatility = VOLATILITY_MIN < volatility < VOLATILITY_MAX
+
+    stake = float(snapshot.base_stake)
+    if valid_volatility and volatility < STAKE_REDUCTION_THRESHOLD:
+        stake *= LOW_VOLATILITY_STAKE_FACTOR
+        logging.info("⚠️ Low volatility (%s) → reducing stake to %.4f", f"{volatility:.5f}", stake)
+
+    allow_trade = False
+    skip_reason: Optional[str] = None
+
+    if final_confidence < SOFT_LOWER_BOUND:
+        skip_reason = "confidence_floor"
+    elif final_confidence < CONFIDENCE_THRESHOLD:
+        calibrator.passive_update(snapshot.symbol, final_confidence)
+        skip_reason = "confidence_soft_zone"
+    else:
+        allow_trade = True
+
+    if allow_trade and not valid_volatility:
+        allow_trade = False
+        skip_reason = "invalid_volatility"
+
+    if allow_trade and (consensus_direction is None or aligned_count < 3):
+        allow_trade = False
+        skip_reason = "insufficient_alignment"
+
+    current_time = snapshot.current_time or time.time()
+    cooldown_until: Optional[float] = None
+
+    if snapshot.cooldowns:
+        existing = float(snapshot.cooldowns.get(snapshot.symbol, 0.0) or 0.0)
+        if existing > current_time:
+            allow_trade = False
+            cooldown_until = existing
+            skip_reason = skip_reason or "cooldown_active"
+
+    if snapshot.consecutive_losses:
+        losses = int(snapshot.consecutive_losses.get(snapshot.symbol, 0))
+    else:
+        losses = 0
+    if losses >= 3:
+        cooldown_until = max(cooldown_until or 0.0, current_time + 120.0)
+        allow_trade = False
+        skip_reason = skip_reason or "cooldown_triggered"
+
+    if snapshot.trades_count and snapshot.trades_count % 30 == 0:
+        calibrator.rebalance()
+
+    if snapshot.result_available and snapshot.trade_result:
+        calibrator.update(final_confidence, snapshot.trade_result, snapshot.symbol)
+        _update_success_memory(snapshot.symbol, snapshot.trade_result)
+
+    return EvaluationResult(
+        final_confidence=final_confidence,
+        base_confidence=base_confidence,
+        allow_trade=allow_trade,
+        strong_signals=strong_count,
+        aligned_strategies=aligned_count,
+        active_strategies=active_count,
+        volatility_weight=volatility_weight,
+        regime_weight=regime_weight,
+        historical_weight=historical_weight,
+        valid_volatility=valid_volatility,
+        consensus_direction=consensus_direction,
+        skip_reason=skip_reason,
+        stake=stake,
+        cooldown_until=cooldown_until,
+    )
+
+
+__all__ = ["EvaluationResult", "evaluate_snapshot", "CONFIDENCE_THRESHOLD", "SOFT_LOWER_BOUND", "MIN_CONFIDENCE"]
