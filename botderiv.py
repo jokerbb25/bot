@@ -34,6 +34,7 @@ except ImportError:  # pragma: no cover
 from PyQt5 import QtCore, QtGui, QtWidgets
 from PyQt5.QtCore import QThread, pyqtSignal
 from aprendizaje import Aprendizaje
+from telegram_bot import BOT_ACTIVE, send_message, telegram_listener
 
 try:
     import websocket  # type: ignore
@@ -84,6 +85,46 @@ RESULT_POLL_INTERVAL = 5
 RESUME_MESSAGE = "🔁 Reanudando análisis del mercado..."
 
 CSV_LOGGED_CONTRACTS: Set[int] = set()
+BIAS_MEMORY_PATH = Path("bias_memory.json")
+
+
+def load_biases() -> Dict[str, Dict[str, Any]]:
+    if not BIAS_MEMORY_PATH.exists():
+        return {}
+    try:
+        with BIAS_MEMORY_PATH.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        return {str(symbol): dict(state) for symbol, state in data.items()}
+    except Exception as exc:  # pragma: no cover
+        logging.debug(f"No se pudo cargar sesgos almacenados: {exc}")
+        return {}
+
+
+def save_biases(biases: Dict[str, Dict[str, Any]]) -> None:
+    payload: Dict[str, Dict[str, Any]] = {}
+    for symbol, state in biases.items():
+        payload[symbol] = {
+            "RSI": float(state.get("RSI", 0.0)),
+            "EMA": float(state.get("EMA", 0.0)),
+            "last_result": state.get("last_result", "NONE"),
+        }
+    try:
+        with BIAS_MEMORY_PATH.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle)
+    except Exception as exc:  # pragma: no cover
+        logging.debug(f"No se pudo guardar sesgos: {exc}")
+
+
+def selective_memory_recovery(saved_biases: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    filtered_biases: Dict[str, Dict[str, Any]] = {}
+    for symbol, data in saved_biases.items():
+        if data.get("last_result") == "WIN":
+            filtered_biases[symbol] = data
+    logging.info(
+        "🧠 Selective memory active: %d winning biases preserved",
+        len(filtered_biases),
+    )
+    return filtered_biases
 
 
 # ===============================================================
@@ -264,8 +305,9 @@ class auto_learning:
         self.training_labels: List[int] = []
         self.trade_counter = 0
         self.model: Optional[RandomForestClassifier] = None
-        self.biases: Dict[str, Dict[str, float]] = {
-            symbol: {"RSI": 0.0, "EMA": 0.0} for symbol in SYMBOLS
+        self.biases: Dict[str, Dict[str, Any]] = {
+            symbol: {"RSI": 0.0, "EMA": 0.0, "last_result": "NONE"}
+            for symbol in SYMBOLS
         }
         self.last_signal: Dict[str, Dict[str, str]] = {
             symbol: {"source": "COMBINED"} for symbol in SYMBOLS
@@ -309,6 +351,7 @@ class auto_learning:
             profile["learning_rate"] = self.learning_rate
         self._current_symbol: Optional[str] = None
         self._ensure_csv()
+        self._load_bias_storage()
     def _ensure_csv(self) -> None:
         if self.csv_path.exists():
             return
@@ -321,6 +364,29 @@ class auto_learning:
                     writer.writeheader()
             except Exception as exc:  # pragma: no cover
                 logging.debug(f"No se pudo crear CSV de autoaprendizaje: {exc}")
+
+    def _load_bias_storage(self) -> None:
+        stored = load_biases()
+        if not stored:
+            save_biases(self.biases)
+            return
+        cleaned = selective_memory_recovery(stored)
+        with self.bias_lock:
+            for symbol, state in self.biases.items():
+                if symbol in cleaned:
+                    data = cleaned[symbol]
+                    state["RSI"] = float(data.get("RSI", state.get("RSI", 0.0)))
+                    state["EMA"] = float(data.get("EMA", state.get("EMA", 0.0)))
+                    state["last_result"] = data.get("last_result", "WIN")
+                else:
+                    state["RSI"] = 0.0
+                    state["EMA"] = 0.0
+                    state["last_result"] = "LOSS"
+        save_biases(self.biases)
+
+    def _persist_biases(self) -> None:
+        with self.bias_lock:
+            save_biases(self.biases)
 
     def _default_symbol_profile(self) -> Dict[str, Any]:
         return {
@@ -783,9 +849,13 @@ class auto_learning:
             adjusted_rsi_value = float(rsi_value + (symbol_params.get("rsi_period", 14.0) - 14.0) * 0.5)
             adjusted_ema_value = float(ema_value + symbol_params.get("ema_tolerance", 0.0) * 0.1)
             with self.bias_lock:
-                bias_state = self.biases.setdefault(asset, {"RSI": 0.0, "EMA": 0.0})
+                bias_state = self.biases.setdefault(
+                    asset,
+                    {"RSI": 0.0, "EMA": 0.0, "last_result": "NONE"},
+                )
                 rsi_bias = float(bias_state.get("RSI", 0.0))
                 ema_bias = float(bias_state.get("EMA", 0.0))
+                bias_state["last_result"] = resultado
             trade_entry = {
                 "asset": asset,
                 "direction": direction,
@@ -821,6 +891,26 @@ class auto_learning:
                     self.training_data = self.training_data[-5000:]
                     self.training_labels = self.training_labels[-5000:]
             self.trade_counter += 1
+            self._persist_biases()
+            if self.trade_counter % 50 == 0:
+                logging.info("🧹 Running selective memory cleanup...")
+                saved_biases = load_biases()
+                cleaned_biases = selective_memory_recovery(saved_biases)
+                with self.bias_lock:
+                    for symbol, state in self.biases.items():
+                        if symbol in cleaned_biases:
+                            data = cleaned_biases[symbol]
+                            state["RSI"] = float(data.get("RSI", 0.0))
+                            state["EMA"] = float(data.get("EMA", 0.0))
+                            state["last_result"] = data.get("last_result", "WIN")
+                        else:
+                            state["RSI"] = 0.0
+                            state["EMA"] = 0.0
+                            state["last_result"] = "LOSS"
+                save_biases(self.biases)
+                logging.info(
+                    "✅ Selective memory cleanup complete — losing biases removed."
+                )
             if self.trade_counter % 100 == 0 and self.trade_counter > 0:
                 should_train = True
             row_payload = {
@@ -993,7 +1083,10 @@ class auto_learning:
         elif direction == "PUT" and price_delta > 0:
             direction_error = True
         with self.bias_lock:
-            bias_state = self.biases.setdefault(symbol, {"RSI": 0.0, "EMA": 0.0})
+            bias_state = self.biases.setdefault(
+                symbol,
+                {"RSI": 0.0, "EMA": 0.0, "last_result": "NONE"},
+            )
             if source == "RSI":
                 bias_state["RSI"] += -0.02 if direction_error else 0.02
             elif source == "EMA":
@@ -1006,10 +1099,12 @@ class auto_learning:
             bias_state["EMA"] = float(np.clip(bias_state["EMA"], -2.0, 2.0))
             rsi_bias = float(bias_state["RSI"])
             ema_bias = float(bias_state["EMA"])
+            bias_state["last_result"] = outcome
         logging.info(
             f"🧠 Bias adjusted [{symbol}] Source={source} RSI={rsi_bias:.2f} EMA={ema_bias:.2f}"
         )
         self.log_bias_update(symbol, outcome, direction, price_delta, source)
+        self._persist_biases()
         self.learning_event.set()
 
     def log_bias_update(
@@ -1023,7 +1118,10 @@ class auto_learning:
         timestamp_now = datetime.now(timezone.utc).isoformat()
         source_label = source or self.last_signal.get(symbol, {}).get("source", "COMBINED")
         with self.bias_lock:
-            bias_state = self.biases.setdefault(symbol, {"RSI": 0.0, "EMA": 0.0})
+            bias_state = self.biases.setdefault(
+                symbol,
+                {"RSI": 0.0, "EMA": 0.0, "last_result": "NONE"},
+            )
             rsi_bias = float(bias_state.get("RSI", 0.0))
             ema_bias = float(bias_state.get("EMA", 0.0))
         self._ensure_csv()
@@ -1320,7 +1418,7 @@ class auto_learning:
             if simbolo and simbolo in self.biases:
                 bias_state = self.biases[simbolo]
             else:
-                bias_state = {"RSI": 0.0, "EMA": 0.0}
+                bias_state = {"RSI": 0.0, "EMA": 0.0, "last_result": "NONE"}
             rsi_bias = float(bias_state.get("RSI", 0.0))
             ema_bias = float(bias_state.get("EMA", 0.0))
         features = np.array(
@@ -1357,7 +1455,11 @@ class auto_learning:
         with self.bias_lock:
             for nombre in SYMBOLS:
                 if nombre not in self.biases:
-                    self.biases[nombre] = {"RSI": 0.0, "EMA": 0.0}
+                    self.biases[nombre] = {
+                        "RSI": 0.0,
+                        "EMA": 0.0,
+                        "last_result": "NONE",
+                    }
             bias_snapshot = {
                 symbol: {
                     "RSI": float(state.get("RSI", 0.0)),
@@ -1402,7 +1504,11 @@ class auto_learning:
             except Exception as exc:  # pragma: no cover
                 logging.debug(f"No se pudo eliminar CSV de autoaprendizaje: {exc}")
         with self.bias_lock:
-            self.biases = {symbol: {"RSI": 0.0, "EMA": 0.0} for symbol in SYMBOLS}
+            self.biases = {
+                symbol: {"RSI": 0.0, "EMA": 0.0, "last_result": "NONE"}
+                for symbol in SYMBOLS
+            }
+        self._persist_biases()
         with self.model_lock:
             self.model = None
         self.last_prediction = 0.5
@@ -2393,6 +2499,18 @@ class TradingEngine:
         self._closed_lock = threading.Lock()
         self._closed_contracts: Set[int] = set()
         self._next_cycle_time = 0.0
+        self.total_operations = 0
+        self.win_operations = 0
+        self.last_contract_id: Optional[int] = None
+        self.last_symbol: Optional[str] = None
+        self.last_result: Optional[str] = None
+        self.last_confidence: float = 0.0
+        self._telegram_thread = threading.Thread(
+            target=telegram_listener,
+            args=(self,),
+            daemon=True,
+        )
+        self._telegram_thread.start()
 
     def add_trade_listener(self, callback: Callable[[TradeRecord, Dict[str, float]], None]) -> None:
         self._trade_listeners.append(callback)
@@ -2472,6 +2590,21 @@ class TradingEngine:
 
     def set_learning_enabled(self, enabled: bool) -> None:
         self.learning_enabled = bool(enabled)
+
+    def get_accuracy(self) -> float:
+        total = self.win_count + self.loss_count
+        if total == 0:
+            return 0.0
+        return (self.win_count / total) * 100.0
+
+    def get_last_contract_info(self) -> str:
+        if self.last_contract_id is None:
+            return "No trades executed yet."
+        symbol = self.last_symbol or "N/A"
+        result = self.last_result or "N/A"
+        return (
+            f"#{self.last_contract_id} | {symbol} | {result} | Conf {self.last_confidence:.2f}"
+        )
 
     def _estimate_balance(self) -> float:
         return max(100.0, self.initial_balance + self.risk.total_pnl)
@@ -2987,6 +3120,10 @@ class TradingEngine:
     def scan_market(self) -> None:
         if not self.running.is_set():
             return
+        if not BOT_ACTIVE:
+            logging.info("⏸ Bot paused — waiting for Telegram resume command.")
+            time.sleep(5)
+            return
         now = time.time()
         if now < self._next_cycle_time:
             QtWidgets.QApplication.processEvents(QtCore.QEventLoop.AllEvents, 50)
@@ -3279,6 +3416,13 @@ class TradingEngine:
             volatilidad_actual = float(evaluation['volatility'])
             confidence_value = combined_confidence
             win_flag = trade_result == 'WIN'
+            self.total_operations += 1
+            if win_flag:
+                self.win_operations += 1
+            self.last_contract_id = contract_id
+            self.last_symbol = symbol
+            self.last_result = trade_result
+            self.last_confidence = confidence_value
             profit_value = float(pnl)
             main_reason = str(consensus.get('main_reason', 'Sin motivo disponible'))
             reason_summary = '; '.join(reasons)
@@ -3305,6 +3449,10 @@ class TradingEngine:
                 logging.debug(f"Contract {contract_id} already closed. Skipping duplicate log.")
                 should_notify = False
             if should_notify:
+                ticket_label = f"#{contract_id}" if contract_id is not None else "N/A"
+                send_message(
+                    f"🎯 {symbol} | Result: {trade_result} | Confidence: {confidence_value:.2f} | Ticket {ticket_label}"
+                )
                 self._notify_trade_result(result_info)
             exit_price = self._fetch_exit_price(symbol, entry_price)
             price_change = float(exit_price - entry_price)

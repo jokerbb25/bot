@@ -1,16 +1,21 @@
-import numpy as np
+import json
+import os
 import logging
 from datetime import datetime, timedelta
 
+import numpy as np
+
 
 class Aprendizaje:
-    def __init__(self) -> None:
+    def __init__(self, save_path: str = "aprendizaje_data.json") -> None:
+        self.save_path = save_path
         self.weights = {}
         self.rsi_bias = {}
         self.loss_streak = 0
         self.win_streak = 0
         self.cooldown_until = None
         self.total_operations = 0
+        self.load_data()
 
     def apply_learning_feedback(
         self,
@@ -40,18 +45,21 @@ class Aprendizaje:
         confidence = min(confidence, 0.85)
         if volatility < 0.0008 or confidence < 0.65 or conflicts > 0:
             logging.info("🚫 Skipping trade: low confidence or volatility")
+            self.save_data()
             return None
         if self.loss_streak >= 2:
             self.cooldown_until = datetime.now() + timedelta(minutes=10)
             logging.info("⏸️ Cooldown activated for 10 minutes after 2 consecutive losses")
         if self.cooldown_until and datetime.now() < self.cooldown_until:
             logging.info("⏳ Skipping trade — cooldown active")
+            self.save_data()
             return None
         self.total_operations += 1
         if self.total_operations % 50 == 0:
             self.clean_rsi_biases()
         if self.win_streak >= 3 and symbol in self.rsi_bias:
             self.rsi_bias[symbol] *= 0.9
+        self.save_data()
         return confidence
 
     def clean_rsi_biases(self) -> None:
@@ -59,3 +67,31 @@ class Aprendizaje:
             if abs(bias) > 8 or np.isnan(bias):
                 self.rsi_bias[symbol] = 0
                 logging.info(f"🧹 RSI bias reset for {symbol}")
+
+    def save_data(self) -> None:
+        data = {
+            "weights": self.weights,
+            "rsi_bias": self.rsi_bias,
+            "total_operations": self.total_operations,
+        }
+        try:
+            with open(self.save_path, "w", encoding="utf-8") as handle:
+                json.dump(data, handle)
+        except Exception as exc:
+            logging.debug(f"No se pudo guardar aprendizaje: {exc}")
+
+    def load_data(self) -> None:
+        if not os.path.exists(self.save_path):
+            logging.info("ℹ️ No previous learning data found. Starting fresh.")
+            return
+        try:
+            with open(self.save_path, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+            self.weights = data.get("weights", {})
+            self.rsi_bias = data.get("rsi_bias", {})
+            self.total_operations = data.get("total_operations", 0)
+            logging.info(
+                f"✅ Learning data loaded ({int(self.total_operations)} operations)"
+            )
+        except Exception as exc:
+            logging.debug(f"No se pudo cargar aprendizaje: {exc}")
