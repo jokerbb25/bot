@@ -3565,6 +3565,11 @@ class BotWindow(QtWidgets.QWidget):
         self.refresh_timer.timeout.connect(self._refresh_phase)
         self.refresh_timer.start()
 
+        self.learning_timer = QtCore.QTimer(self)
+        self.learning_timer.setInterval(3000)
+        self.learning_timer.timeout.connect(self.update_learning_tab)
+        self.learning_timer.start()
+
     def _build_ui(self) -> None:
         layout = QtWidgets.QVBoxLayout(self)
         self.tabs = QtWidgets.QTabWidget()
@@ -3574,6 +3579,7 @@ class BotWindow(QtWidgets.QWidget):
         self._build_asset_summary_tab()
         self._build_settings_tab()
         self._build_history_tab()
+        self._build_learning_tab()
         self._initialize_asset_summary()
 
     def _build_general_tab(self) -> None:
@@ -3830,6 +3836,75 @@ class BotWindow(QtWidgets.QWidget):
         layout.addLayout(button_layout)
         self.reset_history_button.clicked.connect(self._reset_history_data)
         self._update_history_tab()
+
+    def _build_learning_tab(self) -> None:
+        self.tab_learning = QtWidgets.QWidget()
+        self.tabs.addTab(self.tab_learning, "Aprendizaje")
+        layout = QtWidgets.QVBoxLayout(self.tab_learning)
+
+        self.label_operations = QtWidgets.QLabel("Operaciones totales: 0")
+        self.label_precision = QtWidgets.QLabel("Precisión actual: 0.00%")
+        self.label_confidence = QtWidgets.QLabel("Confianza promedio: 0.00")
+        self.label_progress = QtWidgets.QLabel("Progreso adaptativo: 0.00%")
+        self.label_mode = QtWidgets.QLabel("Modo: Pasivo")
+
+        self.progress_bar = QtWidgets.QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+
+        layout.addWidget(self.label_operations)
+        layout.addWidget(self.label_precision)
+        layout.addWidget(self.label_confidence)
+        layout.addWidget(self.label_progress)
+        layout.addWidget(self.label_mode)
+        layout.addWidget(self.progress_bar)
+        layout.addStretch(1)
+
+    def update_learning_tab(self) -> None:
+        try:
+            engine = getattr(self, "engine", None)
+            if engine is None:
+                return
+
+            wins = getattr(engine, "win_count", 0)
+            losses = getattr(engine, "loss_count", 0)
+            total_ops = int(wins + losses)
+
+            precision = 0.0
+            if total_ops > 0:
+                precision = (wins / total_ops) * 100.0
+
+            confidences = []
+            history = getattr(engine, "trade_history", [])
+            for record in history[-100:]:
+                confidence_value = getattr(record, "confidence", None)
+                if confidence_value is not None:
+                    confidences.append(float(confidence_value))
+
+            if confidences:
+                avg_conf = float(np.mean(confidences))
+            else:
+                avg_conf = 0.0
+
+            progress = 0.0
+            if total_ops > 0:
+                progress = min(100.0, (total_ops / 100.0) * max(avg_conf, 0.0) * 100.0)
+
+            mode = "Pasivo"
+            if total_ops > 70:
+                mode = "Estable"
+            elif total_ops > 30:
+                mode = "Aprendizaje"
+
+            self.label_operations.setText(f"Operaciones totales: {total_ops}")
+            self.label_precision.setText(f"Precisión actual: {precision:.2f}%")
+            self.label_confidence.setText(f"Confianza promedio: {avg_conf:.2f}")
+            self.label_progress.setText(f"Progreso adaptativo: {progress:.2f}%")
+            self.label_mode.setText(f"Modo: {mode}")
+            self.progress_bar.setValue(int(progress))
+
+        except Exception as exc:
+            print(f"[LearningTab] Update error: {exc}")
 
     def start_trading(self) -> None:
         if self.bot_thread is not None and self.bot_thread.isRunning():
