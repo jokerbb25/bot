@@ -127,6 +127,78 @@ def selective_memory_recovery(saved_biases: Dict[str, Dict[str, Any]]) -> Dict[s
     return filtered_biases
 
 
+global_engine = None
+
+
+def telegram_bot() -> None:
+    global BOT_ACTIVE, global_engine
+    token = "8300367826:AAGzaMCJRY6pzZEqzjqgzAaRUXC_19KcB60"
+    chat_id = "8364256476"
+    logging.info("🤖 Telegram bot active and listening...")
+
+    def _send_text(text: str) -> None:
+        url = f"https://api.telegram.org/bot{token}/sendMessage"
+        payload = {"chat_id": chat_id, "text": text}
+        try:
+            requests.post(url, data=payload, timeout=5)
+        except Exception as exc:
+            logging.error(f"❌ Telegram send error: {exc}")
+
+    offset: Optional[int] = None
+    while True:
+        try:
+            params: Dict[str, Any] = {"timeout": 10}
+            if offset is not None:
+                params["offset"] = offset
+            response = requests.get(
+                f"https://api.telegram.org/bot{token}/getUpdates",
+                params=params,
+                timeout=15,
+            )
+            payload = response.json()
+            if not payload.get("ok"):
+                time.sleep(5)
+                continue
+            for update in payload.get("result", []):
+                offset = update.get("update_id", 0) + 1
+                message = (update.get("message") or {}).get("text", "")
+                if not message:
+                    continue
+                command = message.lower()
+                if "pause" in command or "stop" in command:
+                    BOT_ACTIVE = False
+                    _send_text("⏸ Bot paused by user.")
+                elif "resume" in command or "start" in command:
+                    BOT_ACTIVE = True
+                    _send_text("▶ Bot resumed.")
+                elif "status" in command:
+                    engine_ref = global_engine
+                    if engine_ref is not None:
+                        precision = engine_ref.get_accuracy()
+                        operations = engine_ref.total_operations
+                        _send_text(
+                            f"📊 Status:\nPrecision: {precision:.2f}%\nOperations: {int(operations)}"
+                        )
+                    else:
+                        _send_text("ℹ️ Engine not ready yet.")
+                elif "help" in command:
+                    _send_text(
+                        "🧠 Commands:\n- pause\n- resume\n- status\n- info"
+                    )
+                elif "info" in command:
+                    engine_ref = global_engine
+                    if engine_ref is not None:
+                        _send_text(
+                            f"📄 Last contract: {engine_ref.get_last_contract_info()}"
+                        )
+                    else:
+                        _send_text("ℹ️ No contract information available.")
+        except Exception as exc:
+            logging.error(f"❌ Telegram bot error: {exc}")
+            time.sleep(5)
+        time.sleep(3)
+
+
 # ===============================================================
 # DATA STRUCTURES
 # ===============================================================
@@ -2536,7 +2608,10 @@ class TradingEngine:
         self.last_symbol: Optional[str] = None
         self.last_result: Optional[str] = None
         self.last_confidence: float = 0.0
+        self.bias_memory: Dict[str, Dict[str, Any]] = load_biases()
+        self._selective_thread: Optional[threading.Thread] = None
         self._telegram_thread: Optional[threading.Thread] = None
+        self.telegram_bot = telegram_bot
 
     def add_trade_listener(self, callback: Callable[[TradeRecord, Dict[str, float]], None]) -> None:
         self._trade_listeners.append(callback)
@@ -2578,6 +2653,53 @@ class TradingEngine:
         if not enabled:
             self.auto_shutdown_triggered = False
 
+    def _selective_memory_worker(self) -> None:
+        while True:
+            self.maintain_selective_memory()
+            time.sleep(300)
+
+    def maintain_selective_memory(self) -> None:
+        try:
+            saved_biases = load_biases()
+            win_biases = {
+                symbol: state
+                for symbol, state in saved_biases.items()
+                if str(state.get("last_result", "")).upper() == "WIN"
+            }
+            save_biases(win_biases)
+            self.bias_memory = win_biases
+            logging.info(
+                "🧠 Selective memory active: %d winning biases preserved",
+                len(win_biases),
+            )
+        except Exception as exc:
+            logging.error(f"❌ Error in selective memory maintenance: {exc}")
+
+    def start_background_services(self) -> None:
+        try:
+            if hasattr(self, "maintain_selective_memory"):
+                if self._selective_thread is None or not self._selective_thread.is_alive():
+                    self._selective_thread = threading.Thread(
+                        target=self._selective_memory_worker,
+                        daemon=True,
+                    )
+                    self._selective_thread.start()
+                    logging.info("🧠 Selective learning service started in background.")
+            else:
+                logging.info("ℹ️ No selective memory service found in this version.")
+            if hasattr(self, "telegram_bot") and callable(self.telegram_bot):
+                if self._telegram_thread is None or not self._telegram_thread.is_alive():
+                    self._telegram_thread = threading.Thread(
+                        target=self.telegram_bot,
+                        daemon=True,
+                    )
+                    self._telegram_thread.start()
+                    logging.info("📨 Telegram bot service started in background.")
+            else:
+                logging.info("ℹ️ Telegram bot not configured in this version.")
+        except Exception as exc:
+            logging.error(f"❌ Error starting background services: {exc}")
+
     def start_engine(self) -> None:
         global operation_active
         if self.running.is_set():
@@ -2598,6 +2720,7 @@ class TradingEngine:
         with self._closed_lock:
             self._closed_contracts.clear()
         CSV_LOGGED_CONTRACTS.clear()
+        self.maintain_selective_memory()
 
     def is_running(self) -> bool:
         return self.running.is_set()
@@ -3445,6 +3568,8 @@ class TradingEngine:
             self.total_operations += 1
             if win_flag:
                 self.win_operations += 1
+            if self.total_operations % 50 == 0:
+                self.maintain_selective_memory()
             self.last_contract_id = contract_id
             self.last_symbol = symbol
             self.last_result = trade_result
@@ -3728,6 +3853,8 @@ class BotWindow(QtWidgets.QWidget):
             self.log_handler.emitter.message.connect(self._append_log)
 
         self.engine = TradingEngine()
+        global global_engine
+        global_engine = self.engine
         self.engine.add_trade_listener(lambda record, stats: self.bridge.trade.emit(record, stats))
         self.engine.add_status_listener(lambda status: self.bridge.status.emit(status))
         self.engine.add_summary_listener(lambda symbol, data: self.bridge.summary.emit(symbol, data))
