@@ -1,261 +1,200 @@
-"""Adaptive signal evaluation engine.
+"""Adaptive confidence evaluation engine.
 
-This module consolidates individual strategy outputs into a final trade
-confidence while applying dynamic filters requested by the calibration
-specification. Trading logic, GUI elements, and threading constructs live
-elsewhere; here we only manipulate numerical confidences.
+This module computes the trade confidence by combining strategy alignment
+with adaptive adjustments driven by volatility, market regime, and
+historical performance. The surrounding trading logic, GUI, and threading
+layers consume the resulting metrics without alteration.
 """
 from __future__ import annotations
 
+import json
 import logging
 import time
 from dataclasses import dataclass
-from typing import Dict, Iterable, Mapping, Optional, Sequence
+from pathlib import Path
+from typing import Dict, Iterable, Optional, Sequence, Tuple
 
 import numpy as np
 
 from ai_calibrator import ConfidenceCalibrator
-from ai_regressor import LightRegressor
-from market_memory import MarketMemory
 from strategy_base import StrategyResult, StrategySnapshot
 
 MIN_CONFIDENCE = 0.65
 SOFT_LOWER_BOUND = 0.55
-MOMENTUM_BOOST = 0.03
-EMA_SLOPE_MIN = 0.0001
-EMA_SLOPE_DAMP = 0.8
-LOW_VOLATILITY_MIN = 0.0002
-HIGH_VOLATILITY_MAX = 0.002
+CONFIDENCE_THRESHOLD = 0.70
+VOLATILITY_MIN = 0.0002
+VOLATILITY_MAX = 0.002
+VOLATILITY_LOW_INFLUENCE = 0.0005
+VOLATILITY_HIGH_INFLUENCE = 0.0012
 STAKE_REDUCTION_THRESHOLD = 0.0005
 LOW_VOLATILITY_STAKE_FACTOR = 0.5
-
-DEFAULT_BASE_WEIGHTS: Mapping[str, float] = {
-    "RSI": 1.0,
-    "EMA": 1.0,
-    "EMA_TREND": 1.0,
-    "PULLBACK": 1.0,
-    "BOLL": 1.0,
-    "BOLLINGER": 1.0,
-    "BOLLINGER_REBOUND": 1.0,
-    "DIVERGENCE": 1.0,
-}
-
-REGIME_WEIGHT_MAP: Mapping[str, Mapping[str, float]] = {
-    "RANGING": {
-        "RSI": 1.3,
-        "DIVERGENCE": 1.2,
-        "EMA": 0.8,
-        "EMA_TREND": 0.8,
-        "BOLL": 1.1,
-        "BOLLINGER": 1.1,
-        "BOLLINGER_REBOUND": 1.1,
-    },
-    "VOLATILE": {
-        "RSI": 0.9,
-        "EMA": 1.4,
-        "EMA_TREND": 1.4,
-        "PULLBACK": 1.3,
-        "BOLL": 0.8,
-        "BOLLINGER": 0.8,
-        "BOLLINGER_REBOUND": 0.8,
-    },
-    "TREND": {
-        "RSI": 1.2,
-        "EMA": 1.5,
-        "EMA_TREND": 1.5,
-        "PULLBACK": 1.0,
-        "BOLL": 0.9,
-        "BOLLINGER": 0.9,
-        "BOLLINGER_REBOUND": 0.9,
-    },
-}
-
-STRONG_STRATEGY_KEYS = {
-    "RSI",
-    "EMA",
-    "EMA_TREND",
-    "PULLBACK",
-    "BOLL",
-    "BOLLINGER",
-    "BOLLINGER_REBOUND",
-    "DIVERGENCE",
-}
+DEFAULT_SUCCESS_RATE = 0.5
+CONFIDENCE_MEMORY_PATH = Path("confidence_memory.json")
 
 calibrator = ConfidenceCalibrator()
-market_memory = MarketMemory()
-light_regressor = LightRegressor()
+
+
+def _load_confidence_memory() -> Dict[str, float]:
+    if not CONFIDENCE_MEMORY_PATH.exists():
+        return {}
+    try:
+        with CONFIDENCE_MEMORY_PATH.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+    except (json.JSONDecodeError, OSError):
+        return {}
+    cleaned: Dict[str, float] = {}
+    for symbol, value in data.items():
+        try:
+            cleaned[symbol] = float(np.clip(float(value), 0.0, 1.0))
+        except (TypeError, ValueError):
+            continue
+    return cleaned
+
+
+def _save_confidence_memory(memory: Dict[str, float]) -> None:
+    try:
+        with CONFIDENCE_MEMORY_PATH.open("w", encoding="utf-8") as handle:
+            json.dump(memory, handle, ensure_ascii=False, indent=2)
+    except OSError:
+        pass
+
+
+_confidence_memory: Dict[str, float] = _load_confidence_memory()
 
 
 @dataclass(slots=True)
 class EvaluationResult:
     final_confidence: float
+    base_confidence: float
     allow_trade: bool
     strong_signals: int
-    regime_weights: Dict[str, float]
-    momentum: float
-    ema_slope: Optional[float]
-    stake: float
-    ai_prediction: float
-    calibrated_confidence: float
+    aligned_strategies: int
+    active_strategies: int
+    volatility_weight: float
+    regime_weight: float
+    historical_weight: float
     valid_volatility: bool
-    alignment_direction: Optional[str]
+    consensus_direction: Optional[str]
     skip_reason: Optional[str]
+    stake: float
     cooldown_until: Optional[float]
 
 
-def _normalise_key(name: str) -> str:
-    return name.strip().upper().replace(" ", "_")
+def _consensus_direction(results: Sequence[StrategyResult]) -> Tuple[Optional[str], int]:
+    call_count = sum(1 for result in results if result.normalized_signal() == "CALL")
+    put_count = sum(1 for result in results if result.normalized_signal() == "PUT")
+    if call_count == 0 and put_count == 0:
+        return None, 0
+    if call_count >= put_count:
+        return "CALL", call_count
+    return "PUT", put_count
 
 
-def _regime_weights(regime: str) -> Dict[str, float]:
-    base = dict(DEFAULT_BASE_WEIGHTS)
-    override = REGIME_WEIGHT_MAP.get(regime.strip().upper())
-    if override:
-        base.update(override)
-    return base
+def _volatility_weight(volatility: float) -> float:
+    if volatility < VOLATILITY_LOW_INFLUENCE:
+        return 0.9
+    if volatility > VOLATILITY_HIGH_INFLUENCE:
+        return 1.05
+    return 1.0
 
 
-def _weighted_confidence(results: Iterable[StrategyResult], weights: Mapping[str, float]) -> tuple[float, float, int]:
-    total = 0.0
-    weight_sum = 0.0
-    strong_count = 0
-    for result in results:
-        key = _normalise_key(result.name)
-        weight = weights.get(key, result.weight)
-        total += float(result.confidence) * weight
-        weight_sum += weight
-        if key in STRONG_STRATEGY_KEYS and result.strong_alignment():
-            strong_count += 1
-    if weight_sum == 0:
-        return 0.0, weight_sum, strong_count
-    return total / weight_sum, weight_sum, strong_count
+def _regime_weight(regime: str) -> float:
+    normalized = regime.strip().upper()
+    if normalized in {"TRENDING", "TREND"}:
+        return 1.05
+    if normalized in {"RANGING", "RANGE"}:
+        return 0.95
+    return 1.0
 
 
-def _ema_slope(ema_short: Optional[Sequence[float]]) -> Optional[float]:
-    if not ema_short or len(ema_short) < 5:
-        return None
-    reference = float(ema_short[-5])
-    if reference == 0:
-        return None
-    latest = float(ema_short[-1])
-    return (latest - reference) / reference
+def _success_rate(symbol: str) -> float:
+    return float(_confidence_memory.get(symbol, DEFAULT_SUCCESS_RATE))
 
 
-def _short_term_momentum(closes: Sequence[float]) -> float:
-    if len(closes) < 3:
-        return 0.0
-    tail = np.array(closes[-3:], dtype=float)
-    diffs = np.diff(tail)
-    if diffs.size == 0:
-        return 0.0
-    return float(np.mean(diffs))
-
-
-def _metadata_value(snapshot: StrategySnapshot, keys: Sequence[str], default: float) -> float:
-    for result in snapshot.results:
-        metadata = result.metadata
-        for key in keys:
-            if key in metadata:
-                try:
-                    return float(metadata[key])
-                except (TypeError, ValueError):
-                    continue
-    return float(default)
-
-
-def _build_features(symbol_snapshot: StrategySnapshot, momentum: float, ema_slope: Optional[float]) -> tuple[float, float, float, float]:
-    if symbol_snapshot.rsi_value is not None:
-        rsi_value = float(symbol_snapshot.rsi_value)
+def _update_success_memory(symbol: str, result: str) -> None:
+    normalized = (result or "").strip().upper()
+    if normalized not in {"WIN", "LOSS"}:
+        return
+    current = _confidence_memory.get(symbol, DEFAULT_SUCCESS_RATE)
+    if normalized == "WIN":
+        updated = current * 1.02
     else:
-        rsi_value = _metadata_value(symbol_snapshot, ("rsi", "RSI"), 50.0)
-    if symbol_snapshot.ema_slope_value is not None:
-        ema_metric = float(symbol_snapshot.ema_slope_value)
-    elif ema_slope is not None:
-        ema_metric = float(ema_slope)
-    else:
-        ema_metric = _metadata_value(symbol_snapshot, ("ema_slope", "slope"), 0.0)
-    volatility = float(symbol_snapshot.volatility or 0.0)
-    return (
-        rsi_value / 100.0,
-        ema_metric,
-        volatility,
-        float(momentum),
-    )
+        updated = current * 0.98
+    updated = float(np.clip(updated, 0.0, 1.0))
+    _confidence_memory[symbol] = updated
+    _save_confidence_memory(_confidence_memory)
+
+
+def _strong_signal_count(results: Iterable[StrategyResult]) -> int:
+    return sum(1 for result in results if result.strong_alignment())
 
 
 def evaluate_snapshot(snapshot: StrategySnapshot) -> EvaluationResult:
-    weights = _regime_weights(snapshot.regime)
     active_results = list(snapshot.active_signals())
-    base_confidence, _, strong_count = _weighted_confidence(active_results, weights)
-    directions = [result.normalized_signal() for result in active_results if result.normalized_signal() in {"CALL", "PUT"}]
-    alignment_direction: Optional[str] = None
-    for direction in ("CALL", "PUT"):
-        if directions.count(direction) >= 3:
-            alignment_direction = direction
-            break
-    base_confidence = float(np.clip(base_confidence, 0.0, 1.0))
+    active_count = len(active_results)
+    strong_count = _strong_signal_count(active_results)
+    consensus_direction, aligned_count = _consensus_direction(active_results)
 
-    momentum = _short_term_momentum(snapshot.closes)
-    if momentum > 0:
-        base_confidence += MOMENTUM_BOOST
-    elif momentum < 0:
-        base_confidence -= MOMENTUM_BOOST
+    if active_count == 0:
+        base_confidence = 0.0
+    else:
+        base_confidence = float(aligned_count / active_count)
 
-    ema_slope = _ema_slope(snapshot.ema_short)
-    if ema_slope is not None and abs(ema_slope) < EMA_SLOPE_MIN:
-        base_confidence *= EMA_SLOPE_DAMP
+    volatility = float(snapshot.volatility or 0.0)
+    volatility_weight = _volatility_weight(volatility) if volatility else 1.0
+    regime_weight = _regime_weight(snapshot.regime)
+    success_rate = _success_rate(snapshot.symbol)
+    historical_weight = 0.9 + (0.2 * success_rate)
 
-    calibrated_confidence = float(np.clip(base_confidence, 0.0, 1.0))
-    calibrated_confidence = calibrator.adjusted_confidence(calibrated_confidence, snapshot.symbol)
-    calibrated_confidence *= market_memory.bias(snapshot.symbol)
+    try:
+        final_confidence = base_confidence * volatility_weight * regime_weight * historical_weight
+    except Exception:
+        final_confidence = base_confidence
 
-    features = _build_features(snapshot, momentum, ema_slope)
-    ai_prediction = light_regressor.predict(features)
-    final_confidence = (calibrated_confidence * 0.7) + (ai_prediction * 0.3)
     final_confidence = float(np.clip(final_confidence, 0.0, 1.0))
 
+    valid_volatility = False
+    if volatility:
+        valid_volatility = VOLATILITY_MIN < volatility < VOLATILITY_MAX
+
     stake = float(snapshot.base_stake)
-    volatility = float(snapshot.volatility or 0.0)
-    valid_volatility = LOW_VOLATILITY_MIN < volatility < HIGH_VOLATILITY_MAX if volatility else False
     if valid_volatility and volatility < STAKE_REDUCTION_THRESHOLD:
         stake *= LOW_VOLATILITY_STAKE_FACTOR
-        logging.info(
-            "⚠️ Low volatility (%s) → reducing stake to %.4f",
-            f"{volatility:.5f}",
-            stake,
-        )
+        logging.info("⚠️ Low volatility (%s) → reducing stake to %.4f", f"{volatility:.5f}", stake)
 
-    allow_trade = True
+    allow_trade = False
     skip_reason: Optional[str] = None
-    if final_confidence < 0.55:
-        allow_trade = False
+
+    if final_confidence < SOFT_LOWER_BOUND:
         skip_reason = "confidence_floor"
-    elif final_confidence < 0.70:
+    elif final_confidence < CONFIDENCE_THRESHOLD:
         calibrator.passive_update(snapshot.symbol, final_confidence)
-        allow_trade = False
         skip_reason = "confidence_soft_zone"
+    else:
+        allow_trade = True
 
     if allow_trade and not valid_volatility:
         allow_trade = False
-        skip_reason = skip_reason or "invalid_volatility"
+        skip_reason = "invalid_volatility"
 
-    if allow_trade and alignment_direction is None:
+    if allow_trade and (consensus_direction is None or aligned_count < 3):
         allow_trade = False
-        skip_reason = skip_reason or "insufficient_alignment"
+        skip_reason = "insufficient_alignment"
 
     current_time = snapshot.current_time or time.time()
     cooldown_until: Optional[float] = None
-    existing_cooldown = 0.0
+
     if snapshot.cooldowns:
-        existing_cooldown = float(snapshot.cooldowns.get(snapshot.symbol, 0.0) or 0.0)
-        if existing_cooldown > current_time:
+        existing = float(snapshot.cooldowns.get(snapshot.symbol, 0.0) or 0.0)
+        if existing > current_time:
             allow_trade = False
-            cooldown_until = existing_cooldown
+            cooldown_until = existing
             skip_reason = skip_reason or "cooldown_active"
 
-    losses = 0
     if snapshot.consecutive_losses:
         losses = int(snapshot.consecutive_losses.get(snapshot.symbol, 0))
+    else:
+        losses = 0
     if losses >= 3:
         cooldown_until = max(cooldown_until or 0.0, current_time + 120.0)
         allow_trade = False
@@ -266,30 +205,24 @@ def evaluate_snapshot(snapshot: StrategySnapshot) -> EvaluationResult:
 
     if snapshot.result_available and snapshot.trade_result:
         calibrator.update(final_confidence, snapshot.trade_result, snapshot.symbol)
-        market_memory.update(snapshot.symbol, snapshot.trade_result)
-        outcome_value = 1.0 if snapshot.trade_result.strip().upper() == "WIN" else 0.0
-        light_regressor.train([features], [outcome_value])
+        _update_success_memory(snapshot.symbol, snapshot.trade_result)
 
     return EvaluationResult(
         final_confidence=final_confidence,
+        base_confidence=base_confidence,
         allow_trade=allow_trade,
         strong_signals=strong_count,
-        regime_weights=dict(weights),
-        momentum=momentum,
-        ema_slope=ema_slope,
-        stake=stake,
-        ai_prediction=ai_prediction,
-        calibrated_confidence=calibrated_confidence,
+        aligned_strategies=aligned_count,
+        active_strategies=active_count,
+        volatility_weight=volatility_weight,
+        regime_weight=regime_weight,
+        historical_weight=historical_weight,
         valid_volatility=valid_volatility,
-        alignment_direction=alignment_direction,
+        consensus_direction=consensus_direction,
         skip_reason=skip_reason,
+        stake=stake,
         cooldown_until=cooldown_until,
     )
 
 
-__all__ = [
-    "EvaluationResult",
-    "evaluate_snapshot",
-    "MIN_CONFIDENCE",
-    "SOFT_LOWER_BOUND",
-]
+__all__ = ["EvaluationResult", "evaluate_snapshot", "CONFIDENCE_THRESHOLD", "SOFT_LOWER_BOUND", "MIN_CONFIDENCE"]
