@@ -34,7 +34,7 @@ except ImportError:  # pragma: no cover
 from PyQt5 import QtCore, QtGui, QtWidgets
 from PyQt5.QtCore import QThread, pyqtSignal
 from aprendizaje import Aprendizaje
-from telegram_bot import BOT_ACTIVE, send_message, telegram_listener
+from telegram_bot import BOT_ACTIVE, telegram_listener
 
 try:
     import websocket  # type: ignore
@@ -60,6 +60,23 @@ MAX_DRAWDOWN = -150.0
 MIN_TRADE_CONFIDENCE = 0.45
 MIN_CONFIDENCE = 0.65
 MIN_VOLATILITY = 0.0005
+
+# === STRICT MODE PARAMETERS ===
+CONFIDENCE_MIN = 0.75
+LOW_VOL_THRESHOLD = 0.0006
+LOW_VOL_CONFIDENCE = 0.85
+NEUTRAL_RSI_BAND = (45.0, 55.0)
+NEUTRAL_RSI_CONF = 0.95
+MIN_ALIGNED_STRATEGIES = 4
+POST_LOSS_COOLDOWN_SEC = 120
+MAX_TRADES_PER_HOUR = 20
+KEEP_WIN_MIN_CONF = 0.70
+MAINTENANCE_EVERY = 40
+STRICT_MODE_ENABLED = True
+
+# === TELEGRAM BOT CONFIGURATION ===
+TELEGRAM_TOKEN = "8300367826:AAGzaMCJRY6pzZEqzjqgzAaRUXC_19KcB60"
+TELEGRAM_CHAT_ID = "8364256476"
 
 AI_ENABLED = True
 AI_PASSIVE_MODE = True
@@ -88,13 +105,35 @@ CSV_LOGGED_CONTRACTS: Set[int] = set()
 BIAS_MEMORY_PATH = Path("bias_memory.json")
 
 
+def send_telegram_message(text: str) -> None:
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text}
+        requests.post(url, json=payload, timeout=5)
+    except Exception as exc:
+        logging.warning(f"⚠️ Telegram message failed: {exc}")
+
+
 def load_biases() -> Dict[str, Dict[str, Any]]:
     if not BIAS_MEMORY_PATH.exists():
         return {}
     try:
         with BIAS_MEMORY_PATH.open("r", encoding="utf-8") as handle:
             data = json.load(handle)
-        return {str(symbol): dict(state) for symbol, state in data.items()}
+        normalized: Dict[str, Dict[str, Any]] = {}
+        for symbol, state in data.items():
+            symbol_key = str(symbol)
+            snapshot = dict(state)
+            snapshot.setdefault("RSI", 0.0)
+            snapshot.setdefault("EMA", 0.0)
+            snapshot.setdefault("last_result", "NONE")
+            snapshot.setdefault("confidence", 0.0)
+            try:
+                snapshot["confidence"] = float(snapshot.get("confidence", 0.0))
+            except (TypeError, ValueError):
+                snapshot["confidence"] = 0.0
+            normalized[symbol_key] = snapshot
+        return normalized
     except Exception as exc:  # pragma: no cover
         logging.debug(f"No se pudo cargar sesgos almacenados: {exc}")
         return {}
@@ -107,6 +146,7 @@ def save_biases(biases: Dict[str, Dict[str, Any]]) -> None:
             "RSI": float(state.get("RSI", 0.0)),
             "EMA": float(state.get("EMA", 0.0)),
             "last_result": state.get("last_result", "NONE"),
+            "confidence": float(state.get("confidence", 0.0)),
         }
     try:
         with BIAS_MEMORY_PATH.open("w", encoding="utf-8") as handle:
@@ -118,10 +158,12 @@ def save_biases(biases: Dict[str, Dict[str, Any]]) -> None:
 def selective_memory_recovery(saved_biases: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
     filtered_biases: Dict[str, Dict[str, Any]] = {}
     for symbol, data in saved_biases.items():
-        if data.get("last_result") == "WIN":
-            filtered_biases[symbol] = data
+        outcome = str(data.get("last_result", "")).upper()
+        confidence_value = float(data.get("confidence", 0.0))
+        if outcome == "WIN" and confidence_value >= KEEP_WIN_MIN_CONF:
+            filtered_biases[symbol] = dict(data)
     logging.info(
-        "🧠 Selective memory active: %d winning biases preserved",
+        "🧠 Strict selective maintenance: %d winning biases preserved",
         len(filtered_biases),
     )
     return filtered_biases
@@ -132,17 +174,10 @@ global_engine = None
 
 def telegram_bot() -> None:
     global BOT_ACTIVE, global_engine
-    token = "8300367826:AAGzaMCJRY6pzZEqzjqgzAaRUXC_19KcB60"
-    chat_id = "8364256476"
-    logging.info("🤖 Telegram bot active and listening...")
+    logging.info("🤖 Bot de Telegram activo y escuchando comandos...")
 
     def _send_text(text: str) -> None:
-        url = f"https://api.telegram.org/bot{token}/sendMessage"
-        payload = {"chat_id": chat_id, "text": text}
-        try:
-            requests.post(url, data=payload, timeout=5)
-        except Exception as exc:
-            logging.error(f"❌ Telegram send error: {exc}")
+        send_telegram_message(text)
 
     offset: Optional[int] = None
     while True:
@@ -151,7 +186,7 @@ def telegram_bot() -> None:
             if offset is not None:
                 params["offset"] = offset
             response = requests.get(
-                f"https://api.telegram.org/bot{token}/getUpdates",
+                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
                 params=params,
                 timeout=15,
             )
@@ -165,34 +200,30 @@ def telegram_bot() -> None:
                 if not message:
                     continue
                 command = message.lower()
-                if "pause" in command or "stop" in command:
+                if any(keyword in command for keyword in ("pause", "stop", "pausar")):
                     BOT_ACTIVE = False
-                    _send_text("⏸ Bot paused by user.")
-                elif "resume" in command or "start" in command:
+                    _send_text("⏸ Bot detenido manualmente.")
+                elif any(keyword in command for keyword in ("resume", "start", "reanudar")):
                     BOT_ACTIVE = True
-                    _send_text("▶ Bot resumed.")
-                elif "status" in command:
+                    _send_text("▶️ Bot reanudado.")
+                elif any(keyword in command for keyword in ("status", "estado")):
                     engine_ref = global_engine
                     if engine_ref is not None:
                         precision = engine_ref.get_accuracy()
                         operations = engine_ref.total_operations
                         _send_text(
-                            f"📊 Status:\nPrecision: {precision:.2f}%\nOperations: {int(operations)}"
+                            f"📊 Precisión: {precision:.2f}%\nOperaciones: {int(operations)}"
                         )
                     else:
-                        _send_text("ℹ️ Engine not ready yet.")
-                elif "help" in command:
-                    _send_text(
-                        "🧠 Commands:\n- pause\n- resume\n- status\n- info"
-                    )
+                        _send_text("ℹ️ Motor no disponible todavía.")
+                elif any(keyword in command for keyword in ("help", "ayuda")):
+                    _send_text("🧠 Comandos:\n- pausar\n- reanudar\n- estado\n- info")
                 elif "info" in command:
                     engine_ref = global_engine
                     if engine_ref is not None:
-                        _send_text(
-                            f"📄 Last contract: {engine_ref.get_last_contract_info()}"
-                        )
+                        _send_text(f"📄 Último contrato: {engine_ref.get_last_contract_info()}")
                     else:
-                        _send_text("ℹ️ No contract information available.")
+                        _send_text("ℹ️ No hay información de contratos disponible.")
         except Exception as exc:
             logging.error(f"❌ Telegram bot error: {exc}")
             time.sleep(5)
@@ -476,20 +507,23 @@ class auto_learning:
             self._telegram_thread.start()
 
     def maintain_selective_memory(self) -> None:
-        preserved = 0
-        with self.bias_lock:
-            for state in self.biases.values():
-                if str(state.get("last_result", "")).upper() == "WIN":
-                    preserved += 1
-                else:
-                    state["RSI"] = 0.0
-                    state["EMA"] = 0.0
-                    state["last_result"] = "LOSS"
-        save_biases(self.biases)
-        logging.info(
-            "🧠 Selective memory active: %d winning biases preserved",
-            preserved,
-        )
+        try:
+            saved_biases = load_biases()
+            preserved: Dict[str, Dict[str, Any]] = {}
+            for symbol, state in saved_biases.items():
+                outcome = str(state.get("last_result", "")).upper()
+                confidence_value = float(state.get("confidence", 0.0))
+                if outcome == "WIN" and confidence_value >= KEEP_WIN_MIN_CONF:
+                    preserved[symbol] = dict(state)
+            save_biases(preserved)
+            with self.bias_lock:
+                self.bias_memory = preserved
+            logging.info(
+                "🧠 Strict selective maintenance: %d strong winning biases kept.",
+                len(preserved),
+            )
+        except Exception as exc:
+            logging.error(f"❌ Error in selective memory maintenance: {exc}")
 
     def _default_symbol_profile(self) -> Dict[str, Any]:
         return {
@@ -2602,6 +2636,8 @@ class TradingEngine:
         self._closed_lock = threading.Lock()
         self._closed_contracts: Set[int] = set()
         self._next_cycle_time = 0.0
+        self._post_loss_cooldown_until: float = 0.0
+        self._trade_timestamps: deque = deque()
         self.total_operations = 0
         self.win_operations = 0
         self.last_contract_id: Optional[int] = None
@@ -2661,16 +2697,17 @@ class TradingEngine:
     def maintain_selective_memory(self) -> None:
         try:
             saved_biases = load_biases()
-            win_biases = {
-                symbol: state
-                for symbol, state in saved_biases.items()
-                if str(state.get("last_result", "")).upper() == "WIN"
-            }
-            save_biases(win_biases)
-            self.bias_memory = win_biases
+            preserved: Dict[str, Dict[str, Any]] = {}
+            for symbol, state in saved_biases.items():
+                outcome = str(state.get("last_result", "")).upper()
+                confidence_value = float(state.get("confidence", 0.0))
+                if outcome == "WIN" and confidence_value >= KEEP_WIN_MIN_CONF:
+                    preserved[symbol] = dict(state)
+            save_biases(preserved)
+            self.bias_memory = preserved
             logging.info(
-                "🧠 Selective memory active: %d winning biases preserved",
-                len(win_biases),
+                "🧠 Strict selective maintenance: %d strong winning biases kept.",
+                len(preserved),
             )
         except Exception as exc:
             logging.error(f"❌ Error in selective memory maintenance: {exc}")
@@ -2748,11 +2785,11 @@ class TradingEngine:
 
     def get_last_contract_info(self) -> str:
         if self.last_contract_id is None:
-            return "No trades executed yet."
+            return "Sin operaciones registradas."
         symbol = self.last_symbol or "N/A"
         result = self.last_result or "N/A"
         return (
-            f"#{self.last_contract_id} | {symbol} | {result} | Conf {self.last_confidence:.2f}"
+            f"#{self.last_contract_id} | {symbol} | {result} | Confianza {self.last_confidence:.2f}"
         )
 
     def _estimate_balance(self) -> float:
@@ -3146,6 +3183,7 @@ class TradingEngine:
                     'rsi_signal': rsi_signal,
                     'ema_signal': ema_signal,
                     'macd_signal': macd_signal,
+                    'aligned': consensus['aligned'],
                 }
             )
             self._latest_regime_inputs = {'symbol': symbol, 'ema_slope': ema_slope, 'boll_width': boll_width}
@@ -3472,6 +3510,50 @@ class TradingEngine:
             except (TypeError, ValueError):
                 volatility_value = None
         confidence_value = float(combined_confidence) if combined_confidence is not None else 0.0
+        latest_rsi_value = float(evaluation.get('latest_rsi', 0.0))
+        aligned_strategies = int(
+            evaluation.get('aligned', evaluation.get('consensus', {}).get('aligned', 0))
+        )
+        if STRICT_MODE_ENABLED:
+            if confidence_value < CONFIDENCE_MIN:
+                logging.info("🚫 Skipping trade — low confidence (modo estricto).")
+                return False
+            if (
+                volatility_value is not None
+                and volatility_value < LOW_VOL_THRESHOLD
+                and confidence_value < LOW_VOL_CONFIDENCE
+            ):
+                logging.info(
+                    "🚫 Skipping trade — low volatility & weak signal (modo estricto)."
+                )
+                return False
+            if (
+                NEUTRAL_RSI_BAND[0]
+                <= latest_rsi_value
+                <= NEUTRAL_RSI_BAND[1]
+                and confidence_value < NEUTRAL_RSI_CONF
+            ):
+                logging.info(
+                    "🚫 Skipping trade — neutral RSI & insufficient confidence (modo estricto)."
+                )
+                return False
+            if aligned_strategies < MIN_ALIGNED_STRATEGIES:
+                logging.info(
+                    f"🚫 Skipping trade — only {aligned_strategies}/7 strategies aligned (modo estricto)."
+                )
+                return False
+            now_ts = time.time()
+            if self._post_loss_cooldown_until and now_ts < self._post_loss_cooldown_until:
+                remaining = self._post_loss_cooldown_until - now_ts
+                logging.info(
+                    f"⏳ Skipping trade — cooldown activo tras pérdida ({remaining:.0f}s restantes, modo estricto)."
+                )
+                return False
+            while self._trade_timestamps and now_ts - self._trade_timestamps[0] > 3600:
+                self._trade_timestamps.popleft()
+            if len(self._trade_timestamps) >= MAX_TRADES_PER_HOUR:
+                logging.info("⛔ Máximo de operaciones por hora alcanzado (modo estricto).")
+                return False
         if combined_confidence is None or confidence_value < MIN_CONFIDENCE:
             logging.info(f"🚫 Skipping trade on {symbol} due to low confidence ({confidence_value:.2f})")
             return False
@@ -3502,6 +3584,7 @@ class TradingEngine:
         self._notify_trade_state('active')
         dur_seconds = duration_seconds if duration_seconds > 0 else TRADE_DURATION_SECONDS
         logging.info(f"🟢 Operación abierta — Contrato #{contract_id} | Duración: {dur_seconds}s")
+        self._trade_timestamps.append(time.time())
         trade_initiated = True
         try:
             result_status = self._wait_for_contract_result(contract_id, dur_seconds)
@@ -3568,12 +3651,25 @@ class TradingEngine:
             self.total_operations += 1
             if win_flag:
                 self.win_operations += 1
-            if self.total_operations % 50 == 0:
+            if MAINTENANCE_EVERY > 0 and self.total_operations % MAINTENANCE_EVERY == 0:
                 self.maintain_selective_memory()
             self.last_contract_id = contract_id
             self.last_symbol = symbol
             self.last_result = trade_result
             self.last_confidence = confidence_value
+            if STRICT_MODE_ENABLED:
+                if win_flag:
+                    self._post_loss_cooldown_until = 0.0
+                else:
+                    self._post_loss_cooldown_until = time.time() + POST_LOSS_COOLDOWN_SEC
+            bias_state = self.bias_memory.get(
+                symbol,
+                {"RSI": 0.0, "EMA": 0.0, "last_result": "NONE", "confidence": 0.0},
+            )
+            bias_state["last_result"] = trade_result
+            bias_state["confidence"] = confidence_value
+            self.bias_memory[symbol] = bias_state
+            save_biases(self.bias_memory)
             profit_value = float(pnl)
             main_reason = str(consensus.get('main_reason', 'Sin motivo disponible'))
             reason_summary = '; '.join(reasons)
@@ -3601,9 +3697,18 @@ class TradingEngine:
                 should_notify = False
             if should_notify:
                 ticket_label = f"#{contract_id}" if contract_id is not None else "N/A"
-                send_message(
-                    f"🎯 {symbol} | Result: {trade_result} | Confidence: {confidence_value:.2f} | Ticket {ticket_label}"
+                total_trades = int(self.total_operations)
+                winrate = self.get_accuracy()
+                emoji = "🟢" if win_flag else "🔴"
+                message = (
+                    f"{emoji} {symbol}\n"
+                    f"Resultado: {trade_result}\n"
+                    f"Confianza: {confidence_value:.2f}\n"
+                    f"Operaciones: {total_trades}\n"
+                    f"Precisión: {winrate:.2f}%\n"
+                    f"Ticket: {ticket_label}"
                 )
+                send_telegram_message(message)
                 self._notify_trade_result(result_info)
             exit_price = self._fetch_exit_price(symbol, entry_price)
             price_change = float(exit_price - entry_price)

@@ -38,26 +38,32 @@ def telegram_listener(bot_ref: Any) -> None:
                 message = update.get("message", {}).get("text", "").lower()
                 if not message:
                     continue
-                if "pause" in message:
+                if any(keyword in message for keyword in ("pause", "pausar")):
                     BOT_ACTIVE = False
-                    send_message("⏸ Bot paused via Telegram.")
-                elif "resume" in message:
+                    send_message("⏸ Bot pausado manualmente.")
+                elif any(keyword in message for keyword in ("resume", "reanudar")):
                     BOT_ACTIVE = True
-                    send_message("▶ Bot resumed.")
-                elif "status" in message:
+                    send_message("▶️ Bot reanudado.")
+                elif any(keyword in message for keyword in ("status", "estado")):
                     try:
                         accuracy = float(bot_ref.get_accuracy())
+                        operations = int(getattr(bot_ref, "total_operations", 0))
                     except Exception as exc:  # pragma: no cover
                         logging.error(f"[Telegram status error] {exc}")
                         accuracy = 0.0
-                    send_message(f"📊 Current accuracy: {accuracy:.2f}%")
-                elif "info" in message:
+                        operations = 0
+                    send_message(
+                        f"📊 Precisión actual: {accuracy:.2f}% | Operaciones: {operations}"
+                    )
+                elif any(keyword in message for keyword in ("info",)):
                     try:
                         info = bot_ref.get_last_contract_info()
                     except Exception as exc:  # pragma: no cover
                         logging.error(f"[Telegram info error] {exc}")
-                        info = "No trades executed yet."
-                    send_message(f"📄 Last contract: {info}")
+                        info = "Sin operaciones registradas."
+                    send_message(f"📄 Último contrato: {info}")
+                elif "ayuda" in message:
+                    send_message("🧠 Comandos: pausar, reanudar, estado, info")
         except Exception as exc:
             logging.error(f"[Telegram listener error] {exc}")
         time.sleep(3)
