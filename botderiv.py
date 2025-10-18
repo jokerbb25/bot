@@ -33,6 +33,7 @@ except ImportError:  # pragma: no cover
 
 from PyQt5 import QtCore, QtGui, QtWidgets
 from PyQt5.QtCore import QThread, pyqtSignal
+from aprendizaje import Aprendizaje
 
 try:
     import websocket  # type: ignore
@@ -2373,6 +2374,10 @@ class TradingEngine:
         self.kelly_enabled = False
         self.initial_balance = 1000.0
         self.base_trade_amount = STAKE
+        self.aprendizaje = Aprendizaje()
+        self.learning_enabled = True
+        self.learning_confidences: deque = deque(maxlen=100)
+        self.last_learning_feedback: Optional[float] = None
         self.regime_cycle_count = 0
         with auto_learn.weights_lock:
             self._baseline_weights = dict(auto_learn.weights)
@@ -2464,6 +2469,9 @@ class TradingEngine:
 
     def set_kelly_enabled(self, enabled: bool) -> None:
         self.kelly_enabled = bool(enabled)
+
+    def set_learning_enabled(self, enabled: bool) -> None:
+        self.learning_enabled = bool(enabled)
 
     def _estimate_balance(self) -> float:
         return max(100.0, self.initial_balance + self.risk.total_pnl)
@@ -3320,6 +3328,21 @@ class TradingEngine:
                 trade_result,
             )
             auto_learn.predict_next(latest_rsi, ema_spread, boll_width, volatilidad_actual)
+            if not self.learning_enabled:
+                logging.info("Learning temporarily disabled.")
+            else:
+                signals_list = [outcome.signal for _, outcome in results]
+                feedback = self.aprendizaje.apply_learning_feedback(
+                    trade_result,
+                    symbol,
+                    latest_rsi,
+                    volatilidad_actual,
+                    signals_list,
+                    signal,
+                )
+                self.last_learning_feedback = feedback
+                if feedback is not None:
+                    self.learning_confidences.append(feedback)
             logging.info(
                 f"{record.timestamp:%Y-%m-%d %H:%M:%S} INFO: [{symbol}] {signal} @{ai_confidence:.2f} | Stake:{stake_amount:.2f} | EMA:{evaluation['ema_diff']:.2f} RSI:{latest_rsi:.2f} | Motivos: {'; '.join(reasons)}"
             )
@@ -3557,6 +3580,7 @@ class BotWindow(QtWidgets.QWidget):
 
         self.logged_contracts: Set[int] = set()
         self.pending_contracts: Set[int] = set()
+        self.learning_enabled = True
 
         self._build_ui()
 
@@ -3578,7 +3602,6 @@ class BotWindow(QtWidgets.QWidget):
         self._build_strategies_tab()
         self._build_asset_summary_tab()
         self._build_settings_tab()
-        self._build_history_tab()
         self._build_learning_tab()
         self._initialize_asset_summary()
 
@@ -3858,6 +3881,10 @@ class BotWindow(QtWidgets.QWidget):
         layout.addWidget(self.label_progress)
         layout.addWidget(self.label_mode)
         layout.addWidget(self.progress_bar)
+        self.learning_toggle = QtWidgets.QCheckBox("Habilitar aprendizaje adaptativo")
+        self.learning_toggle.setChecked(True)
+        self.learning_toggle.stateChanged.connect(self._on_learning_toggled)
+        layout.addWidget(self.learning_toggle)
         layout.addStretch(1)
 
     def update_learning_tab(self) -> None:
@@ -3874,37 +3901,55 @@ class BotWindow(QtWidgets.QWidget):
             if total_ops > 0:
                 precision = (wins / total_ops) * 100.0
 
-            confidences = []
-            history = getattr(engine, "trade_history", [])
-            for record in history[-100:]:
-                confidence_value = getattr(record, "confidence", None)
-                if confidence_value is not None:
-                    confidences.append(float(confidence_value))
+            aprendizaje = getattr(engine, "aprendizaje", None)
+            adaptive_ops = getattr(aprendizaje, "total_operations", 0) if aprendizaje is not None else 0
+            displayed_ops = max(total_ops, adaptive_ops)
 
-            if confidences:
-                avg_conf = float(np.mean(confidences))
-            else:
-                avg_conf = 0.0
+            confidences = list(getattr(engine, "learning_confidences", []))
+            if not confidences:
+                history = getattr(engine, "trade_history", [])
+                for record in history[-100:]:
+                    value = getattr(record, "confidence", None)
+                    if value is not None:
+                        confidences.append(float(value))
+
+            avg_conf = float(np.mean(confidences)) if confidences else 0.0
 
             progress = 0.0
-            if total_ops > 0:
-                progress = min(100.0, (total_ops / 100.0) * max(avg_conf, 0.0) * 100.0)
+            if displayed_ops > 0:
+                progress = min(100.0, (displayed_ops / 100.0) * max(avg_conf, 0.0) * 100.0)
 
-            mode = "Pasivo"
-            if total_ops > 70:
+            if not getattr(self, "learning_enabled", True):
+                mode = "Pausado"
+            elif displayed_ops > 70:
                 mode = "Estable"
-            elif total_ops > 30:
+            elif displayed_ops > 30:
                 mode = "Aprendizaje"
+            else:
+                mode = "Pasivo"
 
-            self.label_operations.setText(f"Operaciones totales: {total_ops}")
+            self.label_operations.setText(f"Operaciones totales: {displayed_ops}")
             self.label_precision.setText(f"Precisión actual: {precision:.2f}%")
             self.label_confidence.setText(f"Confianza promedio: {avg_conf:.2f}")
             self.label_progress.setText(f"Progreso adaptativo: {progress:.2f}%")
             self.label_mode.setText(f"Modo: {mode}")
             self.progress_bar.setValue(int(progress))
 
+            desired_state = getattr(self, "learning_enabled", True)
+            if self.learning_toggle.isChecked() != desired_state:
+                self.learning_toggle.blockSignals(True)
+                self.learning_toggle.setChecked(desired_state)
+                self.learning_toggle.blockSignals(False)
+
         except Exception as exc:
             print(f"[LearningTab] Update error: {exc}")
+
+    def _on_learning_toggled(self, state: int) -> None:
+        enabled = state == QtCore.Qt.Checked
+        self.learning_enabled = enabled
+        engine = getattr(self, "engine", None)
+        if engine is not None:
+            engine.set_learning_enabled(enabled)
 
     def start_trading(self) -> None:
         if self.bot_thread is not None and self.bot_thread.isRunning():
