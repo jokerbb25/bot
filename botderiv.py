@@ -103,6 +103,7 @@ RESUME_MESSAGE = "🔁 Reanudando análisis del mercado..."
 
 CSV_LOGGED_CONTRACTS: Set[int] = set()
 BIAS_MEMORY_PATH = Path("bias_memory.json")
+WINNER_MEMORY_PATH = Path("sesgos_ganadores.json")
 
 
 def send_telegram_message(text: str) -> None:
@@ -155,6 +156,29 @@ def save_biases(biases: Dict[str, Dict[str, Any]]) -> None:
         logging.debug(f"No se pudo guardar sesgos: {exc}")
 
 
+def load_winner_biases() -> List[Dict[str, Any]]:
+    if not WINNER_MEMORY_PATH.exists():
+        return []
+    try:
+        with WINNER_MEMORY_PATH.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        if isinstance(data, list):
+            return [dict(entry) for entry in data]
+        if isinstance(data, dict):
+            return [dict(value) for value in data.values()]
+    except Exception as exc:  # pragma: no cover
+        logging.debug(f"No se pudo cargar sesgos ganadores: {exc}")
+    return []
+
+
+def save_winner_biases(entries: List[Dict[str, Any]]) -> None:
+    try:
+        with WINNER_MEMORY_PATH.open("w", encoding="utf-8") as handle:
+            json.dump(entries, handle, ensure_ascii=False, indent=2)
+    except Exception as exc:  # pragma: no cover
+        logging.debug(f"No se pudo guardar sesgos ganadores: {exc}")
+
+
 def selective_memory_recovery(saved_biases: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
     filtered_biases: Dict[str, Dict[str, Any]] = {}
     for symbol, data in saved_biases.items():
@@ -163,7 +187,7 @@ def selective_memory_recovery(saved_biases: Dict[str, Dict[str, Any]]) -> Dict[s
         if outcome == "WIN" and confidence_value >= KEEP_WIN_MIN_CONF:
             filtered_biases[symbol] = dict(data)
     logging.info(
-        "🧠 Strict selective maintenance: %d winning biases preserved",
+        "🧠 Selective maintenance: %d winning biases preserved",
         len(filtered_biases),
     )
     return filtered_biases
@@ -2645,6 +2669,13 @@ class TradingEngine:
         self.last_result: Optional[str] = None
         self.last_confidence: float = 0.0
         self.bias_memory: Dict[str, Dict[str, Any]] = load_biases()
+        self.winner_biases: List[Dict[str, Any]] = load_winner_biases()
+        try:
+            send_telegram_message(
+                f"🧠 Memoria cargada con {len(self.winner_biases)} sesgos ganadores"
+            )
+        except Exception:
+            logging.debug("No se pudo notificar la carga de sesgos ganadores")
         self._selective_thread: Optional[threading.Thread] = None
         self._telegram_thread: Optional[threading.Thread] = None
         self.telegram_bot = telegram_bot
@@ -2706,11 +2737,32 @@ class TradingEngine:
             save_biases(preserved)
             self.bias_memory = preserved
             logging.info(
-                "🧠 Strict selective maintenance: %d strong winning biases kept.",
+                "🧠 Selective maintenance: %d strong winning biases kept.",
                 len(preserved),
             )
         except Exception as exc:
             logging.error(f"❌ Error in selective memory maintenance: {exc}")
+
+    def _store_winner_bias(
+        self,
+        symbol: str,
+        rsi_value: float,
+        ema_spread: float,
+        volatility: float,
+        regime: Optional[str],
+        confidence_value: float,
+    ) -> None:
+        entry = {
+            "symbol": symbol,
+            "rsi": float(rsi_value),
+            "ema": float(ema_spread),
+            "volatility": float(volatility),
+            "regime": regime or "DESCONOCIDO",
+            "confidence": float(confidence_value),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        self.winner_biases.append(entry)
+        save_winner_biases(self.winner_biases)
 
     def start_background_services(self) -> None:
         try:
@@ -2745,6 +2797,10 @@ class TradingEngine:
         self._notify_status("connecting")
         try:
             self.api.connect()
+            try:
+                send_telegram_message("🤖 Bot iniciado correctamente y conectado a Deriv")
+            except Exception:
+                logging.debug("No se pudo enviar mensaje de inicio a Telegram")
         except Exception:
             self.running.clear()
             self._notify_status("stopped")
@@ -3189,6 +3245,7 @@ class TradingEngine:
             self._latest_regime_inputs = {'symbol': symbol, 'ema_slope': ema_slope, 'boll_width': boll_width}
             regime = self.detect_market_regime(adx_value, boll_width, smoothed_volatility)
             self._apply_regime_adjustments(regime)
+            evaluation['regime'] = regime
             signals = [rsi_signal, ema_signal, macd_signal]
             if signals.count('CALL') >= 2:
                 evaluation['confluence_direction'] = 'CALL'
@@ -3196,6 +3253,86 @@ class TradingEngine:
             elif signals.count('PUT') >= 2:
                 evaluation['confluence_direction'] = 'PUT'
                 evaluation['confluence_confirmed'] = True
+            strategy_conf_map = consensus.get('strategy_confidences', {})
+            rsi_strength = float(np.clip(strategy_conf_map.get('RSI', 0.0), 0.0, 1.0))
+            if rsi_strength == 0.0:
+                rsi_strength = float(
+                    np.clip(strategy_conf_map.get('RSI Strategy', 0.0), 0.0, 1.0)
+                )
+            if rsi_strength == 0.0:
+                rsi_outcome = next(
+                    (
+                        outcome
+                        for name, outcome in results
+                        if name.lower() == 'rsi'
+                    ),
+                    None,
+                )
+                if rsi_outcome is not None:
+                    rsi_strength = float(np.clip(abs(rsi_outcome.score), 0.0, 1.0))
+            ema_strength = float(
+                np.clip(
+                    strategy_conf_map.get('EMA Trend', strategy_conf_map.get('EMA', 0.0)),
+                    0.0,
+                    1.0,
+                )
+            )
+            if ema_strength == 0.0:
+                ema_outcome = next(
+                    (
+                        outcome
+                        for name, outcome in results
+                        if name.lower() == 'ema trend' or name.lower() == 'ema'
+                    ),
+                    None,
+                )
+                if ema_outcome is not None:
+                    ema_strength = float(np.clip(abs(ema_outcome.score), 0.0, 1.0))
+            active_signals = [
+                outcome for _, outcome in results if outcome.signal in {'CALL', 'PUT'}
+            ]
+            total_active = len(active_signals)
+            aligned_strategies = sum(
+                1 for outcome in active_signals if outcome.signal == signal
+            ) if signal in {'CALL', 'PUT'} else 0
+            contradictory = any(
+                outcome.signal not in {signal}
+                for outcome in active_signals
+            ) if signal in {'CALL', 'PUT'} else False
+            pullback_signal = next(
+                (
+                    outcome.signal
+                    for name, outcome in results
+                    if name.lower() == 'pullback'
+                ),
+                'NONE',
+            )
+            volatility_mid_range = 0.0005 <= smoothed_volatility <= 0.002
+            perfect_alignment = (
+                signal in {'CALL', 'PUT'}
+                and not contradictory
+                and pullback_signal == signal
+                and rsi_signal == signal
+                and ema_signal == signal
+                and total_active > 0
+                and aligned_strategies == total_active
+                and volatility_mid_range
+            )
+            if total_active > 0:
+                average_strength = (rsi_strength + ema_strength) / 2.0
+                strict_confidence = (aligned_strategies / total_active) * average_strength
+            else:
+                strict_confidence = 0.0
+            strict_confidence = float(np.clip(strict_confidence, 0.0, 0.95))
+            if perfect_alignment:
+                strict_confidence = 1.0
+            confidence = strict_confidence
+            consensus['confidence'] = confidence
+            evaluation['base_confidence'] = confidence
+            evaluation['strict_confidence'] = confidence
+            evaluation['perfect_alignment'] = perfect_alignment
+            evaluation['aligned'] = aligned_strategies
+            evaluation['active'] = total_active
             current_hour = datetime.now(timezone.utc).hour
             ml_probability = auto_learn.predict_win_probability(
                 latest_rsi,
@@ -3269,6 +3406,10 @@ class TradingEngine:
                 final_confidence = min_confidence
             final_confidence *= symbol_weight
             final_confidence = float(np.clip(final_confidence, 0.0, 1.0))
+            if perfect_alignment:
+                final_confidence = 1.0
+            else:
+                final_confidence = float(min(final_confidence, 0.95))
             logging.debug(
                 f"[Fusion] base={confidence:.3f} indicador={indicator_conf:.3f} IA={ai_confidence:.3f} final={final_confidence:.3f}"
             )
@@ -3432,12 +3573,35 @@ class TradingEngine:
                     volatility_value = float(volatility_raw)
                 except (TypeError, ValueError):
                     volatility_value = None
+            aprendizaje_ref = getattr(self, 'aprendizaje', None)
+            dynamic_min_conf = max(0.70, MIN_CONFIDENCE)
+            latest_rsi_value = 0.0
+            ema_value_for_threshold = 0.0
+            try:
+                latest_rsi_value = float(evaluation.get('latest_rsi', 0.0))
+            except (TypeError, ValueError):
+                latest_rsi_value = 0.0
+            try:
+                ema_value_for_threshold = float(evaluation.get('ema_spread', 0.0))
+            except (TypeError, ValueError):
+                ema_value_for_threshold = 0.0
+            if aprendizaje_ref is not None:
+                try:
+                    dynamic_min_conf = max(
+                        dynamic_min_conf,
+                        aprendizaje_ref.get_dynamic_threshold(
+                            latest_rsi_value,
+                            ema_value_for_threshold,
+                        ),
+                    )
+                except Exception as exc:
+                    logging.debug(f"No se pudo obtener umbral dinámico: {exc}")
             confidence_for_log = confidence_value if confidence_value is not None else 0.0
             volatility_display = f"{volatility_value:.4f}" if volatility_value is not None else "N/A"
             logging.info(
                 f"📊 Final confidence {symbol}: {confidence_for_log:.2f} | Volatility: {volatility_display} | Action: {direction}"
             )
-            if confidence_value is None or confidence_value < MIN_CONFIDENCE:
+            if confidence_value is None or confidence_value < dynamic_min_conf:
                 logging.info(
                     f"🚫 Skipping trade on {symbol} due to low confidence ({confidence_for_log:.2f})"
                 )
@@ -3462,14 +3626,20 @@ class TradingEngine:
         reasons.append('Multi-indicator confirmation')
         enriched['reasons'] = reasons
         consensus_snapshot = dict(enriched.get('consensus', {}))
-        consensus_snapshot['confidence_label'] = 'Alta'
-        consensus_snapshot['confidence'] = 1.0
+        final_snapshot = confidence_value if confidence_value is not None else dynamic_min_conf
+        perfect_alignment = bool(enriched.get('perfect_alignment'))
+        if perfect_alignment:
+            final_snapshot = 1.0
+        else:
+            final_snapshot = float(np.clip(final_snapshot, 0.0, 0.95))
+        consensus_snapshot['confidence_label'] = 'Alta' if final_snapshot >= 0.85 else 'Media'
+        consensus_snapshot['confidence'] = final_snapshot
         consensus_snapshot['main_reason'] = 'multi-confirmation'
         consensus_snapshot['override'] = True
         consensus_snapshot['override_reason'] = 'multi-confirmation'
         enriched['consensus'] = consensus_snapshot
-        enriched['ai_confidence'] = max(float(enriched.get('ai_confidence', 0.0)), 1.0)
-        enriched['final_confidence'] = 1.0
+        enriched['ai_confidence'] = max(float(enriched.get('ai_confidence', 0.0)), final_snapshot)
+        enriched['final_confidence'] = final_snapshot
         enriched['eligible'] = True
         probability = float(enriched.get('predicted_probability', 0.6))
         enriched['stake'] = self._calculate_kelly_stake(probability)
@@ -3691,6 +3861,15 @@ class TradingEngine:
                 "nota": notes,
                 "ticket": contract_id,
             }
+            if win_flag:
+                self._store_winner_bias(
+                    symbol,
+                    latest_rsi,
+                    ema_spread,
+                    volatilidad_actual,
+                    evaluation.get('regime'),
+                    confidence_value,
+                )
             should_notify = True
             if contract_id is not None and not self._register_contract_closure(contract_id):
                 logging.debug(f"Contract {contract_id} already closed. Skipping duplicate log.")
@@ -3699,14 +3878,14 @@ class TradingEngine:
                 ticket_label = f"#{contract_id}" if contract_id is not None else "N/A"
                 total_trades = int(self.total_operations)
                 winrate = self.get_accuracy()
-                emoji = "🟢" if win_flag else "🔴"
+                emoji = "✅" if win_flag else "❌"
+                resultado_texto = "GANADA" if win_flag else "PERDIDA"
                 message = (
-                    f"{emoji} {symbol}\n"
-                    f"Resultado: {trade_result}\n"
-                    f"Confianza: {confidence_value:.2f}\n"
-                    f"Operaciones: {total_trades}\n"
-                    f"Precisión: {winrate:.2f}%\n"
-                    f"Ticket: {ticket_label}"
+                    f"{emoji} 🎯 Activo: {symbol}\n"
+                    f"📊 Resultado: {resultado_texto}\n"
+                    f"📈 Confianza: {confidence_value:.2f}\n"
+                    f"⚙️ Operaciones: {total_trades}\n"
+                    f"🎯 Precisión actual: {winrate:.2f}%"
                 )
                 send_telegram_message(message)
                 self._notify_trade_result(result_info)
@@ -3740,9 +3919,11 @@ class TradingEngine:
                     trade_result,
                     symbol,
                     latest_rsi,
+                    ema_spread,
                     volatilidad_actual,
                     signals_list,
                     signal,
+                    confidence_value,
                 )
                 self.last_learning_feedback = feedback
                 if feedback is not None:

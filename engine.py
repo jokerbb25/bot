@@ -78,6 +78,9 @@ class EvaluationResult:
     skip_reason: Optional[str]
     stake: float
     cooldown_until: Optional[float]
+    perfect_alignment: bool
+    rsi_strength: float
+    ema_strength: float
 
 
 def _consensus_direction(results: Sequence[StrategyResult]) -> Tuple[Optional[str], int]:
@@ -129,29 +132,65 @@ def _strong_signal_count(results: Iterable[StrategyResult]) -> int:
     return sum(1 for result in results if result.strong_alignment())
 
 
+def _find_result(results: Sequence[StrategyResult], aliases: Iterable[str]) -> Optional[StrategyResult]:
+    normalized_aliases = {alias.strip().upper().replace(" ", "_") for alias in aliases}
+    for result in results:
+        if result.normalized_name() in normalized_aliases:
+            return result
+    return None
+
+
 def evaluate_snapshot(snapshot: StrategySnapshot) -> EvaluationResult:
     active_results = list(snapshot.active_signals())
     active_count = len(active_results)
     strong_count = _strong_signal_count(active_results)
     consensus_direction, aligned_count = _consensus_direction(active_results)
 
+    total_strategies = active_count if active_count > 0 else 1
+
+    rsi_result = _find_result(active_results, {"RSI"})
+    ema_result = _find_result(active_results, {"EMA", "EMA_TREND"})
+    pullback_result = _find_result(active_results, {"PULLBACK"})
+
+    rsi_strength = float(np.clip(rsi_result.confidence if rsi_result else 0.0, 0.0, 1.0))
+    ema_strength = float(np.clip(ema_result.confidence if ema_result else 0.0, 0.0, 1.0))
+
+    volatility = float(snapshot.volatility or 0.0)
+    volatility_mid_range = 0.0005 <= volatility <= 0.002 if volatility else False
+
+    has_contradiction = False
+    if consensus_direction:
+        has_contradiction = any(
+            result.normalized_signal() not in {"NONE", consensus_direction}
+            for result in active_results
+        )
+
+    perfect_alignment = (
+        consensus_direction in {"CALL", "PUT"}
+        and not has_contradiction
+        and rsi_result is not None
+        and ema_result is not None
+        and pullback_result is not None
+        and rsi_result.normalized_signal() == consensus_direction
+        and ema_result.normalized_signal() == consensus_direction
+        and pullback_result.normalized_signal() == consensus_direction
+        and aligned_count == active_count
+        and active_count > 0
+        and volatility_mid_range
+    )
+
+    if perfect_alignment:
+        final_confidence = 1.0
+    else:
+        base_confidence = float(aligned_count / total_strategies) if total_strategies else 0.0
+        average_strength = (rsi_strength + ema_strength) / 2.0
+        final_confidence = base_confidence * average_strength
+        final_confidence = float(np.clip(final_confidence, 0.0, 0.95))
+
     if active_count == 0:
         base_confidence = 0.0
     else:
-        base_confidence = float(aligned_count / active_count)
-
-    volatility = float(snapshot.volatility or 0.0)
-    volatility_weight = _volatility_weight(volatility) if volatility else 1.0
-    regime_weight = _regime_weight(snapshot.regime)
-    success_rate = _success_rate(snapshot.symbol)
-    historical_weight = 0.9 + (0.2 * success_rate)
-
-    try:
-        final_confidence = base_confidence * volatility_weight * regime_weight * historical_weight
-    except Exception:
-        final_confidence = base_confidence
-
-    final_confidence = float(np.clip(final_confidence, 0.0, 1.0))
+        base_confidence = float(aligned_count / total_strategies)
 
     valid_volatility = False
     if volatility:
@@ -214,14 +253,17 @@ def evaluate_snapshot(snapshot: StrategySnapshot) -> EvaluationResult:
         strong_signals=strong_count,
         aligned_strategies=aligned_count,
         active_strategies=active_count,
-        volatility_weight=volatility_weight,
-        regime_weight=regime_weight,
-        historical_weight=historical_weight,
+        volatility_weight=1.0,
+        regime_weight=1.0,
+        historical_weight=1.0,
         valid_volatility=valid_volatility,
         consensus_direction=consensus_direction,
         skip_reason=skip_reason,
         stake=stake,
         cooldown_until=cooldown_until,
+        perfect_alignment=perfect_alignment,
+        rsi_strength=rsi_strength,
+        ema_strength=ema_strength,
     )
 
 
