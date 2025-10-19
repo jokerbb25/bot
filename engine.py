@@ -141,60 +141,107 @@ def _find_result(results: Sequence[StrategyResult], aliases: Iterable[str]) -> O
 
 
 def evaluate_snapshot(snapshot: StrategySnapshot) -> EvaluationResult:
-    pullback_signal = None
+    rsi_signal = None
+    ema_signal = None
     bollinger_signal = None
-    divergence_signal = None
+    pullback_signal = None
     range_break_signal = None
-    active_results = list(snapshot.active_signals())
-    active_count = len(active_results)
-    strong_count = _strong_signal_count(active_results)
-    consensus_direction, aligned_count = _consensus_direction(active_results)
+    divergence_signal = None
+    volatility_signal = None
+    final_signal = None
+    confidence = 0.0
 
-    total_strategies = active_count if active_count > 0 else 1
-
-    rsi_result = _find_result(active_results, {"RSI"})
-    ema_result = _find_result(active_results, {"EMA", "EMA_TREND"})
-    pullback_result = _find_result(active_results, {"PULLBACK"})
-
-    rsi_strength = float(np.clip(rsi_result.confidence if rsi_result else 0.0, 0.0, 1.0))
-    ema_strength = float(np.clip(ema_result.confidence if ema_result else 0.0, 0.0, 1.0))
-
+    active_results: Sequence[StrategyResult] = []
+    active_count = 0
+    strong_count = 0
+    consensus_direction: Optional[str] = None
+    aligned_count = 0
+    total_strategies = 1
+    rsi_result: Optional[StrategyResult] = None
+    ema_result: Optional[StrategyResult] = None
+    pullback_result: Optional[StrategyResult] = None
+    rsi_strength = 0.0
+    ema_strength = 0.0
     volatility = float(snapshot.volatility or 0.0)
-    volatility_mid_range = 0.0005 <= volatility <= 0.002 if volatility else False
-
+    volatility_mid_range = False
     has_contradiction = False
-    if consensus_direction:
-        has_contradiction = any(
-            result.normalized_signal() not in {"NONE", consensus_direction}
-            for result in active_results
+    perfect_alignment = False
+    base_confidence = 0.0
+    final_confidence = 0.0
+
+    try:
+        active_results = list(snapshot.active_signals())
+        active_count = len(active_results)
+        strong_count = _strong_signal_count(active_results)
+        consensus_direction, aligned_count = _consensus_direction(active_results)
+        total_strategies = active_count if active_count > 0 else 1
+
+        rsi_result = _find_result(active_results, {"RSI"})
+        ema_result = _find_result(active_results, {"EMA", "EMA_TREND"})
+        pullback_result = _find_result(active_results, {"PULLBACK"})
+
+        rsi_signal = rsi_result.normalized_signal() if rsi_result else None
+        ema_signal = ema_result.normalized_signal() if ema_result else None
+        pullback_signal = pullback_result.normalized_signal() if pullback_result else None
+
+        rsi_strength = float(np.clip(rsi_result.confidence if rsi_result else 0.0, 0.0, 1.0))
+        ema_strength = float(np.clip(ema_result.confidence if ema_result else 0.0, 0.0, 1.0))
+
+        volatility = float(snapshot.volatility or 0.0)
+        volatility_mid_range = 0.0005 <= volatility <= 0.002 if volatility else False
+
+        if consensus_direction:
+            has_contradiction = any(
+                result.normalized_signal() not in {"NONE", consensus_direction}
+                for result in active_results
+            )
+
+        perfect_alignment = (
+            consensus_direction in {"CALL", "PUT"}
+            and not has_contradiction
+            and rsi_result is not None
+            and ema_result is not None
+            and pullback_result is not None
+            and rsi_result.normalized_signal() == consensus_direction
+            and ema_result.normalized_signal() == consensus_direction
+            and pullback_result.normalized_signal() == consensus_direction
+            and aligned_count == active_count
+            and active_count > 0
+            and volatility_mid_range
         )
 
-    perfect_alignment = (
-        consensus_direction in {"CALL", "PUT"}
-        and not has_contradiction
-        and rsi_result is not None
-        and ema_result is not None
-        and pullback_result is not None
-        and rsi_result.normalized_signal() == consensus_direction
-        and ema_result.normalized_signal() == consensus_direction
-        and pullback_result.normalized_signal() == consensus_direction
-        and aligned_count == active_count
-        and active_count > 0
-        and volatility_mid_range
-    )
+        if perfect_alignment:
+            final_confidence = 1.0
+        else:
+            base_confidence = float(aligned_count / total_strategies) if total_strategies else 0.0
+            average_strength = (rsi_strength + ema_strength) / 2.0
+            final_confidence = base_confidence * average_strength
+            final_confidence = float(np.clip(final_confidence, 0.0, 0.95))
 
-    if perfect_alignment:
-        final_confidence = 1.0
-    else:
-        base_confidence = float(aligned_count / total_strategies) if total_strategies else 0.0
-        average_strength = (rsi_strength + ema_strength) / 2.0
-        final_confidence = base_confidence * average_strength
-        final_confidence = float(np.clip(final_confidence, 0.0, 0.95))
+        if active_count == 0:
+            base_confidence = 0.0
+        else:
+            base_confidence = float(aligned_count / total_strategies)
 
-    if active_count == 0:
-        base_confidence = 0.0
-    else:
-        base_confidence = float(aligned_count / total_strategies)
+        final_signal = consensus_direction
+        confidence = final_confidence
+    except Exception as exc:
+        logging.warning('[%s] Strategy evaluation error: %s', snapshot.symbol, str(exc))
+
+    if volatility and volatility < 0.0005:
+        logging.info('⚠️ Skipping low-volatility asset (%s) — volatility=%.6f', snapshot.symbol, volatility)
+        return None
+
+    if pullback_signal is None:
+        pullback_signal = 'NONE'
+    if bollinger_signal is None:
+        bollinger_signal = 'NONE'
+    if divergence_signal is None:
+        divergence_signal = 'NONE'
+    if range_break_signal is None:
+        range_break_signal = 'NONE'
+    if volatility_signal is None:
+        volatility_signal = 'NONE'
 
     valid_volatility = False
     if volatility:
@@ -203,26 +250,26 @@ def evaluate_snapshot(snapshot: StrategySnapshot) -> EvaluationResult:
     stake = float(snapshot.base_stake)
     if valid_volatility and volatility < STAKE_REDUCTION_THRESHOLD:
         stake *= LOW_VOLATILITY_STAKE_FACTOR
-        logging.info("⚠️ Low volatility (%s) → reducing stake to %.4f", f"{volatility:.5f}", stake)
+        logging.info('⚠️ Low volatility (%s) → reducing stake to %.4f', f"{volatility:.5f}", stake)
 
     allow_trade = False
     skip_reason: Optional[str] = None
 
     if final_confidence < SOFT_LOWER_BOUND:
-        skip_reason = "confidence_floor"
+        skip_reason = 'confidence_floor'
     elif final_confidence < CONFIDENCE_THRESHOLD:
         calibrator.passive_update(snapshot.symbol, final_confidence)
-        skip_reason = "confidence_soft_zone"
+        skip_reason = 'confidence_soft_zone'
     else:
         allow_trade = True
 
     if allow_trade and not valid_volatility:
         allow_trade = False
-        skip_reason = "invalid_volatility"
+        skip_reason = 'invalid_volatility'
 
     if allow_trade and (consensus_direction is None or aligned_count < 3):
         allow_trade = False
-        skip_reason = "insufficient_alignment"
+        skip_reason = 'insufficient_alignment'
 
     current_time = snapshot.current_time or time.time()
     cooldown_until: Optional[float] = None
@@ -232,16 +279,15 @@ def evaluate_snapshot(snapshot: StrategySnapshot) -> EvaluationResult:
         if existing > current_time:
             allow_trade = False
             cooldown_until = existing
-            skip_reason = skip_reason or "cooldown_active"
+            skip_reason = skip_reason or 'cooldown_active'
 
+    losses = 0
     if snapshot.consecutive_losses:
         losses = int(snapshot.consecutive_losses.get(snapshot.symbol, 0))
-    else:
-        losses = 0
     if losses >= 3:
         cooldown_until = max(cooldown_until or 0.0, current_time + 120.0)
         allow_trade = False
-        skip_reason = skip_reason or "cooldown_triggered"
+        skip_reason = skip_reason or 'cooldown_triggered'
 
     if snapshot.trades_count and snapshot.trades_count % 30 == 0:
         calibrator.rebalance()
@@ -250,14 +296,6 @@ def evaluate_snapshot(snapshot: StrategySnapshot) -> EvaluationResult:
         calibrator.update(final_confidence, snapshot.trade_result, snapshot.symbol)
         _update_success_memory(snapshot.symbol, snapshot.trade_result)
 
-    if 'pullback_signal' not in locals():
-        pullback_signal = None
-    if 'bollinger_signal' not in locals():
-        bollinger_signal = None
-    if 'divergence_signal' not in locals():
-        divergence_signal = None
-    if 'range_break_signal' not in locals():
-        range_break_signal = None
     return EvaluationResult(
         final_confidence=final_confidence,
         base_confidence=base_confidence,
@@ -277,6 +315,5 @@ def evaluate_snapshot(snapshot: StrategySnapshot) -> EvaluationResult:
         rsi_strength=rsi_strength,
         ema_strength=ema_strength,
     )
-
 
 __all__ = ["EvaluationResult", "evaluate_snapshot", "CONFIDENCE_THRESHOLD", "SOFT_LOWER_BOUND", "MIN_CONFIDENCE"]
