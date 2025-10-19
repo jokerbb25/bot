@@ -58,7 +58,7 @@ MAX_DAILY_PROFIT = 100.0
 COOLDOWN_AFTER_LOSS = 60
 MAX_DRAWDOWN = -150.0
 MIN_TRADE_CONFIDENCE = 0.45
-MIN_CONFIDENCE = 0.65
+MIN_CONFIDENCE = 0.70
 MIN_VOLATILITY = 0.0005
 
 # === STRICT MODE PARAMETERS ===
@@ -67,7 +67,7 @@ LOW_VOL_THRESHOLD = 0.0006
 LOW_VOL_CONFIDENCE = 0.85
 NEUTRAL_RSI_BAND = (45.0, 55.0)
 NEUTRAL_RSI_CONF = 0.95
-MIN_ALIGNED_STRATEGIES = 3
+MIN_ALIGNED_STRATEGIES = 2
 POST_LOSS_COOLDOWN_SEC = 120
 MAX_TRADES_PER_HOUR = 20
 KEEP_WIN_MIN_CONF = 0.70
@@ -3755,8 +3755,9 @@ class TradingEngine:
             and ema_signal_eval in {'CALL', 'PUT'}
             and rsi_signal_eval != ema_signal_eval
         ):
-            logging.info("⚠️ RSI y EMA en conflicto → cancelando señal.")
-            return False
+            logging.info("⚠️ RSI y EMA en conflicto → reduciendo confianza (penalización 15%).")
+            confidence_value *= 0.85
+            evaluation['final_confidence'] = confidence_value
         if STRICT_MODE_ENABLED:
             if confidence_value < CONFIDENCE_MIN:
                 logging.info("🚫 Skipping trade — low confidence (modo estricto).")
