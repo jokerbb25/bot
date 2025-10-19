@@ -3087,6 +3087,10 @@ class TradingEngine:
         divergence_signal = 'NONE'
         volatility_signal = 'NONE'
         final_signal = 'NONE'
+        combined_base_action = 'NONE'
+        skip_reason = None
+        confidence = 0.0
+        stake = 0.0
         try:
             try:
                 candles = self.api.fetch_candles(symbol)
@@ -3464,6 +3468,20 @@ class TradingEngine:
             logging.warning(f"Error en ciclo para {symbol}: {exc}")
             return None
         finally:
+            if combined_base_action is None:
+                combined_base_action = 'NONE'
+            if pullback_signal is None:
+                pullback_signal = 'NONE'
+            if bollinger_signal is None:
+                bollinger_signal = 'NONE'
+            if divergence_signal is None:
+                divergence_signal = 'NONE'
+            if range_break_signal is None:
+                range_break_signal = 'NONE'
+            if volatility_signal is None:
+                volatility_signal = 'NONE'
+            if final_signal is None:
+                final_signal = 'NONE'
             auto_learn.set_active_symbol(None)
 
     def scan_market(self) -> None:
