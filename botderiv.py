@@ -3088,6 +3088,7 @@ class TradingEngine:
         volatility_signal = 'NONE'
         final_signal = 'NONE'
         combined_base_action = 'NONE'
+        primary_signals: List[str] = []
         skip_reason = None
         confidence = 0.0
         stake = 0.0
@@ -3482,6 +3483,8 @@ class TradingEngine:
                 volatility_signal = 'NONE'
             if final_signal is None:
                 final_signal = 'NONE'
+            if primary_signals is None:
+                primary_signals = []
             auto_learn.set_active_symbol(None)
 
     def scan_market(self) -> None:
