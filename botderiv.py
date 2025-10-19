@@ -11,7 +11,7 @@ from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
-from typing import Any, Callable, Dict, Iterable, List, Optional, Tuple
+from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 
 import numpy as np
 import pandas as pd
@@ -32,6 +32,9 @@ except ImportError:  # pragma: no cover
     gp_minimize = None  # type: ignore
 
 from PyQt5 import QtCore, QtGui, QtWidgets
+from PyQt5.QtCore import QThread, pyqtSignal
+from aprendizaje import Aprendizaje
+from telegram_bot import BOT_ACTIVE, telegram_listener
 
 try:
     import websocket  # type: ignore
@@ -55,6 +58,25 @@ MAX_DAILY_PROFIT = 100.0
 COOLDOWN_AFTER_LOSS = 60
 MAX_DRAWDOWN = -150.0
 MIN_TRADE_CONFIDENCE = 0.45
+MIN_CONFIDENCE = 0.65
+MIN_VOLATILITY = 0.0005
+
+# === STRICT MODE PARAMETERS ===
+CONFIDENCE_MIN = 0.75
+LOW_VOL_THRESHOLD = 0.0006
+LOW_VOL_CONFIDENCE = 0.85
+NEUTRAL_RSI_BAND = (45.0, 55.0)
+NEUTRAL_RSI_CONF = 0.95
+MIN_ALIGNED_STRATEGIES = 3
+POST_LOSS_COOLDOWN_SEC = 120
+MAX_TRADES_PER_HOUR = 20
+KEEP_WIN_MIN_CONF = 0.70
+MAINTENANCE_EVERY = 40
+STRICT_MODE_ENABLED = True
+
+# === TELEGRAM BOT CONFIGURATION ===
+TELEGRAM_TOKEN = "8300367826:AAGzaMCJRY6pzZEqzjqgzAaRUXC_19KcB60"
+TELEGRAM_CHAT_ID = "8364256476"
 
 AI_ENABLED = True
 AI_PASSIVE_MODE = True
@@ -78,6 +100,158 @@ operation_active = False
 TRADE_DURATION_SECONDS = 60
 RESULT_POLL_INTERVAL = 5
 RESUME_MESSAGE = "🔁 Reanudando análisis del mercado..."
+
+CSV_LOGGED_CONTRACTS: Set[int] = set()
+BIAS_MEMORY_PATH = Path("bias_memory.json")
+WINNER_MEMORY_PATH = Path("sesgos_ganadores.json")
+
+
+def send_telegram_message(text: str) -> None:
+    try:
+        url = f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/sendMessage"
+        payload = {"chat_id": TELEGRAM_CHAT_ID, "text": text}
+        requests.post(url, json=payload, timeout=5)
+    except Exception as exc:
+        logging.warning(f"⚠️ Telegram message failed: {exc}")
+
+
+def load_biases() -> Dict[str, Dict[str, Any]]:
+    if not BIAS_MEMORY_PATH.exists():
+        return {}
+    try:
+        with BIAS_MEMORY_PATH.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        normalized: Dict[str, Dict[str, Any]] = {}
+        for symbol, state in data.items():
+            symbol_key = str(symbol)
+            snapshot = dict(state)
+            snapshot.setdefault("RSI", 0.0)
+            snapshot.setdefault("EMA", 0.0)
+            snapshot.setdefault("last_result", "NONE")
+            snapshot.setdefault("confidence", 0.0)
+            try:
+                snapshot["confidence"] = float(snapshot.get("confidence", 0.0))
+            except (TypeError, ValueError):
+                snapshot["confidence"] = 0.0
+            normalized[symbol_key] = snapshot
+        return normalized
+    except Exception as exc:  # pragma: no cover
+        logging.debug(f"No se pudo cargar sesgos almacenados: {exc}")
+        return {}
+
+
+def save_biases(biases: Dict[str, Dict[str, Any]]) -> None:
+    payload: Dict[str, Dict[str, Any]] = {}
+    for symbol, state in biases.items():
+        payload[symbol] = {
+            "RSI": float(state.get("RSI", 0.0)),
+            "EMA": float(state.get("EMA", 0.0)),
+            "last_result": state.get("last_result", "NONE"),
+            "confidence": float(state.get("confidence", 0.0)),
+        }
+    try:
+        with BIAS_MEMORY_PATH.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle)
+    except Exception as exc:  # pragma: no cover
+        logging.debug(f"No se pudo guardar sesgos: {exc}")
+
+
+def load_winner_biases() -> List[Dict[str, Any]]:
+    if not WINNER_MEMORY_PATH.exists():
+        return []
+    try:
+        with WINNER_MEMORY_PATH.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        if isinstance(data, list):
+            return [dict(entry) for entry in data]
+        if isinstance(data, dict):
+            return [dict(value) for value in data.values()]
+    except Exception as exc:  # pragma: no cover
+        logging.debug(f"No se pudo cargar sesgos ganadores: {exc}")
+    return []
+
+
+def save_winner_biases(entries: List[Dict[str, Any]]) -> None:
+    try:
+        with WINNER_MEMORY_PATH.open("w", encoding="utf-8") as handle:
+            json.dump(entries, handle, ensure_ascii=False, indent=2)
+    except Exception as exc:  # pragma: no cover
+        logging.debug(f"No se pudo guardar sesgos ganadores: {exc}")
+
+
+def selective_memory_recovery(saved_biases: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
+    filtered_biases: Dict[str, Dict[str, Any]] = {}
+    for symbol, data in saved_biases.items():
+        outcome = str(data.get("last_result", "")).upper()
+        confidence_value = float(data.get("confidence", 0.0))
+        if outcome == "WIN" and confidence_value >= KEEP_WIN_MIN_CONF:
+            filtered_biases[symbol] = dict(data)
+    logging.info(
+        "🧠 Selective maintenance: %d winning biases preserved",
+        len(filtered_biases),
+    )
+    return filtered_biases
+
+
+global_engine = None
+
+
+def telegram_bot() -> None:
+    global BOT_ACTIVE, global_engine
+    logging.info("🤖 Bot de Telegram activo y escuchando comandos...")
+
+    def _send_text(text: str) -> None:
+        send_telegram_message(text)
+
+    offset: Optional[int] = None
+    while True:
+        try:
+            params: Dict[str, Any] = {"timeout": 10}
+            if offset is not None:
+                params["offset"] = offset
+            response = requests.get(
+                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
+                params=params,
+                timeout=15,
+            )
+            payload = response.json()
+            if not payload.get("ok"):
+                time.sleep(5)
+                continue
+            for update in payload.get("result", []):
+                offset = update.get("update_id", 0) + 1
+                message = (update.get("message") or {}).get("text", "")
+                if not message:
+                    continue
+                command = message.lower()
+                if any(keyword in command for keyword in ("pause", "stop", "pausar")):
+                    BOT_ACTIVE = False
+                    _send_text("⏸ Bot detenido manualmente.")
+                elif any(keyword in command for keyword in ("resume", "start", "reanudar")):
+                    BOT_ACTIVE = True
+                    _send_text("▶️ Bot reanudado.")
+                elif any(keyword in command for keyword in ("status", "estado")):
+                    engine_ref = global_engine
+                    if engine_ref is not None:
+                        precision = engine_ref.get_accuracy()
+                        operations = engine_ref.total_operations
+                        _send_text(
+                            f"📊 Precisión: {precision:.2f}%\nOperaciones: {int(operations)}"
+                        )
+                    else:
+                        _send_text("ℹ️ Motor no disponible todavía.")
+                elif any(keyword in command for keyword in ("help", "ayuda")):
+                    _send_text("🧠 Comandos:\n- pausar\n- reanudar\n- estado\n- info")
+                elif "info" in command:
+                    engine_ref = global_engine
+                    if engine_ref is not None:
+                        _send_text(f"📄 Último contrato: {engine_ref.get_last_contract_info()}")
+                    else:
+                        _send_text("ℹ️ No hay información de contratos disponible.")
+        except Exception as exc:
+            logging.error(f"❌ Telegram bot error: {exc}")
+            time.sleep(5)
+        time.sleep(3)
 
 
 # ===============================================================
@@ -184,6 +358,19 @@ def donchian_channels(df: pd.DataFrame, period: int = 20) -> Tuple[pd.Series, pd
 
 
 def log_trade(record: TradeRecord) -> None:
+    contract_id: Optional[int] = None
+    if record.metadata:
+        raw_id = record.metadata.get('contract_id')
+        try:
+            contract_id = int(raw_id) if raw_id is not None else None
+        except (TypeError, ValueError):
+            contract_id = None
+    logged_contracts = CSV_LOGGED_CONTRACTS
+    if contract_id is not None:
+        if contract_id in logged_contracts:
+            logging.debug(f"Duplicate contract {contract_id} ignored.")
+            return
+        logged_contracts.add(contract_id)
     try:
         row = {
             "timestamp": record.timestamp.isoformat(),
@@ -194,6 +381,10 @@ def log_trade(record: TradeRecord) -> None:
             "pnl": record.pnl,
             "reasons": "|".join(record.reasons),
         }
+        strategy_snapshot = record.metadata.get('strategy_details', {}) if record.metadata else {}
+        confidence_snapshot = record.metadata.get('strategy_confidences', {}) if record.metadata else {}
+        row["strategies"] = json.dumps(strategy_snapshot)
+        row["strategy_confidences"] = json.dumps(confidence_snapshot)
         df = pd.DataFrame([row])
         path = Path(TRADES_LOG_PATH)
         if not path.exists():
@@ -241,8 +432,9 @@ class auto_learning:
         self.training_labels: List[int] = []
         self.trade_counter = 0
         self.model: Optional[RandomForestClassifier] = None
-        self.biases: Dict[str, Dict[str, float]] = {
-            symbol: {"RSI": 0.0, "EMA": 0.0} for symbol in SYMBOLS
+        self.biases: Dict[str, Dict[str, Any]] = {
+            symbol: {"RSI": 0.0, "EMA": 0.0, "last_result": "NONE"}
+            for symbol in SYMBOLS
         }
         self.last_signal: Dict[str, Dict[str, str]] = {
             symbol: {"source": "COMBINED"} for symbol in SYMBOLS
@@ -266,6 +458,8 @@ class auto_learning:
         self.recent_results: deque = deque(maxlen=200)
         self.learning_rate = 0.02
         self.weights_recalibrated = False
+        self.strategy_accuracy_snapshot: Dict[str, float] = {}
+        self._last_recalibration_total = 0
         self.min_confidence = MIN_TRADE_CONFIDENCE
         self.rsi_high_threshold = 70.0
         self.adx_min_threshold = 20.0
@@ -274,8 +468,7 @@ class auto_learning:
         self.reinforce_batches = 0
         self.optimize_batches = 0
         self.learning_event = threading.Event()
-        self.learning_thread = threading.Thread(target=self._learning_loop, daemon=True)
-        self.learning_thread.start()
+        self.learning_thread: Optional[threading.Thread] = None
         self._pending_context: Dict[str, Dict[str, float]] = {}
         self.symbol_profiles: Dict[str, Dict[str, Any]] = {
             symbol: self._default_symbol_profile() for symbol in SYMBOLS
@@ -284,6 +477,7 @@ class auto_learning:
             profile["learning_rate"] = self.learning_rate
         self._current_symbol: Optional[str] = None
         self._ensure_csv()
+        self._load_bias_storage()
     def _ensure_csv(self) -> None:
         if self.csv_path.exists():
             return
@@ -296,6 +490,64 @@ class auto_learning:
                     writer.writeheader()
             except Exception as exc:  # pragma: no cover
                 logging.debug(f"No se pudo crear CSV de autoaprendizaje: {exc}")
+
+    def _load_bias_storage(self) -> None:
+        stored = load_biases()
+        if not stored:
+            save_biases(self.biases)
+            return
+        cleaned = selective_memory_recovery(stored)
+        with self.bias_lock:
+            for symbol, state in self.biases.items():
+                if symbol in cleaned:
+                    data = cleaned[symbol]
+                    state["RSI"] = float(data.get("RSI", state.get("RSI", 0.0)))
+                    state["EMA"] = float(data.get("EMA", state.get("EMA", 0.0)))
+                    state["last_result"] = data.get("last_result", "WIN")
+                else:
+                    state["RSI"] = 0.0
+                    state["EMA"] = 0.0
+                    state["last_result"] = "LOSS"
+        self.maintain_selective_memory()
+        save_biases(self.biases)
+
+    def _persist_biases(self) -> None:
+        with self.bias_lock:
+            save_biases(self.biases)
+
+    def start_background_services(self) -> None:
+        if self.learning_thread is None or not self.learning_thread.is_alive():
+            self.learning_thread = threading.Thread(
+                target=self._learning_loop,
+                daemon=True,
+            )
+            self.learning_thread.start()
+        if self._telegram_thread is None or not self._telegram_thread.is_alive():
+            self._telegram_thread = threading.Thread(
+                target=telegram_listener,
+                args=(self,),
+                daemon=True,
+            )
+            self._telegram_thread.start()
+
+    def maintain_selective_memory(self) -> None:
+        try:
+            saved_biases = load_biases()
+            preserved: Dict[str, Dict[str, Any]] = {}
+            for symbol, state in saved_biases.items():
+                outcome = str(state.get("last_result", "")).upper()
+                confidence_value = float(state.get("confidence", 0.0))
+                if outcome == "WIN" and confidence_value >= KEEP_WIN_MIN_CONF:
+                    preserved[symbol] = dict(state)
+            save_biases(preserved)
+            with self.bias_lock:
+                self.bias_memory = preserved
+            logging.info(
+                "🧠 Strict selective maintenance: %d strong winning biases kept.",
+                len(preserved),
+            )
+        except Exception as exc:
+            logging.error(f"❌ Error in selective memory maintenance: {exc}")
 
     def _default_symbol_profile(self) -> Dict[str, Any]:
         return {
@@ -758,9 +1010,13 @@ class auto_learning:
             adjusted_rsi_value = float(rsi_value + (symbol_params.get("rsi_period", 14.0) - 14.0) * 0.5)
             adjusted_ema_value = float(ema_value + symbol_params.get("ema_tolerance", 0.0) * 0.1)
             with self.bias_lock:
-                bias_state = self.biases.setdefault(asset, {"RSI": 0.0, "EMA": 0.0})
+                bias_state = self.biases.setdefault(
+                    asset,
+                    {"RSI": 0.0, "EMA": 0.0, "last_result": "NONE"},
+                )
                 rsi_bias = float(bias_state.get("RSI", 0.0))
                 ema_bias = float(bias_state.get("EMA", 0.0))
+                bias_state["last_result"] = resultado
             trade_entry = {
                 "asset": asset,
                 "direction": direction,
@@ -796,6 +1052,26 @@ class auto_learning:
                     self.training_data = self.training_data[-5000:]
                     self.training_labels = self.training_labels[-5000:]
             self.trade_counter += 1
+            self._persist_biases()
+            if self.trade_counter % 50 == 0:
+                logging.info("🧹 Running selective memory cleanup...")
+                saved_biases = load_biases()
+                cleaned_biases = selective_memory_recovery(saved_biases)
+                with self.bias_lock:
+                    for symbol, state in self.biases.items():
+                        if symbol in cleaned_biases:
+                            data = cleaned_biases[symbol]
+                            state["RSI"] = float(data.get("RSI", 0.0))
+                            state["EMA"] = float(data.get("EMA", 0.0))
+                            state["last_result"] = data.get("last_result", "WIN")
+                        else:
+                            state["RSI"] = 0.0
+                            state["EMA"] = 0.0
+                            state["last_result"] = "LOSS"
+                self.maintain_selective_memory()
+                logging.info(
+                    "✅ Selective memory cleanup complete — losing biases removed."
+                )
             if self.trade_counter % 100 == 0 and self.trade_counter > 0:
                 should_train = True
             row_payload = {
@@ -836,11 +1112,123 @@ class auto_learning:
                 for clave, valor in list(self.weights.items()):
                     self.weights[clave] = float(np.clip(valor * (1.0 + adjustment), 0.2, 3.0))
             self.weights_recalibrated = True
+        if total_trades >= 100 and total_trades % 100 == 0 and total_trades != self._last_recalibration_total:
+            self._adaptive_recalibration(total_trades)
         self.learning_event.set()
 
     def _pop_context(self, asset: str) -> Dict[str, float]:
         with self.lock:
             return self._pending_context.pop(asset, {}).copy()
+
+    def _adaptive_recalibration(self, trade_total: int) -> None:
+        path = Path(TRADES_LOG_PATH)
+        if not path.exists():
+            self._last_recalibration_total = trade_total
+            return
+        try:
+            df = pd.read_csv(path)
+        except Exception as exc:  # pragma: no cover
+            logging.debug(f"No se pudo leer el log de operaciones para recalibración: {exc}")
+            self._last_recalibration_total = trade_total
+            return
+        if df.empty or 'strategies' not in df.columns:
+            self._last_recalibration_total = trade_total
+            return
+        accuracy_data: Dict[str, Dict[str, int]] = {}
+        for _, row in df.iterrows():
+            strategies_payload = row.get('strategies')
+            if not isinstance(strategies_payload, str) or not strategies_payload:
+                continue
+            try:
+                strategies_dict = json.loads(strategies_payload)
+            except Exception:
+                continue
+            decision = str(row.get('decision', '')).upper()
+            result = str(row.get('result', '')).upper()
+            if decision not in {'CALL', 'PUT'} or result not in {'WIN', 'LOSS'}:
+                continue
+            if decision == 'CALL':
+                opposite = 'PUT'
+            else:
+                opposite = 'CALL'
+            actual_direction = decision if result == 'WIN' else opposite
+            for strat_name, strat_info in strategies_dict.items():
+                signal = str(strat_info.get('signal', '')).upper()
+                if signal not in {'CALL', 'PUT'}:
+                    continue
+                stats = accuracy_data.setdefault(strat_name, {'wins': 0, 'total': 0})
+                stats['total'] += 1
+                if signal == actual_direction:
+                    stats['wins'] += 1
+        if not accuracy_data:
+            self._last_recalibration_total = trade_total
+            return
+        indicator_map = {
+            'RSI': 'RSI',
+            'EMA Trend': 'EMA',
+            'Bollinger Rebound': 'BOLL',
+            'Range Breakout': 'ADX',
+            'Divergence': 'MACD',
+        }
+        updated = False
+        new_indicator_weights: Dict[str, float] = {}
+        with self.weights_lock:
+            new_indicator_weights = dict(self.weights)
+        for strat_name, stats in accuracy_data.items():
+            total = stats['total']
+            if total == 0:
+                continue
+            accuracy_ratio = stats['wins'] / total
+            previous_accuracy = self.strategy_accuracy_snapshot.get(strat_name)
+            self.strategy_accuracy_snapshot[strat_name] = accuracy_ratio
+            if previous_accuracy is None:
+                continue
+            change = accuracy_ratio - previous_accuracy
+            if abs(change) < 0.01:
+                continue
+            adjustment_ratio = min(0.02, abs(change) * 0.5)
+            if adjustment_ratio <= 0.0:
+                continue
+            factor = 1.0 + adjustment_ratio if change > 0 else 1.0 - adjustment_ratio
+            if strat_name in STRATEGY_WEIGHTS:
+                with self.lock:
+                    STRATEGY_WEIGHTS[strat_name] = float(
+                        np.clip(STRATEGY_WEIGHTS[strat_name] * factor, 0.3, 3.0)
+                    )
+                updated = True
+            key = indicator_map.get(strat_name)
+            if key:
+                current_weight = new_indicator_weights.get(key)
+                if current_weight is not None:
+                    new_indicator_weights[key] = float(
+                        np.clip(current_weight * factor, 0.2, 3.0)
+                    )
+                    updated = True
+        if updated:
+            with self.weights_lock:
+                self.weights.update(new_indicator_weights)
+                self.weights_recalibrated = True
+        with self.weights_lock:
+            indicator_snapshot = {
+                'RSI': float(self.weights.get('RSI', 1.0)),
+                'EMA': float(self.weights.get('EMA', 1.0)),
+                'BOLL': float(self.weights.get('BOLL', 1.0)),
+                'ADX': float(self.weights.get('ADX', 0.8)),
+                'MACD': float(self.weights.get('MACD', 0.8)),
+            }
+        logging.info(
+            "📈 Adaptive weights updated: "
+            + ", ".join(
+                [
+                    f"RSI={indicator_snapshot['RSI']:.2f}",
+                    f"EMA={indicator_snapshot['EMA']:.2f}",
+                    f"Bollinger={indicator_snapshot['BOLL']:.2f}",
+                    f"ADX={indicator_snapshot['ADX']:.2f}",
+                    f"MACD={indicator_snapshot['MACD']:.2f}",
+                ]
+            )
+        )
+        self._last_recalibration_total = trade_total
 
     def adjust_bias(self, symbol: str, result: str, signal_direction: str, price_change: float) -> None:
         outcome = str(result).upper()
@@ -856,7 +1244,10 @@ class auto_learning:
         elif direction == "PUT" and price_delta > 0:
             direction_error = True
         with self.bias_lock:
-            bias_state = self.biases.setdefault(symbol, {"RSI": 0.0, "EMA": 0.0})
+            bias_state = self.biases.setdefault(
+                symbol,
+                {"RSI": 0.0, "EMA": 0.0, "last_result": "NONE"},
+            )
             if source == "RSI":
                 bias_state["RSI"] += -0.02 if direction_error else 0.02
             elif source == "EMA":
@@ -869,10 +1260,12 @@ class auto_learning:
             bias_state["EMA"] = float(np.clip(bias_state["EMA"], -2.0, 2.0))
             rsi_bias = float(bias_state["RSI"])
             ema_bias = float(bias_state["EMA"])
+            bias_state["last_result"] = outcome
         logging.info(
             f"🧠 Bias adjusted [{symbol}] Source={source} RSI={rsi_bias:.2f} EMA={ema_bias:.2f}"
         )
         self.log_bias_update(symbol, outcome, direction, price_delta, source)
+        self._persist_biases()
         self.learning_event.set()
 
     def log_bias_update(
@@ -886,7 +1279,10 @@ class auto_learning:
         timestamp_now = datetime.now(timezone.utc).isoformat()
         source_label = source or self.last_signal.get(symbol, {}).get("source", "COMBINED")
         with self.bias_lock:
-            bias_state = self.biases.setdefault(symbol, {"RSI": 0.0, "EMA": 0.0})
+            bias_state = self.biases.setdefault(
+                symbol,
+                {"RSI": 0.0, "EMA": 0.0, "last_result": "NONE"},
+            )
             rsi_bias = float(bias_state.get("RSI", 0.0))
             ema_bias = float(bias_state.get("EMA", 0.0))
         self._ensure_csv()
@@ -1183,7 +1579,7 @@ class auto_learning:
             if simbolo and simbolo in self.biases:
                 bias_state = self.biases[simbolo]
             else:
-                bias_state = {"RSI": 0.0, "EMA": 0.0}
+                bias_state = {"RSI": 0.0, "EMA": 0.0, "last_result": "NONE"}
             rsi_bias = float(bias_state.get("RSI", 0.0))
             ema_bias = float(bias_state.get("EMA", 0.0))
         features = np.array(
@@ -1220,7 +1616,11 @@ class auto_learning:
         with self.bias_lock:
             for nombre in SYMBOLS:
                 if nombre not in self.biases:
-                    self.biases[nombre] = {"RSI": 0.0, "EMA": 0.0}
+                    self.biases[nombre] = {
+                        "RSI": 0.0,
+                        "EMA": 0.0,
+                        "last_result": "NONE",
+                    }
             bias_snapshot = {
                 symbol: {
                     "RSI": float(state.get("RSI", 0.0)),
@@ -1236,7 +1636,7 @@ class auto_learning:
             "per_asset": per_asset,
             "global_accuracy": global_accuracy,
             "last_trades": list(reversed(historial)),
-            "status": self.learning_thread.is_alive(),
+            "status": bool(self.learning_thread and self.learning_thread.is_alive()),
             "biases": bias_snapshot,
             "last_prediction": self.last_prediction,
             "symbol_tuning": tuning,
@@ -1265,7 +1665,11 @@ class auto_learning:
             except Exception as exc:  # pragma: no cover
                 logging.debug(f"No se pudo eliminar CSV de autoaprendizaje: {exc}")
         with self.bias_lock:
-            self.biases = {symbol: {"RSI": 0.0, "EMA": 0.0} for symbol in SYMBOLS}
+            self.biases = {
+                symbol: {"RSI": 0.0, "EMA": 0.0, "last_result": "NONE"}
+                for symbol in SYMBOLS
+            }
+        self._persist_biases()
         with self.model_lock:
             self.model = None
         self.last_prediction = 0.5
@@ -1320,14 +1724,32 @@ def strategy_rsi(df: pd.DataFrame) -> StrategyResult:
             superior = float(perfil.get("rsi_upper", superior))
         except Exception:
             pass
+    variation = 0.0
+    if len(df) > 10:
+        serie_variacion = df['close'].pct_change().rolling(10).std()
+        variation = float(np.nan_to_num(serie_variacion.iloc[-1], nan=0.0)) if len(serie_variacion) else 0.0
+    stable_threshold = 0.0012
+    high_threshold = 0.003
+    margin = 0.0
+    if variation <= stable_threshold:
+        ratio = 1.0 - variation / max(stable_threshold, 1e-9)
+        margin = ratio * 2.5
+    elif variation >= high_threshold:
+        ratio = min(1.0, (variation - high_threshold) / max(high_threshold, 1e-9))
+        margin = -ratio * 2.0
+    inferior_dinamico = float(np.clip(inferior + margin, 5.0, 45.0))
+    superior_dinamico = float(np.clip(superior - margin, 55.0, 95.0))
     extra = {
         'rsi': valor,
-        'strong_call': valor < max(20.0, inferior - 5.0),
-        'strong_put': valor > min(80.0, superior + 5.0),
+        'strong_call': valor < max(20.0, inferior_dinamico - 5.0),
+        'strong_put': valor > min(80.0, superior_dinamico + 5.0),
+        'rsi_lower_dynamic': inferior_dinamico,
+        'rsi_upper_dynamic': superior_dinamico,
+        'price_variation': variation,
     }
-    if valor < inferior:
+    if valor < inferior_dinamico:
         return StrategyResult('CALL', 2.0, [f"RSI {valor:.2f} sobrevendido → señal CALL"], extra)
-    if valor > superior:
+    if valor > superior_dinamico:
         return StrategyResult('PUT', -2.0, [f"RSI {valor:.2f} sobrecomprado → señal PUT"], extra)
     return StrategyResult('NONE', 0.0, [f"RSI {valor:.2f} sin sesgo claro"], extra)
 
@@ -1351,7 +1773,16 @@ def strategy_ema_trend(df: pd.DataFrame) -> StrategyResult:
                     tolerancia = float(perfil.get("ema_tolerance", 0.0))
                 except Exception:
                     tolerancia = 0.0
-    threshold = tolerancia / 1000.0
+    diff_series = ema_corto - ema_largo
+    recent_diff = diff_series.iloc[-5:] if len(diff_series) >= 5 else diff_series
+    diff_std = float(np.nan_to_num(recent_diff.diff().abs().mean(), nan=0.0)) if len(recent_diff) > 1 else 0.0
+    price_volatility = 0.0
+    if len(df) > 10:
+        window_vol = df['close'].pct_change().rolling(10).std()
+        price_volatility = float(np.nan_to_num(window_vol.iloc[-1], nan=0.0)) if len(window_vol) else 0.0
+    baseline_threshold = tolerancia / 1000.0
+    slope_floor = max(0.0001, baseline_threshold, diff_std * 0.5, price_volatility * 0.3)
+    threshold = baseline_threshold
     diff_prev = float(ema_corto.iloc[-2] - ema_largo.iloc[-2])
     diff_curr = float(ema_corto.iloc[-1] - ema_largo.iloc[-1])
     cruz_alcista = diff_prev <= threshold and diff_curr > threshold
@@ -1360,6 +1791,24 @@ def strategy_ema_trend(df: pd.DataFrame) -> StrategyResult:
         return StrategyResult('CALL', 1.5, ['Cruce alcista EMA9 sobre EMA21 → CALL'], {'ema_short': float(ema_corto.iloc[-1]), 'ema_long': float(ema_largo.iloc[-1])})
     if cruz_bajista:
         return StrategyResult('PUT', -1.5, ['Cruce bajista EMA9 bajo EMA21 → PUT'], {'ema_short': float(ema_corto.iloc[-1]), 'ema_long': float(ema_largo.iloc[-1])})
+    consistent_direction = False
+    if len(recent_diff) > 0:
+        signs = [np.sign(val) for val in recent_diff if abs(val) > 1e-9]
+        if signs:
+            consistent_direction = all(sign == signs[0] for sign in signs)
+    minor_threshold = slope_floor * 0.8 if slope_floor else 0.0001
+    slope_drift = float(recent_diff.iloc[-1] - recent_diff.iloc[0]) if len(recent_diff) > 1 else diff_curr
+    if consistent_direction and abs(diff_curr) >= minor_threshold and abs(slope_drift) <= abs(diff_curr) * 1.5:
+        direccion = 'CALL' if diff_curr > 0 else 'PUT'
+        puntaje = 1.1 if direccion == 'CALL' else -1.1
+        tendencia = 'alcista' if direccion == 'CALL' else 'bajista'
+        extra = {
+            'ema_short': float(ema_corto.iloc[-1]),
+            'ema_long': float(ema_largo.iloc[-1]),
+            'diff_mean': float(recent_diff.mean()) if len(recent_diff) else diff_curr,
+            'slope_floor': slope_floor,
+        }
+        return StrategyResult(direccion, puntaje, [f"Pendiente EMA consistente {tendencia} → {direccion}"], extra)
     return StrategyResult('NONE', 0.0, ['EMAs paralelas sin cruce'], {'ema_short': float(ema_corto.iloc[-1]), 'ema_long': float(ema_largo.iloc[-1])})
 
 
@@ -1386,11 +1835,40 @@ def strategy_pullback(df: pd.DataFrame) -> StrategyResult:
     rsi_series = rsi(closes)
     tramo = closes.iloc[-5:]
     rsi_tramo = rsi_series.iloc[-5:]
-    extra = {'rsi_trend': float(rsi_tramo.iloc[-1] - rsi_tramo.iloc[-2])}
+    ema_short_series = ema(closes, 9)
+    ema_long_series = ema(closes, 21)
+    ema_support_diff = float(ema_short_series.iloc[-1] - ema_long_series.iloc[-1]) if len(ema_short_series) and len(ema_long_series) else 0.0
+    extra = {
+        'rsi_trend': float(rsi_tramo.iloc[-1] - rsi_tramo.iloc[-2]) if len(rsi_tramo) > 1 else 0.0,
+        'ema_support': ema_support_diff,
+    }
     if tramo.iloc[0] > tramo.iloc[1] > tramo.iloc[2] and tramo.iloc[3] >= tramo.iloc[2] and tramo.iloc[4] > tramo.iloc[2] and rsi_tramo.iloc[-1] > rsi_tramo.iloc[-2]:
         return StrategyResult('CALL', 1.0, ['Pullback alcista con RSI recuperándose → CALL'], extra)
     if tramo.iloc[0] < tramo.iloc[1] < tramo.iloc[2] and tramo.iloc[3] <= tramo.iloc[2] and tramo.iloc[4] < tramo.iloc[2] and rsi_tramo.iloc[-1] < rsi_tramo.iloc[-2]:
         return StrategyResult('PUT', -1.0, ['Pullback bajista con RSI cayendo → PUT'], extra)
+    soporte_rsi_alcista = len(rsi_tramo) > 1 and rsi_tramo.iloc[-1] > rsi_tramo.iloc[-2]
+    soporte_rsi_bajista = len(rsi_tramo) > 1 and rsi_tramo.iloc[-1] < rsi_tramo.iloc[-2]
+    soporte_ema_alcista = ema_support_diff > 0
+    soporte_ema_bajista = ema_support_diff < 0
+    if len(tramo) >= 3:
+        recuperacion_rapida = tramo.iloc[-3] >= tramo.iloc[-2] and tramo.iloc[-1] > tramo.iloc[-2]
+        caida_rapida = tramo.iloc[-3] <= tramo.iloc[-2] and tramo.iloc[-1] < tramo.iloc[-2]
+        if recuperacion_rapida and (soporte_rsi_alcista or soporte_ema_alcista):
+            respaldos = []
+            if soporte_rsi_alcista:
+                respaldos.append('RSI')
+            if soporte_ema_alcista:
+                respaldos.append('EMA')
+            texto_respaldo = ' y '.join(respaldos)
+            return StrategyResult('CALL', 0.9, [f"Pullback rápido confirmado ({texto_respaldo}) → CALL"], extra)
+        if caida_rapida and (soporte_rsi_bajista or soporte_ema_bajista):
+            respaldos = []
+            if soporte_rsi_bajista:
+                respaldos.append('RSI')
+            if soporte_ema_bajista:
+                respaldos.append('EMA')
+            texto_respaldo = ' y '.join(respaldos)
+            return StrategyResult('PUT', -0.9, [f"Pullback rápido confirmado ({texto_respaldo}) → PUT"], extra)
     return StrategyResult('NONE', 0.0, ['Sin pullback definido'], extra)
 
 
@@ -1464,6 +1942,8 @@ STRATEGY_WEIGHTS: Dict[str, float] = {
 
 TOTAL_STRATEGY_COUNT = len(STRATEGY_WEIGHTS)
 
+MAX_STRATEGY_SCORE = 3.0
+
 STRATEGY_DISPLAY_NAMES: Dict[str, str] = {
     'RSI': 'RSI',
     'EMA Trend': 'Tendencia EMA',
@@ -1486,6 +1966,29 @@ def _clasificar_confianza(valor: float) -> str:
     return 'Baja'
 
 
+def _compute_strategy_confidence(score: float) -> float:
+    magnitude = abs(float(score))
+    normalized = magnitude / MAX_STRATEGY_SCORE if MAX_STRATEGY_SCORE else magnitude
+    return float(max(0.0, min(1.0, normalized)))
+
+
+def _compute_volatility_factor(volatility: Optional[float]) -> float:
+    if volatility is None:
+        return 1.0
+    vol = max(0.0, float(volatility))
+    low_threshold = 0.0005
+    high_threshold = 0.003
+    if vol < low_threshold:
+        ratio = vol / max(low_threshold, 1e-9)
+        reduction = (1.0 - ratio) * 0.15
+        return float(max(0.7, 1.0 - reduction))
+    if vol > high_threshold:
+        ratio_high = min(1.0, (vol - high_threshold) / max(high_threshold, 1e-9))
+        boost = ratio_high * 0.05
+        return float(min(1.1, 1.0 + boost))
+    return 1.0
+
+
 def combine_signals(results: List[Tuple[str, StrategyResult]], active_states: Dict[str, bool]) -> Dict[str, Any]:
     reasons: List[str] = []
     agreements: Dict[str, str] = {}
@@ -1498,6 +2001,9 @@ def combine_signals(results: List[Tuple[str, StrategyResult]], active_states: Di
     low_volatility = False
     volatility_value: Optional[float] = None
     active_count = 0
+    direction_confidence_sum = {'CALL': 0.0, 'PUT': 0.0}
+    direction_weight_sum = {'CALL': 0.0, 'PUT': 0.0}
+    strategy_confidences: Dict[str, float] = {}
     for name, res in results:
         if not active_states.get(name, True):
             continue
@@ -1506,6 +2012,11 @@ def combine_signals(results: List[Tuple[str, StrategyResult]], active_states: Di
         active_count += 1
         agreements[name] = res.signal
         reasons.extend(res.reasons)
+        strategy_conf = _compute_strategy_confidence(res.score)
+        strategy_confidences[name] = strategy_conf
+        logging.debug(
+            f"[Signals] {name}: señal={res.signal} score={res.score:.3f} confianza={strategy_conf:.3f}"
+        )
         if name == 'Volatility Filter':
             volatility_value = res.extra.get('volatility')
             if res.extra.get('low'):
@@ -1529,6 +2040,8 @@ def combine_signals(results: List[Tuple[str, StrategyResult]], active_states: Di
             pesos_direccion[res.signal] += weight
             conteo_direccion[res.signal] += 1
             total_weight_signals += weight
+            direction_confidence_sum[res.signal] += strategy_conf * weight
+            direction_weight_sum[res.signal] += weight
     if total_weight_signals == 0.0:
         main_reason = '⚠️ Ninguna de las estrategias activas generó señal'
         return {
@@ -1551,12 +2064,22 @@ def combine_signals(results: List[Tuple[str, StrategyResult]], active_states: Di
             'total_weight': total_weight_signals,
             'active_weight': total_weight_active,
             'strong': 0,
+            'strategy_confidences': strategy_confidences,
         }
-    dominante = 'CALL' if pesos_direccion['CALL'] >= pesos_direccion['PUT'] else 'PUT'
-    dominant_weight = pesos_direccion[dominante]
-    confidence_from_signals = dominant_weight / total_weight_signals if total_weight_signals else 0.0
-    confidence_vs_active = dominant_weight / total_weight_active if total_weight_active else 0.0
-    confianza = max(confidence_from_signals, confidence_vs_active)
+    call_support = direction_confidence_sum['CALL']
+    put_support = direction_confidence_sum['PUT']
+    if call_support == put_support:
+        dominante = 'CALL' if pesos_direccion['CALL'] >= pesos_direccion['PUT'] else 'PUT'
+    else:
+        dominante = 'CALL' if call_support > put_support else 'PUT'
+    dominant_weight = direction_weight_sum[dominante]
+    weighted_confidence = (
+        direction_confidence_sum[dominante] / dominant_weight if dominant_weight else 0.0
+    )
+    participation_factor = (
+        pesos_direccion[dominante] / total_weight_active if total_weight_active else 0.0
+    )
+    confianza = max(weighted_confidence, participation_factor)
     signal = 'NONE'
     aligned = conteo_direccion[dominante]
     if confianza >= 0.45:
@@ -1565,9 +2088,17 @@ def combine_signals(results: List[Tuple[str, StrategyResult]], active_states: Di
         signal = override_signal
         confianza = max(confianza, 0.45)
         aligned = conteo_direccion.get(override_signal, 0)
-    if low_volatility and signal != 'NONE':
-        confianza *= 0.9
-        reasons.append('Volatilidad baja → confianza limitada')
+    if signal != 'NONE':
+        factor_volatilidad = _compute_volatility_factor(volatility_value)
+        if volatility_value is not None:
+            logging.debug(
+                f"[Signals] Volatilidad previa al ajuste: {volatility_value:.6f} factor={factor_volatilidad:.3f}"
+            )
+        if factor_volatilidad < 1.0:
+            confianza *= factor_volatilidad
+            reasons.append('Volatilidad baja → confianza limitada')
+        elif factor_volatilidad > 1.0:
+            confianza *= factor_volatilidad
     confianza = min(confianza, 0.98)
     if signal != 'NONE':
         confianza = max(confianza, 0.35)
@@ -1604,6 +2135,7 @@ def combine_signals(results: List[Tuple[str, StrategyResult]], active_states: Di
         'total_weight': total_weight_signals,
         'active_weight': total_weight_active,
         'strong': strong_flag,
+        'strategy_confidences': strategy_confidences,
     }
 
 
@@ -2096,6 +2628,7 @@ class TradingEngine:
         self._status_listeners: List[Callable[[str], None]] = []
         self._summary_listeners: List[Callable[[str, Dict[str, Any]], None]] = []
         self._trade_state_listeners: List[Callable[[str], None]] = []
+        self._result_listeners: List[Callable[[Dict[str, Any]], None]] = []
         self._strategy_lock = threading.Lock()
         self.strategy_states: Dict[str, bool] = {name: True for name, _ in STRATEGY_FUNCTIONS}
         self.strategy_states["Divergence"] = True
@@ -2108,6 +2641,10 @@ class TradingEngine:
         self.kelly_enabled = False
         self.initial_balance = 1000.0
         self.base_trade_amount = STAKE
+        self.aprendizaje = Aprendizaje()
+        self.learning_enabled = True
+        self.learning_confidences: deque = deque(maxlen=100)
+        self.last_learning_feedback: Optional[float] = None
         self.regime_cycle_count = 0
         with auto_learn.weights_lock:
             self._baseline_weights = dict(auto_learn.weights)
@@ -2118,6 +2655,30 @@ class TradingEngine:
         self._current_cycle_id = 0
         self._latest_regime_inputs: Dict[str, Any] = {}
         self._active_regime: Optional[str] = None
+        self._processed_lock = threading.Lock()
+        self._processed_contracts: Set[int] = set()
+        self._closed_lock = threading.Lock()
+        self._closed_contracts: Set[int] = set()
+        self._next_cycle_time = 0.0
+        self._post_loss_cooldown_until: float = 0.0
+        self._trade_timestamps: deque = deque()
+        self.total_operations = 0
+        self.win_operations = 0
+        self.last_contract_id: Optional[int] = None
+        self.last_symbol: Optional[str] = None
+        self.last_result: Optional[str] = None
+        self.last_confidence: float = 0.0
+        self.bias_memory: Dict[str, Dict[str, Any]] = load_biases()
+        self.winner_biases: List[Dict[str, Any]] = load_winner_biases()
+        try:
+            send_telegram_message(
+                f"🧠 Memoria cargada con {len(self.winner_biases)} sesgos ganadores"
+            )
+        except Exception:
+            logging.debug("No se pudo notificar la carga de sesgos ganadores")
+        self._selective_thread: Optional[threading.Thread] = None
+        self._telegram_thread: Optional[threading.Thread] = None
+        self.telegram_bot = telegram_bot
 
     def add_trade_listener(self, callback: Callable[[TradeRecord, Dict[str, float]], None]) -> None:
         self._trade_listeners.append(callback)
@@ -2130,6 +2691,15 @@ class TradingEngine:
 
     def add_trade_state_listener(self, callback: Callable[[str], None]) -> None:
         self._trade_state_listeners.append(callback)
+
+    def add_result_listener(self, callback: Callable[[Dict[str, Any]], None]) -> None:
+        self._result_listeners.append(callback)
+
+    def remove_result_listener(self, callback: Callable[[Dict[str, Any]], None]) -> None:
+        try:
+            self._result_listeners.remove(callback)
+        except ValueError:
+            pass
 
     def set_trade_amount(self, value: float) -> None:
         self.trade_amount = max(0.1, float(value))
@@ -2150,6 +2720,75 @@ class TradingEngine:
         if not enabled:
             self.auto_shutdown_triggered = False
 
+    def _selective_memory_worker(self) -> None:
+        while True:
+            self.maintain_selective_memory()
+            time.sleep(300)
+
+    def maintain_selective_memory(self) -> None:
+        try:
+            saved_biases = load_biases()
+            preserved: Dict[str, Dict[str, Any]] = {}
+            for symbol, state in saved_biases.items():
+                outcome = str(state.get("last_result", "")).upper()
+                confidence_value = float(state.get("confidence", 0.0))
+                if outcome == "WIN" and confidence_value >= KEEP_WIN_MIN_CONF:
+                    preserved[symbol] = dict(state)
+            save_biases(preserved)
+            self.bias_memory = preserved
+            logging.info(
+                "🧠 Selective maintenance: %d strong winning biases kept.",
+                len(preserved),
+            )
+        except Exception as exc:
+            logging.error(f"❌ Error in selective memory maintenance: {exc}")
+
+    def _store_winner_bias(
+        self,
+        symbol: str,
+        rsi_value: float,
+        ema_spread: float,
+        volatility: float,
+        regime: Optional[str],
+        confidence_value: float,
+    ) -> None:
+        entry = {
+            "symbol": symbol,
+            "rsi": float(rsi_value),
+            "ema": float(ema_spread),
+            "volatility": float(volatility),
+            "regime": regime or "DESCONOCIDO",
+            "confidence": float(confidence_value),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+        }
+        self.winner_biases.append(entry)
+        save_winner_biases(self.winner_biases)
+
+    def start_background_services(self) -> None:
+        try:
+            if hasattr(self, "maintain_selective_memory"):
+                if self._selective_thread is None or not self._selective_thread.is_alive():
+                    self._selective_thread = threading.Thread(
+                        target=self._selective_memory_worker,
+                        daemon=True,
+                    )
+                    self._selective_thread.start()
+                    logging.info("🧠 Selective learning service started in background.")
+            else:
+                logging.info("ℹ️ No selective memory service found in this version.")
+            if hasattr(self, "telegram_bot") and callable(self.telegram_bot):
+                if self._telegram_thread is None or not self._telegram_thread.is_alive():
+                    self._telegram_thread = threading.Thread(
+                        target=self.telegram_bot,
+                        daemon=True,
+                    )
+                    self._telegram_thread.start()
+                    logging.info("📨 Telegram bot service started in background.")
+            else:
+                logging.info("ℹ️ Telegram bot not configured in this version.")
+        except Exception as exc:
+            logging.error(f"❌ Error starting background services: {exc}")
+
     def start_engine(self) -> None:
         global operation_active
         if self.running.is_set():
@@ -2158,6 +2797,10 @@ class TradingEngine:
         self._notify_status("connecting")
         try:
             self.api.connect()
+            try:
+                send_telegram_message("🤖 Bot iniciado correctamente y conectado a Deriv")
+            except Exception:
+                logging.debug("No se pudo enviar mensaje de inicio a Telegram")
         except Exception:
             self.running.clear()
             self._notify_status("stopped")
@@ -2165,6 +2808,12 @@ class TradingEngine:
         self._notify_status("running")
         operation_active = False
         self._notify_trade_state("ready")
+        with self._processed_lock:
+            self._processed_contracts.clear()
+        with self._closed_lock:
+            self._closed_contracts.clear()
+        CSV_LOGGED_CONTRACTS.clear()
+        self.maintain_selective_memory()
 
     def is_running(self) -> bool:
         return self.running.is_set()
@@ -2180,6 +2829,24 @@ class TradingEngine:
 
     def set_kelly_enabled(self, enabled: bool) -> None:
         self.kelly_enabled = bool(enabled)
+
+    def set_learning_enabled(self, enabled: bool) -> None:
+        self.learning_enabled = bool(enabled)
+
+    def get_accuracy(self) -> float:
+        total = self.win_count + self.loss_count
+        if total == 0:
+            return 0.0
+        return (self.win_count / total) * 100.0
+
+    def get_last_contract_info(self) -> str:
+        if self.last_contract_id is None:
+            return "Sin operaciones registradas."
+        symbol = self.last_symbol or "N/A"
+        result = self.last_result or "N/A"
+        return (
+            f"#{self.last_contract_id} | {symbol} | {result} | Confianza {self.last_confidence:.2f}"
+        )
 
     def _estimate_balance(self) -> float:
         return max(100.0, self.initial_balance + self.risk.total_pnl)
@@ -2210,6 +2877,13 @@ class TradingEngine:
                 callback(record, stats)
             except Exception as exc:
                 logging.debug(f"Error en escucha de operaciones: {exc}")
+
+    def _notify_trade_result(self, data: Dict[str, Any]) -> None:
+        for callback in list(self._result_listeners):
+            try:
+                callback(dict(data))
+            except Exception as exc:
+                logging.debug(f"Error en escucha de resultados: {exc}")
 
     def _notify_status(self, status: str) -> None:
         for callback in list(self._status_listeners):
@@ -2355,6 +3029,26 @@ class TradingEngine:
             return "LOSS", -float(stake)
         return "UNKNOWN", 0.0
 
+    def _register_processed_contract(self, contract_id: int) -> bool:
+        with self._processed_lock:
+            if contract_id in self._processed_contracts:
+                return False
+            self._processed_contracts.add(contract_id)
+            if len(self._processed_contracts) > 5000:
+                self._processed_contracts.pop()
+            return True
+
+    def _register_contract_closure(self, contract_id: Optional[int]) -> bool:
+        if contract_id is None:
+            return True
+        with self._closed_lock:
+            if contract_id in self._closed_contracts:
+                return False
+            self._closed_contracts.add(contract_id)
+            if len(self._closed_contracts) > 5000:
+                self._closed_contracts.pop()
+            return True
+
 
     def _determine_signal_source(
         self,
@@ -2383,24 +3077,24 @@ class TradingEngine:
             return "EMA"
         return "COMBINED"
 
-    def _get_candles_with_timeout(self, symbol: str, timeout: float = 3.0) -> List[Candle]:
-        start_time = time.time()
-        while True:
-            candles = self.api.fetch_candles(symbol)
-            if candles:
-                return candles
-            if time.time() - start_time > timeout:
-                raise TimeoutError(f"⏳ Candle fetch timeout for {symbol}")
-            if not self.running.is_set():
-                break
-            QtCore.QThread.msleep(200)
-        return []
-
     def _evaluate_symbol(self, symbol: str) -> Optional[Dict[str, Any]]:
         auto_learn.set_active_symbol(symbol)
+        rsi_signal = 'NONE'
+        ema_signal = 'NONE'
+        bollinger_signal = 'NONE'
+        pullback_signal = 'NONE'
+        range_break_signal = 'NONE'
+        divergence_signal = 'NONE'
+        volatility_signal = 'NONE'
+        final_signal = 'NONE'
         try:
-            candles = self._get_candles_with_timeout(symbol)
+            try:
+                candles = self.api.fetch_candles(symbol)
+            except Exception as exc:
+                logging.warning(f"Error al obtener velas de {symbol}: {exc}")
+                return None
             if not candles:
+                logging.warning(f"Sin velas disponibles para {symbol}, se omite del ciclo")
                 return None
             df = to_dataframe(candles)
             results, consensus = self._evaluate_strategies(df)
@@ -2421,14 +3115,12 @@ class TradingEngine:
                 logging.info('⚠️ Ninguna de las estrategias activas generó señal')
                 logging.info(f"Estrategias activas: {active_total}/{TOTAL_STRATEGY_COUNT}")
             elif signal == 'NONE':
-                logging.info(f"⚠️ Confianza {etiqueta_conf} ({confidence:.2f}) → {consensus['main_reason']}")
                 logging.info(f"Estrategias activas: {active_total}/{TOTAL_STRATEGY_COUNT}")
                 if consensus['low_volatility']:
                     valor_vol = consensus['volatility_value']
                     detalle = f" ({valor_vol:.4f})" if valor_vol is not None else ''
                     logging.info(f"⚠️ Volatilidad baja detectada{detalle}")
             else:
-                logging.info(f"📊 Confianza {etiqueta_conf} ({confidence:.2f}) → {consensus['main_reason']}")
                 logging.info(f"Estrategias alineadas: {consensus['aligned']}/{signals_total}")
                 logging.info(f"Estrategias activas: {active_total}/{TOTAL_STRATEGY_COUNT}")
                 if consensus['low_volatility']:
@@ -2455,6 +3147,7 @@ class TradingEngine:
                 'ai_notes': [],
                 'consensus': consensus,
                 'results': results,
+                'strategy_confidences': consensus.get('strategy_confidences', {}),
                 'features': None,
                 'entry_price': entry_price,
                 'latest_rsi': 0.0,
@@ -2530,11 +3223,17 @@ class TradingEngine:
                 macd_value,
             )
             trend_bias = abs(ema_slope) > 0.0005 or adx_value > 25.0
-            if smoothed_volatility < 0.0005:
-                penalty = 0.95 if trend_bias else 0.9
-                indicator_conf *= penalty
-            elif smoothed_volatility > 0.003:
-                indicator_conf *= 1.05
+            volatility_factor = _compute_volatility_factor(smoothed_volatility)
+            adjusted_indicator_factor = volatility_factor
+            if volatility_factor < 1.0 and trend_bias:
+                adjusted_indicator_factor = 1.0 - (1.0 - volatility_factor) * 0.5
+            logging.debug(
+                f"[Fusion] Volatilidad suavizada: {smoothed_volatility:.6f} factor={volatility_factor:.3f}"
+            )
+            if volatility_factor < 1.0:
+                indicator_conf *= adjusted_indicator_factor
+            elif volatility_factor > 1.0:
+                indicator_conf *= volatility_factor
             indicator_conf = float(np.clip(indicator_conf, 0.0, 1.0))
             evaluation.update(
                 {
@@ -2547,12 +3246,18 @@ class TradingEngine:
                     'macd': macd_value,
                     'rsi_signal': rsi_signal,
                     'ema_signal': ema_signal,
+                    'pullback_signal': pullback_signal,
+                    'base_action': combined_base_action,
+                    'primary_signals': primary_signals,
+                    'latest_prices': df['close'].tail(5).tolist(),
                     'macd_signal': macd_signal,
+                    'aligned': consensus['aligned'],
                 }
             )
             self._latest_regime_inputs = {'symbol': symbol, 'ema_slope': ema_slope, 'boll_width': boll_width}
             regime = self.detect_market_regime(adx_value, boll_width, smoothed_volatility)
             self._apply_regime_adjustments(regime)
+            evaluation['regime'] = regime
             signals = [rsi_signal, ema_signal, macd_signal]
             if signals.count('CALL') >= 2:
                 evaluation['confluence_direction'] = 'CALL'
@@ -2560,6 +3265,95 @@ class TradingEngine:
             elif signals.count('PUT') >= 2:
                 evaluation['confluence_direction'] = 'PUT'
                 evaluation['confluence_confirmed'] = True
+            strategy_conf_map = consensus.get('strategy_confidences', {})
+            rsi_strength = float(np.clip(strategy_conf_map.get('RSI', 0.0), 0.0, 1.0))
+            if rsi_strength == 0.0:
+                rsi_strength = float(
+                    np.clip(strategy_conf_map.get('RSI Strategy', 0.0), 0.0, 1.0)
+                )
+            if rsi_strength == 0.0:
+                rsi_outcome = next(
+                    (
+                        outcome
+                        for name, outcome in results
+                        if name.lower() == 'rsi'
+                    ),
+                    None,
+                )
+                if rsi_outcome is not None:
+                    rsi_strength = float(np.clip(abs(rsi_outcome.score), 0.0, 1.0))
+            ema_strength = float(
+                np.clip(
+                    strategy_conf_map.get('EMA Trend', strategy_conf_map.get('EMA', 0.0)),
+                    0.0,
+                    1.0,
+                )
+            )
+            if ema_strength == 0.0:
+                ema_outcome = next(
+                    (
+                        outcome
+                        for name, outcome in results
+                        if name.lower() == 'ema trend' or name.lower() == 'ema'
+                    ),
+                    None,
+                )
+                if ema_outcome is not None:
+                    ema_strength = float(np.clip(abs(ema_outcome.score), 0.0, 1.0))
+            active_signals = [
+                outcome for _, outcome in results if outcome.signal in {'CALL', 'PUT'}
+            ]
+            total_active = len(active_signals)
+            aligned_strategies = sum(
+                1 for outcome in active_signals if outcome.signal == signal
+            ) if signal in {'CALL', 'PUT'} else 0
+            contradictory = any(
+                outcome.signal not in {signal}
+                for outcome in active_signals
+            ) if signal in {'CALL', 'PUT'} else False
+            pullback_signal = next(
+                (
+                    outcome.signal
+                    for name, outcome in results
+                    if name.lower() == 'pullback'
+                ),
+                'NONE',
+            )
+            primary_signals = [rsi_signal, ema_signal, pullback_signal]
+            call_votes = primary_signals.count('CALL')
+            put_votes = primary_signals.count('PUT')
+            if call_votes > put_votes:
+                combined_base_action = 'CALL'
+            elif put_votes > call_votes:
+                combined_base_action = 'PUT'
+            else:
+                combined_base_action = signal if signal in {'CALL', 'PUT'} else 'NONE'
+            volatility_mid_range = 0.0005 <= smoothed_volatility <= 0.002
+            perfect_alignment = (
+                signal in {'CALL', 'PUT'}
+                and not contradictory
+                and pullback_signal == signal
+                and rsi_signal == signal
+                and ema_signal == signal
+                and total_active > 0
+                and aligned_strategies == total_active
+                and volatility_mid_range
+            )
+            if total_active > 0:
+                average_strength = (rsi_strength + ema_strength) / 2.0
+                strict_confidence = (aligned_strategies / total_active) * average_strength
+            else:
+                strict_confidence = 0.0
+            strict_confidence = float(np.clip(strict_confidence, 0.0, 0.95))
+            if perfect_alignment:
+                strict_confidence = 1.0
+            confidence = strict_confidence
+            consensus['confidence'] = confidence
+            evaluation['base_confidence'] = confidence
+            evaluation['strict_confidence'] = confidence
+            evaluation['perfect_alignment'] = perfect_alignment
+            evaluation['aligned'] = aligned_strategies
+            evaluation['active'] = total_active
             current_hour = datetime.now(timezone.utc).hour
             ml_probability = auto_learn.predict_win_probability(
                 latest_rsi,
@@ -2613,11 +3407,13 @@ class TradingEngine:
                 combined_confidence = float(max(weighted_average, max(base_components)))
             else:
                 combined_confidence = 0.6
-            if smoothed_volatility < 0.0005:
-                penalty = 0.95 if trend_bias else 0.9
-                combined_confidence *= penalty
-            elif smoothed_volatility > 0.003:
-                combined_confidence *= 1.05
+            adjusted_combined_factor = volatility_factor
+            if volatility_factor < 1.0 and trend_bias:
+                adjusted_combined_factor = 1.0 - (1.0 - volatility_factor) * 0.5
+            if volatility_factor < 1.0:
+                combined_confidence *= adjusted_combined_factor
+            elif volatility_factor > 1.0:
+                combined_confidence *= volatility_factor
             combined_confidence = float(np.clip(combined_confidence, 0.0, 1.0))
             if combined_confidence == 0.0 or math.isnan(combined_confidence):
                 combined_confidence = 0.6
@@ -2631,6 +3427,13 @@ class TradingEngine:
                 final_confidence = min_confidence
             final_confidence *= symbol_weight
             final_confidence = float(np.clip(final_confidence, 0.0, 1.0))
+            if perfect_alignment:
+                final_confidence = 1.0
+            else:
+                final_confidence = float(min(final_confidence, 0.95))
+            logging.debug(
+                f"[Fusion] base={confidence:.3f} indicador={indicator_conf:.3f} IA={ai_confidence:.3f} final={final_confidence:.3f}"
+            )
             if final_confidence >= 0.75:
                 evaluation['strong'] = 1
             adx_threshold = auto_learn.get_adx_min_threshold()
@@ -2666,15 +3469,25 @@ class TradingEngine:
     def scan_market(self) -> None:
         if not self.running.is_set():
             return
+        if not BOT_ACTIVE:
+            logging.info("⏸ Bot paused — waiting for Telegram resume command.")
+            time.sleep(5)
+            return
+        now = time.time()
+        if now < self._next_cycle_time:
+            QtWidgets.QApplication.processEvents(QtCore.QEventLoop.AllEvents, 50)
+            return
         self._cycle_id_counter += 1
         self._current_cycle_id = self._cycle_id_counter
         evaluations: List[Dict[str, Any]] = []
         confidence_lines: List[str] = []
         trade_executed = False
-        def _cycle_pause() -> None:
-            QtWidgets.QApplication.processEvents()
-            QtCore.QThread.msleep(2000)
-        for symbol in SYMBOLS:
+        symbols = list(SYMBOLS)
+        def _cycle_pause(delay: float = 0.5) -> None:
+            QtWidgets.QApplication.processEvents(QtCore.QEventLoop.AllEvents, 50)
+            self._next_cycle_time = time.time() + delay
+
+        for symbol in symbols:
             if not self.running.is_set():
                 break
             evaluation = self._evaluate_symbol(symbol)
@@ -2691,12 +3504,11 @@ class TradingEngine:
                 evaluations.append(evaluation)
             if not self.running.is_set():
                 break
-            QtCore.QThread.msleep(200)
         if not self.running.is_set():
             _cycle_pause()
             return
         if trade_executed:
-            _cycle_pause()
+            _cycle_pause(0.75)
             return
         if not evaluations:
             _cycle_pause()
@@ -2718,19 +3530,45 @@ class TradingEngine:
                 logging.info(f"{summary_line} → Selected: ninguno")
             _cycle_pause()
             return
-        best = max(candidates, key=lambda item: float(item.get('final_confidence', 0.0)))
+        selected = max(candidates, key=lambda item: float(item.get('final_confidence', 0.0)))
         summary_line = " | ".join(confidence_lines)
-        selected_text = f"{best['symbol']} ({float(best['final_confidence']):.2f})"
+        selected_text = f"{selected['symbol']} ({float(selected['final_confidence']):.2f})"
         if summary_line:
             logging.info(f"{summary_line} → Selected: {selected_text} | strong={strong_signal_count}")
-        if best.get('signal') not in {'CALL', 'PUT'}:
+        if selected.get('signal') not in {'CALL', 'PUT'}:
             _cycle_pause()
             return
-        if strong_signal_count == 0 and float(best['final_confidence']) < min_required:
+        if strong_signal_count == 0 and float(selected['final_confidence']) < min_required:
             _cycle_pause()
             return
-        self._execute_selected_trade(best)
-        _cycle_pause()
+        confidence_value_raw = selected.get('final_confidence')
+        confidence_value = float(confidence_value_raw) if confidence_value_raw is not None else 0.0
+        volatility_value_raw = selected.get('volatility')
+        volatility_value: Optional[float] = None
+        if volatility_value_raw is not None:
+            try:
+                volatility_value = float(volatility_value_raw)
+            except (TypeError, ValueError):
+                volatility_value = None
+        volatility_display = f"{volatility_value:.4f}" if volatility_value is not None else "N/A"
+        logging.info(
+            f"📊 Final confidence {selected['symbol']}: {confidence_value:.2f} | Volatility: {volatility_display} | Action: {selected['signal']}"
+        )
+        if confidence_value < MIN_CONFIDENCE:
+            logging.info(
+                f"🚫 Skipping trade on {selected['symbol']} due to low confidence ({confidence_value:.2f})"
+            )
+            _cycle_pause()
+            return
+        if volatility_value is not None and volatility_value < MIN_VOLATILITY:
+            logging.info(
+                f"🚫 Skipping trade on {selected['symbol']} due to low volatility ({volatility_value:.4f})"
+            )
+            _cycle_pause()
+            return
+        self._execute_selected_trade(selected)
+        _cycle_pause(0.75)
+        return
 
     def confirm_and_execute(self, evaluation: Dict[str, Any]) -> bool:
         direction = evaluation.get('confluence_direction')
@@ -2738,20 +3576,91 @@ class TradingEngine:
             return False
         symbol = evaluation.get('symbol', 'UNKNOWN')
         logging.info(f"✅ Confluence confirmed for {symbol}: {direction}")
+        skip_trade = False
+        try:
+            confidence_raw = evaluation.get('final_confidence')
+            if confidence_raw is None:
+                confidence_raw = evaluation.get('confidence')
+            confidence_value: Optional[float] = None
+            if confidence_raw is not None:
+                try:
+                    confidence_value = float(confidence_raw)
+                except (TypeError, ValueError):
+                    confidence_value = None
+            volatility_raw = evaluation.get('volatility')
+            volatility_value: Optional[float] = None
+            if volatility_raw is not None:
+                try:
+                    volatility_value = float(volatility_raw)
+                except (TypeError, ValueError):
+                    volatility_value = None
+            aprendizaje_ref = getattr(self, 'aprendizaje', None)
+            dynamic_min_conf = max(0.70, MIN_CONFIDENCE)
+            latest_rsi_value = 0.0
+            ema_value_for_threshold = 0.0
+            try:
+                latest_rsi_value = float(evaluation.get('latest_rsi', 0.0))
+            except (TypeError, ValueError):
+                latest_rsi_value = 0.0
+            try:
+                ema_value_for_threshold = float(evaluation.get('ema_spread', 0.0))
+            except (TypeError, ValueError):
+                ema_value_for_threshold = 0.0
+            if aprendizaje_ref is not None:
+                try:
+                    dynamic_min_conf = max(
+                        dynamic_min_conf,
+                        aprendizaje_ref.get_dynamic_threshold(
+                            latest_rsi_value,
+                            ema_value_for_threshold,
+                        ),
+                    )
+                except Exception as exc:
+                    logging.debug(f"No se pudo obtener umbral dinámico: {exc}")
+            confidence_for_log = confidence_value if confidence_value is not None else 0.0
+            volatility_display = f"{volatility_value:.4f}" if volatility_value is not None else "N/A"
+            logging.info(
+                f"📊 Final confidence {symbol}: {confidence_for_log:.2f} | Volatility: {volatility_display} | Action: {direction}"
+            )
+            if confidence_value is None or confidence_value < dynamic_min_conf:
+                logging.info(
+                    f"🚫 Skipping trade on {symbol} due to low confidence ({confidence_for_log:.2f})"
+                )
+                skip_trade = True
+                pass
+            elif volatility_value is None or volatility_value < MIN_VOLATILITY:
+                volatility_for_log = volatility_value if volatility_value is not None else 0.0
+                logging.info(
+                    f"🚫 Skipping trade on {symbol} due to low volatility ({volatility_for_log:.4f})"
+                )
+                skip_trade = True
+                pass
+        except Exception as exc:
+            logging.error(f"⚠️ Error in pre-trade validation for {symbol}: {exc}")
+            skip_trade = True
+            pass
+        if skip_trade:
+            return False
         enriched = dict(evaluation)
         enriched['signal'] = direction
         reasons = list(enriched.get('reasons', []))
         reasons.append('Multi-indicator confirmation')
         enriched['reasons'] = reasons
         consensus_snapshot = dict(enriched.get('consensus', {}))
-        consensus_snapshot['confidence_label'] = 'Alta'
-        consensus_snapshot['confidence'] = 1.0
+        final_snapshot = confidence_value if confidence_value is not None else dynamic_min_conf
+        perfect_alignment = bool(enriched.get('perfect_alignment'))
+        if perfect_alignment:
+            final_snapshot = 1.0
+        else:
+            final_snapshot = float(np.clip(final_snapshot, 0.0, 0.95))
+        consensus_snapshot['confidence_label'] = 'Alta' if final_snapshot >= 0.85 else 'Media'
+        consensus_snapshot['confidence'] = final_snapshot
         consensus_snapshot['main_reason'] = 'multi-confirmation'
         consensus_snapshot['override'] = True
         consensus_snapshot['override_reason'] = 'multi-confirmation'
         enriched['consensus'] = consensus_snapshot
-        enriched['ai_confidence'] = max(float(enriched.get('ai_confidence', 0.0)), 1.0)
-        enriched['final_confidence'] = 1.0
+        enriched['ai_confidence'] = max(float(enriched.get('ai_confidence', 0.0)), final_snapshot)
+        enriched['final_confidence'] = final_snapshot
         enriched['eligible'] = True
         probability = float(enriched.get('predicted_probability', 0.6))
         enriched['stake'] = self._calculate_kelly_stake(probability)
@@ -2771,17 +3680,108 @@ class TradingEngine:
         symbol = evaluation['symbol']
         signal = evaluation['signal']
         ai_confidence = float(evaluation['ai_confidence'])
+        combined_confidence = float(evaluation.get('final_confidence', ai_confidence))
         reasons = evaluation['reasons']
         ai_notes = evaluation['ai_notes']
         consensus = evaluation['consensus']
         features = evaluation['features']
         entry_price = float(evaluation['entry_price'])
         signal_source = evaluation['signal_source']
+        results: List[Tuple[str, StrategyResult]] = evaluation.get('results', [])
         if 'stake' not in evaluation:
             evaluation['stake'] = self._calculate_kelly_stake(evaluation.get('predicted_probability', 0.5))
         stake_amount = float(max(0.1, evaluation.get('stake', self.trade_amount)))
         ml_probability = float(evaluation.get('predicted_probability', 0.5))
         trade_initiated = False
+        volatility_raw = evaluation.get('volatility')
+        volatility_value: Optional[float] = None
+        if volatility_raw is not None:
+            try:
+                volatility_value = float(volatility_raw)
+            except (TypeError, ValueError):
+                volatility_value = None
+        confidence_value = float(combined_confidence) if combined_confidence is not None else 0.0
+        latest_rsi_value = float(evaluation.get('latest_rsi', 0.0))
+        aligned_strategies = int(
+            evaluation.get('aligned', evaluation.get('consensus', {}).get('aligned', 0))
+        )
+        base_action = evaluation.get('base_action', signal)
+        final_action = signal
+        latest_prices_seq = evaluation.get('latest_prices')
+        live_volatility = None
+        if isinstance(latest_prices_seq, (list, tuple)) and len(latest_prices_seq) >= 5:
+            try:
+                live_volatility = float(np.std(latest_prices_seq[-5:]))
+            except Exception:
+                live_volatility = None
+        if live_volatility is not None and live_volatility < 0.0005:
+            logging.info("⚠️ Volatilidad en vivo baja, cancelando operación.")
+            return False
+        if (
+            final_action in {'CALL', 'PUT'}
+            and base_action in {'CALL', 'PUT'}
+            and final_action != base_action
+            and confidence_value < 0.85
+        ):
+            logging.info(
+                f"⚠️ Señal inconsistente: {base_action} vs {final_action} (conf={confidence_value:.2f}) → Cancelada"
+            )
+            return False
+        rsi_signal_eval = evaluation.get('rsi_signal')
+        ema_signal_eval = evaluation.get('ema_signal')
+        if (
+            rsi_signal_eval in {'CALL', 'PUT'}
+            and ema_signal_eval in {'CALL', 'PUT'}
+            and rsi_signal_eval != ema_signal_eval
+        ):
+            logging.info("⚠️ RSI y EMA en conflicto → cancelando señal.")
+            return False
+        if STRICT_MODE_ENABLED:
+            if confidence_value < CONFIDENCE_MIN:
+                logging.info("🚫 Skipping trade — low confidence (modo estricto).")
+                return False
+            if (
+                volatility_value is not None
+                and volatility_value < LOW_VOL_THRESHOLD
+                and confidence_value < LOW_VOL_CONFIDENCE
+            ):
+                logging.info(
+                    "🚫 Skipping trade — low volatility & weak signal (modo estricto)."
+                )
+                return False
+            if (
+                NEUTRAL_RSI_BAND[0]
+                <= latest_rsi_value
+                <= NEUTRAL_RSI_BAND[1]
+                and confidence_value < NEUTRAL_RSI_CONF
+            ):
+                logging.info(
+                    "🚫 Skipping trade — neutral RSI & insufficient confidence (modo estricto)."
+                )
+                return False
+            if aligned_strategies < MIN_ALIGNED_STRATEGIES:
+                logging.info(
+                    f"🚫 Skipping trade — only {aligned_strategies}/7 strategies aligned (modo estricto)."
+                )
+                return False
+            now_ts = time.time()
+            if self._post_loss_cooldown_until and now_ts < self._post_loss_cooldown_until:
+                remaining = self._post_loss_cooldown_until - now_ts
+                logging.info(
+                    f"⏳ Skipping trade — cooldown activo tras pérdida ({remaining:.0f}s restantes, modo estricto)."
+                )
+                return False
+            while self._trade_timestamps and now_ts - self._trade_timestamps[0] > 3600:
+                self._trade_timestamps.popleft()
+            if len(self._trade_timestamps) >= MAX_TRADES_PER_HOUR:
+                logging.info("⛔ Máximo de operaciones por hora alcanzado (modo estricto).")
+                return False
+        if combined_confidence is None or confidence_value < MIN_CONFIDENCE:
+            logging.info(f"🚫 Skipping trade on {symbol} due to low confidence ({confidence_value:.2f})")
+            return False
+        if volatility_value is not None and volatility_value < MIN_VOLATILITY:
+            logging.info(f"🚫 Skipping trade on {symbol} due to low volatility ({volatility_value:.4f})")
+            return False
         if not self.risk.can_trade(ai_confidence):
             return False
         if operation_active:
@@ -2806,13 +3806,26 @@ class TradingEngine:
         self._notify_trade_state('active')
         dur_seconds = duration_seconds if duration_seconds > 0 else TRADE_DURATION_SECONDS
         logging.info(f"🟢 Operación abierta — Contrato #{contract_id} | Duración: {dur_seconds}s")
+        self._trade_timestamps.append(time.time())
         trade_initiated = True
         try:
             result_status = self._wait_for_contract_result(contract_id, dur_seconds)
             trade_result, pnl = self._resolve_trade_result(result_status, stake_amount)
+            if contract_id is not None and not self._register_processed_contract(contract_id):
+                logging.debug(f"Contrato #{contract_id} ya procesado, omitiendo duplicado de resultados")
+                return trade_initiated
             self.risk.register_trade(pnl)
             if features is not None:
                 self.ai.log_trade(features, 1 if trade_result == 'WIN' else 0)
+            strategy_details = {
+                name: {
+                    'signal': res.signal,
+                    'score': float(res.score),
+                    'weight': float(STRATEGY_WEIGHTS.get(name, 1.0)),
+                    'confidence': float(consensus.get('strategy_confidences', {}).get(name, 0.0)),
+                }
+                for name, res in results
+            }
             record_metadata = {
                 'confidence_label': consensus['confidence_label'],
                 'confidence_value': consensus['confidence'],
@@ -2828,6 +3841,8 @@ class TradingEngine:
                 'dominant': consensus['dominant'],
                 'total_weight': consensus['total_weight'],
                 'active_weight': consensus.get('active_weight', 0.0),
+                'strategy_confidences': consensus.get('strategy_confidences', {}),
+                'strategy_details': strategy_details,
                 'contract_id': contract_id,
                 'stake': stake_amount,
                 'ml_probability': ml_probability,
@@ -2853,6 +3868,79 @@ class TradingEngine:
             ema_spread = float(evaluation['ema_spread'])
             boll_width = float(evaluation['boll_width'])
             volatilidad_actual = float(evaluation['volatility'])
+            confidence_value = combined_confidence
+            win_flag = trade_result == 'WIN'
+            self.total_operations += 1
+            if win_flag:
+                self.win_operations += 1
+            if MAINTENANCE_EVERY > 0 and self.total_operations % MAINTENANCE_EVERY == 0:
+                self.maintain_selective_memory()
+            self.last_contract_id = contract_id
+            self.last_symbol = symbol
+            self.last_result = trade_result
+            self.last_confidence = confidence_value
+            if STRICT_MODE_ENABLED:
+                if win_flag:
+                    self._post_loss_cooldown_until = 0.0
+                else:
+                    self._post_loss_cooldown_until = time.time() + POST_LOSS_COOLDOWN_SEC
+            bias_state = self.bias_memory.get(
+                symbol,
+                {"RSI": 0.0, "EMA": 0.0, "last_result": "NONE", "confidence": 0.0},
+            )
+            bias_state["last_result"] = trade_result
+            bias_state["confidence"] = confidence_value
+            self.bias_memory[symbol] = bias_state
+            save_biases(self.bias_memory)
+            profit_value = float(pnl)
+            main_reason = str(consensus.get('main_reason', 'Sin motivo disponible'))
+            reason_summary = '; '.join(reasons)
+            notes = (
+                f"{symbol} | RSI: {latest_rsi:.2f} | EMA spread: {ema_spread:.5f} | "
+                f"Volatilidad: {volatilidad_actual:.5f} | Reason: {main_reason}"
+            )
+            if reason_summary:
+                notes = f"{notes} | Motivos: {reason_summary}"
+            ema_slope_value = float(evaluation.get('ema_diff', 0.0))
+            notes = f"{notes} | EMA slope: {ema_slope_value:.5f}"
+            result_info = {
+                "hora": datetime.now().strftime("%H:%M:%S"),
+                "simbolo": symbol,
+                "decision": signal,
+                "confianza": confidence_value,
+                "resultado": "GANADA" if win_flag else "PERDIDA",
+                "pnl": profit_value,
+                "nota": notes,
+                "ticket": contract_id,
+            }
+            if win_flag:
+                self._store_winner_bias(
+                    symbol,
+                    latest_rsi,
+                    ema_spread,
+                    volatilidad_actual,
+                    evaluation.get('regime'),
+                    confidence_value,
+                )
+            should_notify = True
+            if contract_id is not None and not self._register_contract_closure(contract_id):
+                logging.debug(f"Contract {contract_id} already closed. Skipping duplicate log.")
+                should_notify = False
+            if should_notify:
+                ticket_label = f"#{contract_id}" if contract_id is not None else "N/A"
+                total_trades = int(self.total_operations)
+                winrate = self.get_accuracy()
+                emoji = "✅" if win_flag else "❌"
+                resultado_texto = "GANADA" if win_flag else "PERDIDA"
+                message = (
+                    f"{emoji} 🎯 Activo: {symbol}\n"
+                    f"📊 Resultado: {resultado_texto}\n"
+                    f"📈 Confianza: {confidence_value:.2f}\n"
+                    f"⚙️ Operaciones: {total_trades}\n"
+                    f"🎯 Precisión actual: {winrate:.2f}%"
+                )
+                send_telegram_message(message)
+                self._notify_trade_result(result_info)
             exit_price = self._fetch_exit_price(symbol, entry_price)
             price_change = float(exit_price - entry_price)
             auto_learn.update_history(
@@ -2875,6 +3963,23 @@ class TradingEngine:
                 trade_result,
             )
             auto_learn.predict_next(latest_rsi, ema_spread, boll_width, volatilidad_actual)
+            if not self.learning_enabled:
+                logging.info("Learning temporarily disabled.")
+            else:
+                signals_list = [outcome.signal for _, outcome in results]
+                feedback = self.aprendizaje.apply_learning_feedback(
+                    trade_result,
+                    symbol,
+                    latest_rsi,
+                    ema_spread,
+                    volatilidad_actual,
+                    signals_list,
+                    signal,
+                    confidence_value,
+                )
+                self.last_learning_feedback = feedback
+                if feedback is not None:
+                    self.learning_confidences.append(feedback)
             logging.info(
                 f"{record.timestamp:%Y-%m-%d %H:%M:%S} INFO: [{symbol}] {signal} @{ai_confidence:.2f} | Stake:{stake_amount:.2f} | EMA:{evaluation['ema_diff']:.2f} RSI:{latest_rsi:.2f} | Motivos: {'; '.join(reasons)}"
             )
@@ -2909,7 +4014,7 @@ class TradingEngine:
                 elapsed = time.time() - cycle_start
                 if elapsed > 3.0:
                     logging.warning(f"⚠️ Cycle timeout ({elapsed:.2f}s) — forcing next iteration")
-                QtCore.QThread.msleep(1500)
+                QtCore.QThread.msleep(100)
         finally:
             self.stop()
 
@@ -2926,6 +4031,11 @@ class TradingEngine:
         except Exception:
             pass
         self.api.socket = None
+        with self._processed_lock:
+            self._processed_contracts.clear()
+        with self._closed_lock:
+            self._closed_contracts.clear()
+        CSV_LOGGED_CONTRACTS.clear()
 
 
 # ===============================================================
@@ -2958,15 +4068,51 @@ class QtLogHandler(logging.Handler):
         self.emitter.message.emit(message)
 
 
-class TradingThread(QtCore.QThread):
+class BotThread(QThread):
+    log_signal = pyqtSignal(str)
+    result_signal = pyqtSignal(dict)
+
     def __init__(self, engine: TradingEngine) -> None:
         super().__init__()
         self.engine = engine
         self._active = True
+        self._closed_contracts: Set[int] = set()
+        self.logged_contracts: Set[int] = set()
+        self._result_callback = self._handle_trade_result
+        self.engine.add_result_listener(self._result_callback)
+
+    def _normalize_contract_id(self, value: Any) -> Optional[int]:
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _handle_trade_result(self, data: Dict[str, Any]) -> None:
+        contract_id = self._normalize_contract_id(data.get("ticket") or data.get("contract_id"))
+        if contract_id is not None:
+            self.logged_contracts = getattr(self, "logged_contracts", set())
+            logged_contracts = self.logged_contracts
+            if contract_id in logged_contracts:
+                logging.debug(f"Duplicate contract {contract_id} ignored.")
+                return
+            logged_contracts.add(contract_id)
+            self._closed_contracts.add(contract_id)
+        ticket = data.get("ticket")
+        resultado = data.get("resultado", "-")
+        if ticket is not None:
+            mensaje = f"✅ Contrato #{ticket} {resultado}"
+        else:
+            mensaje = f"✅ Contrato {resultado}"
+        self.log_signal.emit(mensaje)
+        self.result_signal.emit(dict(data))
 
     def run(self) -> None:  # type: ignore[override]
         logging.info("🚀 BotThread started successfully.")
         self._active = True
+        self._closed_contracts.clear()
+        self.logged_contracts.clear()
         try:
             self.engine.start_engine()
         except Exception as exc:
@@ -2986,15 +4132,19 @@ class TradingThread(QtCore.QThread):
                     logging.warning(f"⚠️ Cycle timeout ({elapsed:.2f}s) — forcing next iteration")
                 if not self._active or not self.engine.is_running():
                     break
-                QtCore.QThread.msleep(1500)
+                QThread.msleep(100)
         finally:
             self.engine.stop()
+            self.engine.remove_result_listener(self._result_callback)
             logging.info("🧩 BotThread stopped.")
             self._active = False
 
     def stop(self) -> None:
         self._active = False
         self.engine.stop()
+        self.engine.remove_result_listener(self._result_callback)
+        self._closed_contracts.clear()
+        self.logged_contracts.clear()
 
 
 class BotWindow(QtWidgets.QWidget):
@@ -3021,6 +4171,9 @@ class BotWindow(QtWidgets.QWidget):
             """
         )
 
+        self.log_view = QtWidgets.QPlainTextEdit()
+        self.log_view.setReadOnly(True)
+
         self.bridge = EngineBridge()
         self.bridge.trade.connect(self._on_trade)
         self.bridge.status.connect(self._on_status)
@@ -3038,6 +4191,8 @@ class BotWindow(QtWidgets.QWidget):
             self.log_handler.emitter.message.connect(self._append_log)
 
         self.engine = TradingEngine()
+        global global_engine
+        global_engine = self.engine
         self.engine.add_trade_listener(lambda record, stats: self.bridge.trade.emit(record, stats))
         self.engine.add_status_listener(lambda status: self.bridge.status.emit(status))
         self.engine.add_summary_listener(lambda symbol, data: self.bridge.summary.emit(symbol, data))
@@ -3046,7 +4201,7 @@ class BotWindow(QtWidgets.QWidget):
         for name, enabled in self.strategy_initial_state.items():
             self.engine.set_strategy_state(name, enabled)
 
-        self.thread: Optional[TradingThread] = None
+        self.bot_thread: Optional[BotThread] = None
         self.latest_stats: Dict[str, float] = {
             "operations": 0.0,
             "wins": 0.0,
@@ -3065,12 +4220,22 @@ class BotWindow(QtWidgets.QWidget):
         self.history_bias_labels: Dict[str, QtWidgets.QLabel] = {}
         self.history_prediction_label: Optional[QtWidgets.QLabel] = None
 
+        self.logged_contracts: Set[int] = set()
+        self.pending_contracts: Set[int] = set()
+        self.learning_enabled = True
+        self._background_initialized = False
+
         self._build_ui()
 
         self.refresh_timer = QtCore.QTimer(self)
         self.refresh_timer.setInterval(1500)
         self.refresh_timer.timeout.connect(self._refresh_phase)
         self.refresh_timer.start()
+
+        self.learning_timer = QtCore.QTimer(self)
+        self.learning_timer.setInterval(3000)
+        self.learning_timer.timeout.connect(self.update_learning_tab)
+        self.learning_timer.start()
 
     def _build_ui(self) -> None:
         layout = QtWidgets.QVBoxLayout(self)
@@ -3080,8 +4245,14 @@ class BotWindow(QtWidgets.QWidget):
         self._build_strategies_tab()
         self._build_asset_summary_tab()
         self._build_settings_tab()
-        self._build_history_tab()
+        self._build_learning_tab()
         self._initialize_asset_summary()
+
+    def initialize_background_services(self) -> None:
+        if self._background_initialized:
+            return
+        self.engine.start_background_services()
+        self._background_initialized = True
 
     def _build_general_tab(self) -> None:
         tab = QtWidgets.QWidget()
@@ -3153,8 +4324,6 @@ class BotWindow(QtWidgets.QWidget):
         self.trade_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
         vbox.addWidget(self.trade_table, 1)
 
-        self.log_view = QtWidgets.QPlainTextEdit()
-        self.log_view.setReadOnly(True)
         vbox.addWidget(self.log_view, 1)
 
     def _build_strategies_tab(self) -> None:
@@ -3338,20 +4507,115 @@ class BotWindow(QtWidgets.QWidget):
         self.reset_history_button.clicked.connect(self._reset_history_data)
         self._update_history_tab()
 
+    def _build_learning_tab(self) -> None:
+        self.tab_learning = QtWidgets.QWidget()
+        self.tabs.addTab(self.tab_learning, "Aprendizaje")
+        layout = QtWidgets.QVBoxLayout(self.tab_learning)
+
+        self.label_operations = QtWidgets.QLabel("Operaciones totales: 0")
+        self.label_precision = QtWidgets.QLabel("Precisión actual: 0.00%")
+        self.label_confidence = QtWidgets.QLabel("Confianza promedio: 0.00")
+        self.label_progress = QtWidgets.QLabel("Progreso adaptativo: 0.00%")
+        self.label_mode = QtWidgets.QLabel("Modo: Pasivo")
+
+        self.progress_bar = QtWidgets.QProgressBar()
+        self.progress_bar.setRange(0, 100)
+        self.progress_bar.setValue(0)
+
+        layout.addWidget(self.label_operations)
+        layout.addWidget(self.label_precision)
+        layout.addWidget(self.label_confidence)
+        layout.addWidget(self.label_progress)
+        layout.addWidget(self.label_mode)
+        layout.addWidget(self.progress_bar)
+        self.learning_toggle = QtWidgets.QCheckBox("Habilitar aprendizaje adaptativo")
+        self.learning_toggle.setChecked(True)
+        self.learning_toggle.stateChanged.connect(self._on_learning_toggled)
+        layout.addWidget(self.learning_toggle)
+        layout.addStretch(1)
+
+    def update_learning_tab(self) -> None:
+        try:
+            engine = getattr(self, "engine", None)
+            if engine is None:
+                return
+
+            wins = getattr(engine, "win_count", 0)
+            losses = getattr(engine, "loss_count", 0)
+            total_ops = int(wins + losses)
+
+            precision = 0.0
+            if total_ops > 0:
+                precision = (wins / total_ops) * 100.0
+
+            aprendizaje = getattr(engine, "aprendizaje", None)
+            adaptive_ops = getattr(aprendizaje, "total_operations", 0) if aprendizaje is not None else 0
+            displayed_ops = max(total_ops, adaptive_ops)
+
+            confidences = list(getattr(engine, "learning_confidences", []))
+            if not confidences:
+                history = getattr(engine, "trade_history", [])
+                for record in history[-100:]:
+                    value = getattr(record, "confidence", None)
+                    if value is not None:
+                        confidences.append(float(value))
+
+            avg_conf = float(np.mean(confidences)) if confidences else 0.0
+
+            progress = 0.0
+            if displayed_ops > 0:
+                progress = min(100.0, (displayed_ops / 100.0) * max(avg_conf, 0.0) * 100.0)
+
+            if not getattr(self, "learning_enabled", True):
+                mode = "Pausado"
+            elif displayed_ops > 70:
+                mode = "Estable"
+            elif displayed_ops > 30:
+                mode = "Aprendizaje"
+            else:
+                mode = "Pasivo"
+
+            self.label_operations.setText(f"Operaciones totales: {displayed_ops}")
+            self.label_precision.setText(f"Precisión actual: {precision:.2f}%")
+            self.label_confidence.setText(f"Confianza promedio: {avg_conf:.2f}")
+            self.label_progress.setText(f"Progreso adaptativo: {progress:.2f}%")
+            self.label_mode.setText(f"Modo: {mode}")
+            self.progress_bar.setValue(int(progress))
+
+            desired_state = getattr(self, "learning_enabled", True)
+            if self.learning_toggle.isChecked() != desired_state:
+                self.learning_toggle.blockSignals(True)
+                self.learning_toggle.setChecked(desired_state)
+                self.learning_toggle.blockSignals(False)
+
+        except Exception as exc:
+            print(f"[LearningTab] Update error: {exc}")
+
+    def _on_learning_toggled(self, state: int) -> None:
+        enabled = state == QtCore.Qt.Checked
+        self.learning_enabled = enabled
+        engine = getattr(self, "engine", None)
+        if engine is not None:
+            engine.set_learning_enabled(enabled)
+
     def start_trading(self) -> None:
-        if self.thread is not None and self.thread.isRunning():
+        if self.bot_thread is not None and self.bot_thread.isRunning():
             return
         self.auto_shutdown_active = False
         self.engine.auto_shutdown_triggered = False
-        self.thread = TradingThread(self.engine)
-        self.thread.finished.connect(self._on_thread_finished)
-        self.thread.start()
+        self.logged_contracts.clear()
+        self.pending_contracts.clear()
+        self.bot_thread = BotThread(self.engine)
+        self.bot_thread.finished.connect(self._on_thread_finished)
+        self.bot_thread.log_signal.connect(self._append_log)
+        self.bot_thread.result_signal.connect(self.update_result_table)
+        self.bot_thread.start()
         self.start_button.setEnabled(False)
         self.stop_button.setEnabled(True)
         self.status_label.setText("Estado: Iniciando...")
 
     def stop_trading(self) -> None:
-        if self.thread is None:
+        if self.bot_thread is None:
             if self.auto_shutdown_active:
                 self.auto_shutdown_active = False
                 self.start_button.setEnabled(True)
@@ -3359,14 +4623,16 @@ class BotWindow(QtWidgets.QWidget):
                 self.status_label.setText("Estado: Detenido")
                 self._on_trade_state("ready")
             return
-        self.thread.stop()
-        self.thread.wait(2000)
-        self.thread = None
+        self.bot_thread.stop()
+        self.bot_thread.wait(2000)
+        self.bot_thread = None
         self.start_button.setEnabled(True)
         self.stop_button.setEnabled(False)
         self.status_label.setText("Estado: Detenido")
         self.auto_shutdown_active = False
         self._on_trade_state("ready")
+        self.logged_contracts.clear()
+        self.pending_contracts.clear()
 
     def _on_trade_amount_changed(self, value: float) -> None:
         self.engine.set_trade_amount(value)
@@ -3382,7 +4648,7 @@ class BotWindow(QtWidgets.QWidget):
         self.engine.configure_auto_shutdown(habilitado, limite)
         if not habilitado and self.auto_shutdown_active:
             self.auto_shutdown_active = False
-            if self.thread is None:
+            if self.bot_thread is None:
                 self.start_button.setEnabled(True)
 
     def _on_kelly_toggled(self, checked: bool) -> None:
@@ -3392,9 +4658,110 @@ class BotWindow(QtWidgets.QWidget):
         auto_learn.reset_history()
         QtCore.QTimer.singleShot(350, self._update_history_tab)
 
+    def _normalize_contract_id(self, value: Any) -> Optional[int]:
+        if value is None:
+            return None
+        try:
+            return int(value)
+        except (TypeError, ValueError):
+            return None
+
+    def _find_contract_row(self, contract_id: Optional[int]) -> Optional[int]:
+        if contract_id is None:
+            return None
+        table = getattr(self, "trade_table", None)
+        if table is None:
+            return None
+        for index in range(table.rowCount()):
+            item = table.item(index, 0)
+            if item is not None:
+                stored_id = item.data(QtCore.Qt.UserRole)
+                if stored_id == contract_id:
+                    return index
+        return None
+
+    def _trim_trade_table(self) -> None:
+        table = getattr(self, "trade_table", None)
+        if table is None:
+            return
+        while table.rowCount() > 250:
+            last_row = table.rowCount() - 1
+            item = table.item(last_row, 0)
+            if item is not None:
+                stored_id = item.data(QtCore.Qt.UserRole)
+                if stored_id is not None:
+                    self.logged_contracts.discard(stored_id)
+                    self.pending_contracts.discard(stored_id)
+            table.removeRow(last_row)
+
+    def update_result_table(self, data: Dict[str, Any]) -> None:
+        table = getattr(self, "trade_table", None)
+        if table is None:
+            return
+        contract_id = self._normalize_contract_id(data.get("ticket") or data.get("contract_id"))
+        if contract_id is not None:
+            self.logged_contracts = getattr(self, "logged_contracts", set())
+            logged_contracts = self.logged_contracts
+            if contract_id in logged_contracts:
+                logging.debug(f"Duplicate contract {contract_id} ignored.")
+                return
+            logged_contracts.add(contract_id)
+        target_row = self._find_contract_row(contract_id)
+        if target_row is None:
+            target_row = 0
+            table.insertRow(target_row)
+        confidence_value = float(data.get("confianza", 0.0))
+        pnl_value = float(data.get("pnl", 0.0))
+        entries = [
+            str(data.get("hora", "")),
+            str(data.get("simbolo", "")),
+            str(data.get("decision", "")),
+            f"{confidence_value:.2f}",
+            str(data.get("resultado", "")),
+            f"{pnl_value:.2f}",
+        ]
+        for column, text_value in enumerate(entries):
+            item = QtWidgets.QTableWidgetItem(text_value)
+            if column == 0 and contract_id is not None:
+                item.setData(QtCore.Qt.UserRole, contract_id)
+            table.setItem(target_row, column, item)
+        nota_text = str(data.get("nota", ""))
+        table.setItem(target_row, 6, QtWidgets.QTableWidgetItem(nota_text))
+        if contract_id is not None:
+            self.pending_contracts.discard(contract_id)
+        if table.rowCount() > 250:
+            self._trim_trade_table()
+
+
     def _on_trade(self, record: TradeRecord, stats: Dict[str, float]) -> None:
         self.latest_stats = stats
-        self.trade_table.insertRow(0)
+        table = self.trade_table
+        contract_id = self._normalize_contract_id(record.metadata.get('contract_id') if record.metadata else None)
+        if contract_id is not None:
+            self.logged_contracts = getattr(self, "logged_contracts", set())
+            logged_contracts = self.logged_contracts
+            if contract_id in logged_contracts:
+                logging.debug(f"Duplicate contract {contract_id} ignored.")
+                self._update_stats_labels(stats)
+                metadata = record.metadata or {}
+                summary_data = {
+                    'confidence': metadata.get('confidence_value', record.confidence),
+                    'confidence_label': metadata.get('confidence_label', 'Baja'),
+                    'active': metadata.get('active', 0),
+                    'signals': metadata.get('signals', 0),
+                    'aligned': metadata.get('aligned', 0),
+                    'signal': metadata.get('direction', record.decision),
+                    'dominant': metadata.get('dominant', record.decision),
+                    'main_reason': metadata.get('main_reason', 'Motivo no disponible'),
+                }
+                self._update_asset_summary_from_dict(record.symbol, summary_data)
+                self._update_history_tab()
+                return
+            logged_contracts.add(contract_id)
+        target_row = self._find_contract_row(contract_id)
+        if target_row is None:
+            target_row = 0
+            table.insertRow(target_row)
         entries = [
             record.timestamp.strftime("%H:%M:%S"),
             record.symbol,
@@ -3402,14 +4769,17 @@ class BotWindow(QtWidgets.QWidget):
             f"{record.confidence:.2f}",
             record.result or "-",
             f"{record.pnl:.2f}",
-            "; ".join(record.reasons),
+            '; '.join(record.reasons),
         ]
-        for column, text in enumerate(entries):
-            self.trade_table.setItem(0, column, QtWidgets.QTableWidgetItem(text))
-        if self.trade_table.rowCount() > 250:
-            self.trade_table.removeRow(self.trade_table.rowCount() - 1)
+        for column, text_value in enumerate(entries):
+            item = QtWidgets.QTableWidgetItem(text_value)
+            if column == 0 and contract_id is not None:
+                item.setData(QtCore.Qt.UserRole, contract_id)
+            table.setItem(target_row, column, item)
+        if table.rowCount() > 250:
+            self._trim_trade_table()
         self._update_stats_labels(stats)
-        metadata = record.metadata
+        metadata = record.metadata or {}
         summary_data = {
             'confidence': metadata.get('confidence_value', record.confidence),
             'confidence_label': metadata.get('confidence_label', 'Baja'),
@@ -3422,6 +4792,10 @@ class BotWindow(QtWidgets.QWidget):
         }
         self._update_asset_summary_from_dict(record.symbol, summary_data)
         self._update_history_tab()
+        if contract_id is not None:
+            self.pending_contracts.add(contract_id)
+            self.logged_contracts.discard(contract_id)
+
 
     def _on_status(self, status: str) -> None:
         if status == "auto_shutdown":
@@ -3458,7 +4832,7 @@ class BotWindow(QtWidgets.QWidget):
             self.trade_state_label.setText(texto)
 
     def _on_thread_finished(self) -> None:
-        self.thread = None
+        self.bot_thread = None
         if self.auto_shutdown_active:
             self.start_button.setEnabled(False)
             self.stop_button.setEnabled(True)
@@ -3470,8 +4844,16 @@ class BotWindow(QtWidgets.QWidget):
         self._on_trade_state("ready")
 
     def _append_log(self, message: str) -> None:
-        self.log_view.appendPlainText(message)
-        self.log_view.verticalScrollBar().setValue(self.log_view.verticalScrollBar().maximum())
+        try:
+            if hasattr(self, "log_view") and self.log_view:
+                self.log_view.appendPlainText(message)
+                self.log_view.verticalScrollBar().setValue(
+                    self.log_view.verticalScrollBar().maximum()
+                )
+            else:
+                print(message)
+        except Exception as exc:
+            print(f"[LogError] {exc}: {message}")
 
     def _update_stats_labels(self, stats: Dict[str, float]) -> None:
         self.stats_values["Operaciones"].setText(str(int(stats.get("operations", 0.0))))
@@ -3637,9 +5019,9 @@ class BotWindow(QtWidgets.QWidget):
                 self.history_list.addItem(item)
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # type: ignore[override]
-        if self.thread is not None and self.thread.isRunning():
-            self.thread.stop()
-            self.thread.wait(2000)
+        if self.bot_thread is not None and self.bot_thread.isRunning():
+            self.bot_thread.stop()
+            self.bot_thread.wait(2000)
         logging.getLogger().removeHandler(self.log_handler)
         super().closeEvent(event)
 
@@ -3651,6 +5033,7 @@ def main() -> None:
     app = QtWidgets.QApplication(sys.argv)
     window = BotWindow()
     window.show()
+    window.initialize_background_services()
     app.exec_()
 
 
