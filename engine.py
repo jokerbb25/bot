@@ -21,7 +21,7 @@ from strategy_base import StrategyResult, StrategySnapshot
 
 MIN_CONFIDENCE = 0.70
 SOFT_LOWER_BOUND = 0.55
-CONFIDENCE_THRESHOLD = 0.70
+CONFIDENCE_THRESHOLD = 0.75
 VOLATILITY_MIN = 0.0002
 VOLATILITY_MAX = 0.002
 VOLATILITY_LOW_INFLUENCE = 0.0005
@@ -30,6 +30,7 @@ STAKE_REDUCTION_THRESHOLD = 0.0005
 LOW_VOLATILITY_STAKE_FACTOR = 0.5
 DEFAULT_SUCCESS_RATE = 0.5
 CONFIDENCE_MEMORY_PATH = Path("confidence_memory.json")
+MIN_ALIGNED_STRATEGIES = 3
 
 calibrator = ConfidenceCalibrator()
 
@@ -267,7 +268,7 @@ def evaluate_snapshot(snapshot: StrategySnapshot) -> EvaluationResult:
         allow_trade = False
         skip_reason = 'invalid_volatility'
 
-    if allow_trade and (consensus_direction is None or aligned_count < 2):
+    if allow_trade and (consensus_direction is None or aligned_count < MIN_ALIGNED_STRATEGIES):
         allow_trade = False
         skip_reason = 'insufficient_alignment'
 

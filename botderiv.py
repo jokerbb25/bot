@@ -67,7 +67,7 @@ LOW_VOL_THRESHOLD = 0.0006
 LOW_VOL_CONFIDENCE = 0.85
 NEUTRAL_RSI_BAND = (45.0, 55.0)
 NEUTRAL_RSI_CONF = 0.95
-MIN_ALIGNED_STRATEGIES = 2
+MIN_ALIGNED_STRATEGIES = 3
 POST_LOSS_COOLDOWN_SEC = 120
 MAX_TRADES_PER_HOUR = 20
 KEEP_WIN_MIN_CONF = 0.70
@@ -3575,10 +3575,14 @@ class TradingEngine:
         logging.info(
             f"📊 Final confidence {selected['symbol']}: {confidence_value:.2f} | Volatility: {volatility_display} | Action: {selected['signal']}"
         )
-        if confidence_value < MIN_CONFIDENCE:
-            logging.info(
-                f"🚫 Skipping trade on {selected['symbol']} due to low confidence ({confidence_value:.2f})"
-            )
+        aligned_total = int(
+            selected.get('aligned', selected.get('consensus', {}).get('aligned', 0))
+        )
+        if (
+            confidence_value < CONFIDENCE_MIN
+            or aligned_total < MIN_ALIGNED_STRATEGIES
+        ):
+            logging.info("⏭️ Trade skipped due to low confluence/confidence.")
             _cycle_pause()
             return
         if volatility_value is not None and volatility_value < MIN_VOLATILITY:
@@ -3758,10 +3762,13 @@ class TradingEngine:
             logging.info("⚠️ RSI y EMA en conflicto → reduciendo confianza (penalización 15%).")
             confidence_value *= 0.85
             evaluation['final_confidence'] = confidence_value
+        if (
+            confidence_value < CONFIDENCE_MIN
+            or aligned_strategies < MIN_ALIGNED_STRATEGIES
+        ):
+            logging.info("⏭️ Trade skipped due to low confluence/confidence.")
+            return False
         if STRICT_MODE_ENABLED:
-            if confidence_value < CONFIDENCE_MIN:
-                logging.info("🚫 Skipping trade — low confidence (modo estricto).")
-                return False
             if (
                 volatility_value is not None
                 and volatility_value < LOW_VOL_THRESHOLD
@@ -3781,11 +3788,6 @@ class TradingEngine:
                     "🚫 Skipping trade — neutral RSI & insufficient confidence (modo estricto)."
                 )
                 return False
-            if aligned_strategies < MIN_ALIGNED_STRATEGIES:
-                logging.info(
-                    f"🚫 Skipping trade — only {aligned_strategies}/7 strategies aligned (modo estricto)."
-                )
-                return False
             now_ts = time.time()
             if self._post_loss_cooldown_until and now_ts < self._post_loss_cooldown_until:
                 remaining = self._post_loss_cooldown_until - now_ts
@@ -3798,8 +3800,8 @@ class TradingEngine:
             if len(self._trade_timestamps) >= MAX_TRADES_PER_HOUR:
                 logging.info("⛔ Máximo de operaciones por hora alcanzado (modo estricto).")
                 return False
-        if combined_confidence is None or confidence_value < MIN_CONFIDENCE:
-            logging.info(f"🚫 Skipping trade on {symbol} due to low confidence ({confidence_value:.2f})")
+        if combined_confidence is None:
+            logging.info("⏭️ Trade skipped due to low confluence/confidence.")
             return False
         if volatility_value is not None and volatility_value < MIN_VOLATILITY:
             logging.info(f"🚫 Skipping trade on {symbol} due to low volatility ({volatility_value:.4f})")
@@ -3873,7 +3875,7 @@ class TradingEngine:
                 timestamp=datetime.now(timezone.utc),
                 symbol=symbol,
                 decision=signal,
-                confidence=ai_confidence,
+                confidence=confidence_value,
                 result=trade_result,
                 pnl=pnl,
                 reasons=reasons + ai_notes,
@@ -3957,7 +3959,7 @@ class TradingEngine:
                 message = (
                     f"{emoji} 🎯 Activo: {symbol}\n"
                     f"📊 Resultado: {resultado_texto}\n"
-                    f"📈 Confianza: {confidence_value:.2f}\n"
+                    f"📈 Confianza real: {confidence_value:.2f}\n"
                     f"⚙️ Operaciones: {total_trades}\n"
                     f"🎯 Precisión actual: {winrate:.2f}%"
                 )
@@ -4336,7 +4338,7 @@ class BotWindow(QtWidgets.QWidget):
             "Hora",
             "Símbolo",
             "Decisión",
-            "Confianza",
+            "Confianza real",
             "Resultado",
             "PnL",
             "Notas",
