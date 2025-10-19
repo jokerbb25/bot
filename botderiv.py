@@ -71,7 +71,8 @@ MIN_ALIGNED_STRATEGIES = 3
 POST_LOSS_COOLDOWN_SEC = 120
 MAX_TRADES_PER_HOUR = 20
 KEEP_WIN_MIN_CONF = 0.70
-MAINTENANCE_EVERY = 40
+MAINTENANCE_EVERY = 50
+VOLATILITY_CONFLICT_PENALTY = 0.10
 STRICT_MODE_ENABLED = True
 
 # === TELEGRAM BOT CONFIGURATION ===
@@ -159,22 +160,65 @@ def save_biases(biases: Dict[str, Dict[str, Any]]) -> None:
 def load_winner_biases() -> List[Dict[str, Any]]:
     if not WINNER_MEMORY_PATH.exists():
         return []
+    entries: List[Dict[str, Any]] = []
     try:
         with WINNER_MEMORY_PATH.open("r", encoding="utf-8") as handle:
-            data = json.load(handle)
-        if isinstance(data, list):
-            return [dict(entry) for entry in data]
-        if isinstance(data, dict):
-            return [dict(value) for value in data.values()]
+            raw_data = json.load(handle)
+        candidates: Iterable[Any]
+        if isinstance(raw_data, list):
+            candidates = raw_data
+        elif isinstance(raw_data, dict):
+            candidates = raw_data.values()
+        else:
+            candidates = []
+        for item in candidates:
+            record = dict(item) if isinstance(item, dict) else {}
+            symbol = str(record.get("symbol", ""))
+            direction = str(record.get("direction", "NONE")).upper()
+            confidence_value = float(record.get("confidence", 0.0) or 0.0)
+            timestamp_value = str(record.get("timestamp", datetime.now(timezone.utc).isoformat()))
+            weight_value = float(record.get("weight", 1.0) or 0.0)
+            entries.append(
+                {
+                    "symbol": symbol,
+                    "direction": direction,
+                    "confidence": confidence_value,
+                    "timestamp": timestamp_value,
+                    "rsi": float(record.get("rsi", 0.0) or 0.0),
+                    "ema": float(record.get("ema", 0.0) or 0.0),
+                    "volatility": float(record.get("volatility", 0.0) or 0.0),
+                    "regime": record.get("regime", "DESCONOCIDO"),
+                    "weight": float(max(weight_value, 0.0)),
+                }
+            )
     except Exception as exc:  # pragma: no cover
         logging.debug(f"No se pudo cargar sesgos ganadores: {exc}")
-    return []
+        return []
+    entries.sort(key=lambda entry: entry.get("weight", 0.0), reverse=True)
+    return entries
 
 
 def save_winner_biases(entries: List[Dict[str, Any]]) -> None:
+    serializable: List[Dict[str, Any]] = []
+    for entry in entries:
+        serializable.append(
+            {
+                "symbol": entry.get("symbol", ""),
+                "direction": entry.get("direction", "NONE"),
+                "confidence": float(entry.get("confidence", 0.0) or 0.0),
+                "timestamp": entry.get(
+                    "timestamp", datetime.now(timezone.utc).isoformat()
+                ),
+                "rsi": float(entry.get("rsi", 0.0) or 0.0),
+                "ema": float(entry.get("ema", 0.0) or 0.0),
+                "volatility": float(entry.get("volatility", 0.0) or 0.0),
+                "regime": entry.get("regime", "DESCONOCIDO"),
+                "weight": float(entry.get("weight", 0.0) or 0.0),
+            }
+        )
     try:
         with WINNER_MEMORY_PATH.open("w", encoding="utf-8") as handle:
-            json.dump(entries, handle, ensure_ascii=False, indent=2)
+            json.dump(serializable, handle, ensure_ascii=False, indent=2)
     except Exception as exc:  # pragma: no cover
         logging.debug(f"No se pudo guardar sesgos ganadores: {exc}")
 
@@ -2670,6 +2714,11 @@ class TradingEngine:
         self.last_confidence: float = 0.0
         self.bias_memory: Dict[str, Dict[str, Any]] = load_biases()
         self.winner_biases: List[Dict[str, Any]] = load_winner_biases()
+        self.learning_memory: List[Dict[str, Any]] = self.winner_biases
+        logging.info(
+            "🧠 %d winning biases loaded successfully.",
+            len(self.learning_memory),
+        )
         try:
             send_telegram_message(
                 f"🧠 Memoria cargada con {len(self.winner_biases)} sesgos ganadores"
@@ -2743,25 +2792,71 @@ class TradingEngine:
         except Exception as exc:
             logging.error(f"❌ Error in selective memory maintenance: {exc}")
 
+    def selective_save_memory(self) -> None:
+        try:
+            filtered: List[Dict[str, Any]] = []
+            for entry in self.winner_biases:
+                weight_value = float(entry.get("weight", 0.0) or 0.0)
+                if weight_value <= 0.0:
+                    continue
+                normalized_entry = dict(entry)
+                normalized_entry["weight"] = weight_value
+                filtered.append(normalized_entry)
+            filtered.sort(key=lambda item: item.get("weight", 0.0), reverse=True)
+            self.winner_biases = filtered
+            self.learning_memory = self.winner_biases
+            save_winner_biases(self.winner_biases)
+            logging.info("🧠 Selective maintenance applied, winning biases preserved.")
+        except Exception as exc:
+            logging.error(f"❌ Error while preserving winning biases: {exc}")
+
     def _store_winner_bias(
         self,
         symbol: str,
+        direction: str,
         rsi_value: float,
         ema_spread: float,
         volatility: float,
         regime: Optional[str],
         confidence_value: float,
     ) -> None:
-        entry = {
-            "symbol": symbol,
-            "rsi": float(rsi_value),
-            "ema": float(ema_spread),
-            "volatility": float(volatility),
-            "regime": regime or "DESCONOCIDO",
-            "confidence": float(confidence_value),
-            "timestamp": datetime.now(timezone.utc).isoformat(),
-        }
-        self.winner_biases.append(entry)
+        direction_value = direction if direction in {"CALL", "PUT"} else "NONE"
+        timestamp_value = datetime.now(timezone.utc).isoformat()
+        weight_increment = max(confidence_value, 0.0)
+        updated = False
+        for entry in self.winner_biases:
+            if (
+                entry.get("symbol") == symbol
+                and entry.get("direction") == direction_value
+            ):
+                entry["confidence"] = max(
+                    float(entry.get("confidence", 0.0) or 0.0),
+                    float(confidence_value),
+                )
+                entry["timestamp"] = timestamp_value
+                entry["rsi"] = float(rsi_value)
+                entry["ema"] = float(ema_spread)
+                entry["volatility"] = float(volatility)
+                entry["regime"] = regime or entry.get("regime", "DESCONOCIDO")
+                entry["weight"] = float(entry.get("weight", 0.0) or 0.0) + weight_increment
+                updated = True
+                break
+        if not updated:
+            self.winner_biases.append(
+                {
+                    "symbol": symbol,
+                    "direction": direction_value,
+                    "confidence": float(confidence_value),
+                    "timestamp": timestamp_value,
+                    "rsi": float(rsi_value),
+                    "ema": float(ema_spread),
+                    "volatility": float(volatility),
+                    "regime": regime or "DESCONOCIDO",
+                    "weight": max(weight_increment, 1.0),
+                }
+            )
+        self.learning_memory = self.winner_biases
+        self.winner_biases.sort(key=lambda item: item.get("weight", 0.0), reverse=True)
         save_winner_biases(self.winner_biases)
 
     def start_background_services(self) -> None:
@@ -3759,9 +3854,28 @@ class TradingEngine:
             and ema_signal_eval in {'CALL', 'PUT'}
             and rsi_signal_eval != ema_signal_eval
         ):
-            logging.info("⚠️ RSI y EMA en conflicto → reduciendo confianza (penalización 15%).")
-            confidence_value *= 0.85
+            logging.info(
+                "⚠️ RSI y EMA en conflicto → reduciendo confianza (penalización 10%)."
+            )
+            confidence_value *= 1.0 - VOLATILITY_CONFLICT_PENALTY
             evaluation['final_confidence'] = confidence_value
+        memory_boost = 0.0
+        for bias in self.learning_memory:
+            if (
+                bias.get('symbol') == symbol
+                and bias.get('direction') == final_action
+            ):
+                memory_boost += float(bias.get('weight', 0.0) or 0.0)
+        if memory_boost > 0.0:
+            confidence_value = float(
+                min(confidence_value * (1.0 + 0.05 * memory_boost), 1.0)
+            )
+            evaluation['final_confidence'] = confidence_value
+            logging.info(
+                "🧩 Weighted learning applied: boost=%.2f, final_conf=%.2f",
+                memory_boost,
+                confidence_value,
+            )
         if (
             confidence_value < CONFIDENCE_MIN
             or aligned_strategies < MIN_ALIGNED_STRATEGIES
@@ -3892,13 +4006,14 @@ class TradingEngine:
             ema_spread = float(evaluation['ema_spread'])
             boll_width = float(evaluation['boll_width'])
             volatilidad_actual = float(evaluation['volatility'])
-            confidence_value = combined_confidence
+            confidence_value = float(evaluation.get('final_confidence', combined_confidence))
             win_flag = trade_result == 'WIN'
             self.total_operations += 1
             if win_flag:
                 self.win_operations += 1
             if MAINTENANCE_EVERY > 0 and self.total_operations % MAINTENANCE_EVERY == 0:
                 self.maintain_selective_memory()
+                self.selective_save_memory()
             self.last_contract_id = contract_id
             self.last_symbol = symbol
             self.last_result = trade_result
@@ -3940,6 +4055,7 @@ class TradingEngine:
             if win_flag:
                 self._store_winner_bias(
                     symbol,
+                    signal,
                     latest_rsi,
                     ema_spread,
                     volatilidad_actual,
