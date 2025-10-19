@@ -3956,6 +3956,7 @@ class TradingEngine:
                 winrate = self.get_accuracy()
                 emoji = "✅" if win_flag else "❌"
                 resultado_texto = "GANADA" if win_flag else "PERDIDA"
+                logging.info(f"✅ Dynamic confidence applied: {confidence_value:.2f}")
                 message = (
                     f"{emoji} 🎯 Activo: {symbol}\n"
                     f"📊 Resultado: {resultado_texto}\n"
