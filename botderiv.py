@@ -3238,6 +3238,10 @@ class TradingEngine:
                     'macd': macd_value,
                     'rsi_signal': rsi_signal,
                     'ema_signal': ema_signal,
+                    'pullback_signal': pullback_signal,
+                    'base_action': combined_base_action,
+                    'primary_signals': primary_signals,
+                    'latest_prices': df['close'].tail(5).tolist(),
                     'macd_signal': macd_signal,
                     'aligned': consensus['aligned'],
                 }
@@ -3307,6 +3311,15 @@ class TradingEngine:
                 ),
                 'NONE',
             )
+            primary_signals = [rsi_signal, ema_signal, pullback_signal]
+            call_votes = primary_signals.count('CALL')
+            put_votes = primary_signals.count('PUT')
+            if call_votes > put_votes:
+                combined_base_action = 'CALL'
+            elif put_votes > call_votes:
+                combined_base_action = 'PUT'
+            else:
+                combined_base_action = signal if signal in {'CALL', 'PUT'} else 'NONE'
             volatility_mid_range = 0.0005 <= smoothed_volatility <= 0.002
             perfect_alignment = (
                 signal in {'CALL', 'PUT'}
@@ -3684,6 +3697,37 @@ class TradingEngine:
         aligned_strategies = int(
             evaluation.get('aligned', evaluation.get('consensus', {}).get('aligned', 0))
         )
+        base_action = evaluation.get('base_action', signal)
+        final_action = signal
+        latest_prices_seq = evaluation.get('latest_prices')
+        live_volatility = None
+        if isinstance(latest_prices_seq, (list, tuple)) and len(latest_prices_seq) >= 5:
+            try:
+                live_volatility = float(np.std(latest_prices_seq[-5:]))
+            except Exception:
+                live_volatility = None
+        if live_volatility is not None and live_volatility < 0.0005:
+            logging.info("⚠️ Volatilidad en vivo baja, cancelando operación.")
+            return False
+        if (
+            final_action in {'CALL', 'PUT'}
+            and base_action in {'CALL', 'PUT'}
+            and final_action != base_action
+            and confidence_value < 0.85
+        ):
+            logging.info(
+                f"⚠️ Señal inconsistente: {base_action} vs {final_action} (conf={confidence_value:.2f}) → Cancelada"
+            )
+            return False
+        rsi_signal_eval = evaluation.get('rsi_signal')
+        ema_signal_eval = evaluation.get('ema_signal')
+        if (
+            rsi_signal_eval in {'CALL', 'PUT'}
+            and ema_signal_eval in {'CALL', 'PUT'}
+            and rsi_signal_eval != ema_signal_eval
+        ):
+            logging.info("⚠️ RSI y EMA en conflicto → cancelando señal.")
+            return False
         if STRICT_MODE_ENABLED:
             if confidence_value < CONFIDENCE_MIN:
                 logging.info("🚫 Skipping trade — low confidence (modo estricto).")
