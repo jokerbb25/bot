@@ -3861,34 +3861,40 @@ class TradingEngine:
         if volatility_value is not None:
             self.current_volatility = volatility_value
 
-        symbol_upper = symbol.upper()
-        low_vol = 0.0003
-        high_vol = 0.0025
-        if 'R_25' in symbol_upper:
-            low_vol, high_vol = 0.0002, 0.0015
-        elif 'R_50' in symbol_upper:
-            low_vol, high_vol = 0.0003, 0.0018
-        elif 'R_75' in symbol_upper:
-            low_vol, high_vol = 0.0004, 0.0022
-        elif 'R_100' in symbol_upper:
-            low_vol, high_vol = 0.0005, 0.0028
-        volatility_reference = None
-        if hasattr(self, 'current_volatility'):
-            try:
-                volatility_reference = float(self.current_volatility)
-            except (TypeError, ValueError):
-                volatility_reference = None
-        if volatility_reference is not None:
-            if volatility_reference > high_vol:
-                logging.info(
-                    f"🌪️ High volatility ({volatility_reference:.5f}) exceeds safe range for {symbol} → trade skipped."
-                )
-                return False
-            if volatility_reference < low_vol:
-                logging.info(
-                    f"💤 Low volatility ({volatility_reference:.5f}) below minimum threshold for {symbol} → trade skipped."
-                )
-                return False
+        def _normalize_symbol(sym: str) -> str:
+            candidate = (sym or "").upper()
+            for base in ("R_25", "R_50", "R_75", "R_100"):
+                if candidate.startswith(base):
+                    return base
+            return candidate
+
+        symbol_base = _normalize_symbol(symbol)
+        low_vol, high_vol = 0.0003, 0.0025
+        symbol_thresholds = {
+            "R_25": (0.0002, 0.0015),
+            "R_50": (0.0003, 0.0018),
+            "R_75": (0.0004, 0.0022),
+            "R_100": (0.0005, 0.0028),
+        }
+        if symbol_base in symbol_thresholds:
+            low_vol, high_vol = symbol_thresholds[symbol_base]
+        volatility_reference = float(getattr(self, "current_volatility", 0.0) or 0.0)
+        if volatility_reference > 0.05:
+            volatility_reference = volatility_reference / 100.0
+        epsilon = 1e-6
+        if volatility_reference > (high_vol + epsilon):
+            logging.info(
+                f"🌪️ High volatility ({volatility_reference:.6f}) > {high_vol:.6f} for {symbol_base} → trade skipped."
+            )
+            return False
+        if volatility_reference < (low_vol - epsilon):
+            logging.info(
+                f"💤 Low volatility ({volatility_reference:.6f}) < {low_vol:.6f} for {symbol_base} → trade skipped."
+            )
+            return False
+        logging.info(
+            f"✅ Volatility OK for {symbol_base}: {volatility_reference:.6f} within [{low_vol:.6f}, {high_vol:.6f}]"
+        )
         confidence_value = float(combined_confidence) if combined_confidence is not None else 0.0
         latest_rsi_value = float(evaluation.get('latest_rsi', 0.0))
         aligned_strategies = int(
