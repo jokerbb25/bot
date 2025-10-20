@@ -2796,10 +2796,12 @@ class TradingEngine:
             losses_loaded,
             total_loaded,
         )
+        startup_message = (
+            f"🤖 Bot iniciado correctamente y conectado a Deriv\n"
+            f"🧠 Memoria cargada con {wins_loaded} ganadoras y {losses_loaded} perdedoras"
+        )
         try:
-            send_telegram_message(
-                f"🧠 Memoria cargada con {wins_loaded} ganadoras y {losses_loaded} perdedoras."
-            )
+            send_telegram_message(startup_message)
         except Exception:
             logging.debug("No se pudo notificar la carga de memoria de aprendizaje")
         self._selective_thread: Optional[threading.Thread] = None
@@ -4026,15 +4028,9 @@ class TradingEngine:
                     confidence_value = float(min(confidence_value + 0.15, 1.0))
                     evaluation['final_confidence'] = confidence_value
                     logging.info(
-                        "💾 Reinforced by similar WIN pattern → new confidence=%.2f",
+                        '💾 Reinforced by similar WIN pattern → new confidence=%.2f',
                         confidence_value,
                     )
-                    try:
-                        send_telegram_message(
-                            f"💾 Patrón ganador reforzado ({symbol}, {final_action}) → confianza={confidence_value:.2f}"
-                        )
-                    except Exception:
-                        logging.debug('No se pudo enviar alerta de refuerzo de patrón ganador')
                     break
         if (
             confidence_value < CONFIDENCE_MIN
@@ -4242,20 +4238,28 @@ class TradingEngine:
                 logging.debug(f"Contract {contract_id} already closed. Skipping duplicate log.")
                 should_notify = False
             if should_notify:
-                ticket_label = f"#{contract_id}" if contract_id is not None else "N/A"
-                total_trades = int(self.total_operations)
-                winrate = self.get_accuracy()
                 emoji = "✅" if win_flag else "❌"
                 resultado_texto = "GANADA" if win_flag else "PERDIDA"
                 logging.info(f"✅ Dynamic confidence applied: {confidence_value:.2f}")
-                message = (
-                    f"{emoji} 🎯 Activo: {symbol}\n"
-                    f"📊 Resultado: {resultado_texto}\n"
-                    f"📈 Confianza real: {confidence_value:.2f}\n"
-                    f"⚙️ Operaciones: {total_trades}\n"
-                    f"🎯 Precisión actual: {winrate:.2f}%"
+                memory_total = len(self.learning_memory)
+                wins_memory = sum(
+                    1
+                    for item in self.learning_memory
+                    if str(item.get('result', '')).upper() == 'WIN'
                 )
-                send_telegram_message(message)
+                precision_actual = (wins_memory / memory_total * 100.0) if memory_total > 0 else 0.0
+                message = (
+                    f"{emoji} Activo: {symbol}\n"
+                    f"📈 Resultado: {resultado_texto}\n"
+                    f"📊 Confianza: {confidence_value:.2f}\n"
+                    f"⚙️ Operaciones: {memory_total}\n"
+                    f"🎯 Precisión actual: {precision_actual:.2f}%\n"
+                    f"🧠 Sesgos totales: {memory_total}"
+                )
+                try:
+                    send_telegram_message(''.join(message))
+                except Exception:
+                    logging.debug('No se pudo enviar actualización de operación por Telegram')
                 self._notify_trade_result(result_info)
             exit_price = self._fetch_exit_price(symbol, entry_price)
             price_change = float(exit_price - entry_price)
@@ -4549,7 +4553,7 @@ class BotWindow(QtWidgets.QWidget):
         self.refresh_timer.start()
 
         self.learning_timer = QtCore.QTimer(self)
-        self.learning_timer.setInterval(3000)
+        self.learning_timer.setInterval(2000)
         self.learning_timer.timeout.connect(self.update_learning_tab)
         self.learning_timer.start()
 
@@ -4630,7 +4634,7 @@ class BotWindow(QtWidgets.QWidget):
             "Hora",
             "Símbolo",
             "Decisión",
-            "Confianza real",
+            "Confianza",
             "Resultado",
             "PnL",
             "Notas",
@@ -4828,9 +4832,9 @@ class BotWindow(QtWidgets.QWidget):
         self.tabs.addTab(self.tab_learning, "Aprendizaje")
         layout = QtWidgets.QVBoxLayout(self.tab_learning)
 
-        self.label_operations = QtWidgets.QLabel("Operaciones totales: 0")
-        self.label_precision = QtWidgets.QLabel("Precisión actual: 0.00%")
-        self.label_confidence = QtWidgets.QLabel("Confianza promedio: 0.00")
+        self.label_operations = QtWidgets.QLabel("Operaciones: 0")
+        self.label_precision = QtWidgets.QLabel("Precisión: 0.00%")
+        self.label_confidence = QtWidgets.QLabel("Confianza media: 0.00")
         self.label_progress = QtWidgets.QLabel("Progreso adaptativo: 0.00%")
         self.label_mode = QtWidgets.QLabel("Modo: Pasivo")
 
@@ -4856,44 +4860,43 @@ class BotWindow(QtWidgets.QWidget):
             if engine is None:
                 return
 
-            wins = getattr(engine, "win_count", 0)
-            losses = getattr(engine, "loss_count", 0)
-            total_ops = int(wins + losses)
+            memory_entries = list(getattr(engine, "learning_memory", []))
+            total_ops = len(memory_entries)
+            wins = sum(
+                1
+                for entry in memory_entries
+                if str(entry.get("result", "")).upper() == "WIN"
+            )
+            losses = sum(
+                1
+                for entry in memory_entries
+                if str(entry.get("result", "")).upper() == "LOSS"
+            )
+            precision = (wins / total_ops * 100.0) if total_ops > 0 else 0.0
 
-            precision = 0.0
-            if total_ops > 0:
-                precision = (wins / total_ops) * 100.0
-
-            aprendizaje = getattr(engine, "aprendizaje", None)
-            adaptive_ops = getattr(aprendizaje, "total_operations", 0) if aprendizaje is not None else 0
-            displayed_ops = max(total_ops, adaptive_ops)
-
-            confidences = list(getattr(engine, "learning_confidences", []))
-            if not confidences:
-                history = getattr(engine, "trade_history", [])
-                for record in history[-100:]:
-                    value = getattr(record, "confidence", None)
-                    if value is not None:
-                        confidences.append(float(value))
-
+            confidences = [
+                float(entry.get("confidence", 0.0))
+                for entry in memory_entries
+                if isinstance(entry.get("confidence", None), (int, float))
+            ]
             avg_conf = float(np.mean(confidences)) if confidences else 0.0
 
             progress = 0.0
-            if displayed_ops > 0:
-                progress = min(100.0, (displayed_ops / 100.0) * max(avg_conf, 0.0) * 100.0)
+            if total_ops > 0:
+                progress = min(100.0, (total_ops / 100.0) * max(avg_conf, 0.0) * 100.0)
 
             if not getattr(self, "learning_enabled", True):
                 mode = "Pausado"
-            elif displayed_ops > 70:
+            elif total_ops > 70:
                 mode = "Estable"
-            elif displayed_ops > 30:
+            elif total_ops > 30:
                 mode = "Aprendizaje"
             else:
                 mode = "Pasivo"
 
-            self.label_operations.setText(f"Operaciones totales: {displayed_ops}")
-            self.label_precision.setText(f"Precisión actual: {precision:.2f}%")
-            self.label_confidence.setText(f"Confianza promedio: {avg_conf:.2f}")
+            self.label_operations.setText(f"Operaciones: {total_ops}")
+            self.label_precision.setText(f"Precisión: {precision:.2f}%")
+            self.label_confidence.setText(f"Confianza media: {avg_conf:.2f}")
             self.label_progress.setText(f"Progreso adaptativo: {progress:.2f}%")
             self.label_mode.setText(f"Modo: {mode}")
             self.progress_bar.setValue(int(progress))
@@ -4903,10 +4906,8 @@ class BotWindow(QtWidgets.QWidget):
                 self.learning_toggle.blockSignals(True)
                 self.learning_toggle.setChecked(desired_state)
                 self.learning_toggle.blockSignals(False)
-
         except Exception as exc:
             print(f"[LearningTab] Update error: {exc}")
-
     def _on_learning_toggled(self, state: int) -> None:
         enabled = state == QtCore.Qt.Checked
         self.learning_enabled = enabled
@@ -5262,6 +5263,7 @@ class BotWindow(QtWidgets.QWidget):
                 blocker = QtCore.QSignalBlocker(checkbox)
                 checkbox.setChecked(desired)
         self._update_history_tab()
+        self.update_learning_tab()
 
     def _load_strategy_config(self) -> Dict[str, bool]:
         estados: Dict[str, bool] = {}
