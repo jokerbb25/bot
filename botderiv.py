@@ -295,20 +295,6 @@ def save_learning_memory(entries: List[Dict[str, Any]]) -> None:
         logging.warning(f"⚠️ Unable to persist learning memory: {exc}")
 
 
-def selective_memory_recovery(saved_biases: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
-    filtered_biases: Dict[str, Dict[str, Any]] = {}
-    for symbol, data in saved_biases.items():
-        outcome = str(data.get("last_result", "")).upper()
-        confidence_value = float(data.get("confidence", 0.0))
-        if outcome == "WIN" and confidence_value >= KEEP_WIN_MIN_CONF:
-            filtered_biases[symbol] = dict(data)
-    logging.info(
-        "🧠 Selective maintenance: %d winning biases preserved",
-        len(filtered_biases),
-    )
-    return filtered_biases
-
-
 global_engine = None
 
 
@@ -612,19 +598,19 @@ class auto_learning:
         if not stored:
             save_biases(self.biases)
             return
-        cleaned = selective_memory_recovery(stored)
         with self.bias_lock:
             for symbol, state in self.biases.items():
-                if symbol in cleaned:
-                    data = cleaned[symbol]
+                if symbol in stored:
+                    data = stored[symbol]
                     state["RSI"] = float(data.get("RSI", state.get("RSI", 0.0)))
                     state["EMA"] = float(data.get("EMA", state.get("EMA", 0.0)))
                     state["last_result"] = data.get("last_result", "WIN")
+                    state["confidence"] = float(data.get("confidence", state.get("confidence", 0.0)))
                 else:
                     state["RSI"] = 0.0
                     state["EMA"] = 0.0
                     state["last_result"] = "LOSS"
-        self.maintain_selective_memory()
+                    state["confidence"] = 0.0
         save_biases(self.biases)
 
     def _persist_biases(self) -> None:
@@ -645,25 +631,6 @@ class auto_learning:
                 daemon=True,
             )
             self._telegram_thread.start()
-
-    def maintain_selective_memory(self) -> None:
-        try:
-            saved_biases = load_biases()
-            preserved: Dict[str, Dict[str, Any]] = {}
-            for symbol, state in saved_biases.items():
-                outcome = str(state.get("last_result", "")).upper()
-                confidence_value = float(state.get("confidence", 0.0))
-                if outcome == "WIN" and confidence_value >= KEEP_WIN_MIN_CONF:
-                    preserved[symbol] = dict(state)
-            save_biases(preserved)
-            with self.bias_lock:
-                self.bias_memory = preserved
-            logging.info(
-                "🧠 Strict selective maintenance: %d strong winning biases kept.",
-                len(preserved),
-            )
-        except Exception as exc:
-            logging.error(f"❌ Error in selective memory maintenance: {exc}")
 
     def _default_symbol_profile(self) -> Dict[str, Any]:
         return {
@@ -1169,25 +1136,6 @@ class auto_learning:
                     self.training_labels = self.training_labels[-5000:]
             self.trade_counter += 1
             self._persist_biases()
-            if self.trade_counter % 50 == 0:
-                logging.info("🧹 Running selective memory cleanup...")
-                saved_biases = load_biases()
-                cleaned_biases = selective_memory_recovery(saved_biases)
-                with self.bias_lock:
-                    for symbol, state in self.biases.items():
-                        if symbol in cleaned_biases:
-                            data = cleaned_biases[symbol]
-                            state["RSI"] = float(data.get("RSI", 0.0))
-                            state["EMA"] = float(data.get("EMA", 0.0))
-                            state["last_result"] = data.get("last_result", "WIN")
-                        else:
-                            state["RSI"] = 0.0
-                            state["EMA"] = 0.0
-                            state["last_result"] = "LOSS"
-                self.maintain_selective_memory()
-                logging.info(
-                    "✅ Selective memory cleanup complete — losing biases removed."
-                )
             if self.trade_counter % 100 == 0 and self.trade_counter > 0:
                 should_train = True
             row_payload = {
@@ -2804,7 +2752,6 @@ class TradingEngine:
             send_telegram_message(startup_message)
         except Exception:
             logging.debug("No se pudo notificar la carga de memoria de aprendizaje")
-        self._selective_thread: Optional[threading.Thread] = None
         self._telegram_thread: Optional[threading.Thread] = None
         self.telegram_bot = telegram_bot
 
@@ -2847,46 +2794,6 @@ class TradingEngine:
         self.auto_shutdown_limit = max(0, int(limit))
         if not enabled:
             self.auto_shutdown_triggered = False
-
-    def _selective_memory_worker(self) -> None:
-        while True:
-            self.maintain_selective_memory()
-            time.sleep(300)
-
-    def maintain_selective_memory(self) -> None:
-        try:
-            saved_biases = load_biases()
-            preserved: Dict[str, Dict[str, Any]] = {}
-            for symbol, state in saved_biases.items():
-                outcome = str(state.get("last_result", "")).upper()
-                confidence_value = float(state.get("confidence", 0.0))
-                if outcome == "WIN" and confidence_value >= KEEP_WIN_MIN_CONF:
-                    preserved[symbol] = dict(state)
-            save_biases(preserved)
-            self.bias_memory = preserved
-            logging.info(
-                "🧠 Selective maintenance: %d strong winning biases kept.",
-                len(preserved),
-            )
-        except Exception as exc:
-            logging.error(f"❌ Error in selective memory maintenance: {exc}")
-
-    def selective_save_memory(self) -> None:
-        try:
-            filtered: List[Dict[str, Any]] = []
-            for entry in self.winner_biases:
-                weight_value = float(entry.get("weight", 0.0) or 0.0)
-                if weight_value <= 0.0:
-                    continue
-                normalized_entry = dict(entry)
-                normalized_entry["weight"] = weight_value
-                filtered.append(normalized_entry)
-            filtered.sort(key=lambda item: item.get("weight", 0.0), reverse=True)
-            self.winner_biases = filtered
-            save_winner_biases(self.winner_biases)
-            logging.info("🧠 Selective maintenance applied, winning biases preserved.")
-        except Exception as exc:
-            logging.error(f"❌ Error while preserving winning biases: {exc}")
 
     def _store_winner_bias(
         self,
@@ -2999,16 +2906,6 @@ class TradingEngine:
 
     def start_background_services(self) -> None:
         try:
-            if hasattr(self, "maintain_selective_memory"):
-                if self._selective_thread is None or not self._selective_thread.is_alive():
-                    self._selective_thread = threading.Thread(
-                        target=self._selective_memory_worker,
-                        daemon=True,
-                    )
-                    self._selective_thread.start()
-                    logging.info("🧠 Selective learning service started in background.")
-            else:
-                logging.info("ℹ️ No selective memory service found in this version.")
             if hasattr(self, "telegram_bot") and callable(self.telegram_bot):
                 if self._telegram_thread is None or not self._telegram_thread.is_alive():
                     self._telegram_thread = threading.Thread(
@@ -3046,7 +2943,6 @@ class TradingEngine:
         with self._closed_lock:
             self._closed_contracts.clear()
         CSV_LOGGED_CONTRACTS.clear()
-        self.maintain_selective_memory()
 
     def is_running(self) -> bool:
         return self.running.is_set()
