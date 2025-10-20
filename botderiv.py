@@ -72,7 +72,7 @@ POST_LOSS_COOLDOWN_SEC = 120
 MAX_TRADES_PER_HOUR = 20
 KEEP_WIN_MIN_CONF = 0.70
 MAINTENANCE_EVERY = 50
-VOLATILITY_CONFLICT_PENALTY = 0.10
+VOLATILITY_CONFLICT_PENALTY = 0.20
 STRICT_MODE_ENABLED = True
 
 # === TELEGRAM BOT CONFIGURATION ===
@@ -3858,6 +3858,37 @@ class TradingEngine:
                 volatility_value = float(volatility_raw)
             except (TypeError, ValueError):
                 volatility_value = None
+        if volatility_value is not None:
+            self.current_volatility = volatility_value
+
+        symbol_upper = symbol.upper()
+        low_vol = 0.0003
+        high_vol = 0.0025
+        if 'R_25' in symbol_upper:
+            low_vol, high_vol = 0.0002, 0.0015
+        elif 'R_50' in symbol_upper:
+            low_vol, high_vol = 0.0003, 0.0018
+        elif 'R_75' in symbol_upper:
+            low_vol, high_vol = 0.0004, 0.0022
+        elif 'R_100' in symbol_upper:
+            low_vol, high_vol = 0.0005, 0.0028
+        volatility_reference = None
+        if hasattr(self, 'current_volatility'):
+            try:
+                volatility_reference = float(self.current_volatility)
+            except (TypeError, ValueError):
+                volatility_reference = None
+        if volatility_reference is not None:
+            if volatility_reference > high_vol:
+                logging.info(
+                    f"🌪️ High volatility ({volatility_reference:.5f}) exceeds safe range for {symbol} → trade skipped."
+                )
+                return False
+            if volatility_reference < low_vol:
+                logging.info(
+                    f"💤 Low volatility ({volatility_reference:.5f}) below minimum threshold for {symbol} → trade skipped."
+                )
+                return False
         confidence_value = float(combined_confidence) if combined_confidence is not None else 0.0
         latest_rsi_value = float(evaluation.get('latest_rsi', 0.0))
         aligned_strategies = int(
@@ -3893,7 +3924,7 @@ class TradingEngine:
             and rsi_signal_eval != ema_signal_eval
         ):
             logging.info(
-                "⚠️ RSI y EMA en conflicto → reduciendo confianza (penalización 10%)."
+                "⚠️ RSI y EMA en conflicto → reduciendo confianza (penalización 20%)."
             )
             confidence_value *= 1.0 - VOLATILITY_CONFLICT_PENALTY
             evaluation['final_confidence'] = confidence_value
