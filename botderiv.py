@@ -3681,11 +3681,15 @@ class TradingEngine:
         aligned_total = int(
             selected.get('aligned', selected.get('consensus', {}).get('aligned', 0))
         )
-        if (
-            confidence_value < CONFIDENCE_MIN
-            or aligned_total < MIN_ALIGNED_STRATEGIES
-        ):
-            logging.info("⏭️ Trade skipped due to low confluence/confidence.")
+        min_confidence = CONFIDENCE_MIN
+        min_confluence = MIN_ALIGNED_STRATEGIES
+        confluence_value = aligned_total
+        if confidence_value < min_confidence:
+            logging.info(f"🚫 Trade skipped due to low confidence ({confidence_value:.2f} < {min_confidence:.2f})")
+            _cycle_pause()
+            return
+        if confluence_value < min_confluence:
+            logging.info(f"🚫 Trade skipped due to low confluence ({confluence_value}/{min_confluence})")
             _cycle_pause()
             return
         if volatility_value is not None and volatility_value < MIN_VOLATILITY:
@@ -3694,6 +3698,10 @@ class TradingEngine:
             )
             _cycle_pause()
             return
+        volatility_output = f"{volatility_value:.6f}" if volatility_value is not None else "N/A"
+        logging.info(
+            f"🚀 Executing trade on {selected['symbol']} | Confidence={confidence_value:.2f} | Confluence={confluence_value}/{min_confluence} | Volatility={volatility_output}"
+        )
         self._execute_selected_trade(selected)
         _cycle_pause(0.75)
         return
@@ -3946,11 +3954,14 @@ class TradingEngine:
                     )
             confidence_value = float(adjusted_confidence)
             evaluation['final_confidence'] = confidence_value
-        if (
-            confidence_value < CONFIDENCE_MIN
-            or aligned_strategies < MIN_ALIGNED_STRATEGIES
-        ):
-            logging.info("⏭️ Trade skipped due to low confluence/confidence.")
+        min_confidence = CONFIDENCE_MIN
+        min_confluence = MIN_ALIGNED_STRATEGIES
+        confluence_value = aligned_strategies
+        if confidence_value < min_confidence:
+            logging.info(f"🚫 Trade skipped due to low confidence ({confidence_value:.2f} < {min_confidence:.2f})")
+            return False
+        if confluence_value < min_confluence:
+            logging.info(f"🚫 Trade skipped due to low confluence ({confluence_value}/{min_confluence})")
             return False
         if STRICT_MODE_ENABLED:
             if (
@@ -3976,7 +3987,7 @@ class TradingEngine:
                 logging.info("⛔ Máximo de operaciones por hora alcanzado (modo estricto).")
                 return False
         if combined_confidence is None:
-            logging.info("⏭️ Trade skipped due to low confluence/confidence.")
+            logging.info("🚫 Trade skipped because final confidence was unavailable.")
             return False
         if not self.risk.can_trade(ai_confidence):
             return False
@@ -3991,6 +4002,9 @@ class TradingEngine:
             evaluation.get('indicator_confidence', 0.0),
             ml_probability,
             stake_amount,
+        )
+        logging.info(
+            f"🚀 Executing trade on {symbol} | Confidence={confidence_value:.2f} | Confluence={confluence_value}/{min_confluence} | Volatility={evaluated_volatility:.6f}"
         )
         contract_id, duration_seconds = self.api.buy(symbol, signal, stake_amount)
         if contract_id is None:
