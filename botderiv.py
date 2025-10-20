@@ -105,6 +105,7 @@ RESUME_MESSAGE = "🔁 Reanudando análisis del mercado..."
 CSV_LOGGED_CONTRACTS: Set[int] = set()
 BIAS_MEMORY_PATH = Path("bias_memory.json")
 WINNER_MEMORY_PATH = Path("sesgos_ganadores.json")
+LEARNING_MEMORY_PATH = Path("learning_memory.json")
 
 
 def send_telegram_message(text: str) -> None:
@@ -221,6 +222,77 @@ def save_winner_biases(entries: List[Dict[str, Any]]) -> None:
             json.dump(serializable, handle, ensure_ascii=False, indent=2)
     except Exception as exc:  # pragma: no cover
         logging.debug(f"No se pudo guardar sesgos ganadores: {exc}")
+
+
+def load_learning_memory() -> List[Dict[str, Any]]:
+    if not LEARNING_MEMORY_PATH.exists():
+        return []
+    try:
+        with LEARNING_MEMORY_PATH.open("r", encoding="utf-8") as handle:
+            raw_data = json.load(handle)
+    except Exception as exc:
+        logging.warning(f"⚠️ No existing learning memory found: {exc}")
+        return []
+    if isinstance(raw_data, dict):
+        candidates = raw_data.get("biases", [])
+    elif isinstance(raw_data, list):
+        candidates = raw_data
+    else:
+        candidates = []
+    normalized: List[Dict[str, Any]] = []
+    for item in candidates:
+        if not isinstance(item, dict):
+            continue
+        try:
+            symbol = str(item.get("symbol", ""))
+            action = str(item.get("action", item.get("direction", "NONE"))).upper()
+            rsi_value = float(item.get("rsi", 0.0))
+            ema_value = float(item.get("ema", 0.0))
+            result_value = str(item.get("result", "LOSS")).upper()
+            confidence_value = float(item.get("confidence", 0.0))
+            timestamp_value = str(item.get("timestamp", datetime.now(timezone.utc).isoformat()))
+            weight_value = float(item.get("weight", 1.0))
+        except (TypeError, ValueError):
+            continue
+        normalized.append(
+            {
+                "symbol": symbol,
+                "action": action,
+                "direction": action,
+                "rsi": rsi_value,
+                "ema": ema_value,
+                "result": result_value,
+                "confidence": confidence_value,
+                "timestamp": timestamp_value,
+                "weight": weight_value,
+            }
+        )
+    return normalized
+
+
+def save_learning_memory(entries: List[Dict[str, Any]]) -> None:
+    payload: List[Dict[str, Any]] = []
+    for item in entries:
+        if not isinstance(item, dict):
+            continue
+        payload.append(
+            {
+                "symbol": str(item.get("symbol", "")),
+                "action": str(item.get("action", item.get("direction", "NONE"))).upper(),
+                "direction": str(item.get("action", item.get("direction", "NONE"))).upper(),
+                "rsi": float(item.get("rsi", 0.0)),
+                "ema": float(item.get("ema", 0.0)),
+                "result": str(item.get("result", "LOSS")).upper(),
+                "confidence": float(item.get("confidence", 0.0)),
+                "timestamp": str(item.get("timestamp", datetime.now(timezone.utc).isoformat())),
+                "weight": float(item.get("weight", 1.0)),
+            }
+        )
+    try:
+        with LEARNING_MEMORY_PATH.open("w", encoding="utf-8") as handle:
+            json.dump(payload, handle, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        logging.warning(f"⚠️ Unable to persist learning memory: {exc}")
 
 
 def selective_memory_recovery(saved_biases: Dict[str, Dict[str, Any]]) -> Dict[str, Dict[str, Any]]:
@@ -2714,17 +2786,22 @@ class TradingEngine:
         self.last_confidence: float = 0.0
         self.bias_memory: Dict[str, Dict[str, Any]] = load_biases()
         self.winner_biases: List[Dict[str, Any]] = load_winner_biases()
-        self.learning_memory: List[Dict[str, Any]] = self.winner_biases
+        self.learning_memory: List[Dict[str, Any]] = load_learning_memory()
+        wins_loaded = sum(1 for item in self.learning_memory if str(item.get('result', '')).upper() == 'WIN')
+        losses_loaded = sum(1 for item in self.learning_memory if str(item.get('result', '')).upper() == 'LOSS')
+        total_loaded = len(self.learning_memory)
         logging.info(
-            "🧠 %d winning biases loaded successfully.",
-            len(self.learning_memory),
+            "🧠 Memory loaded with %d WIN and %d LOSS patterns (%d total).",
+            wins_loaded,
+            losses_loaded,
+            total_loaded,
         )
         try:
             send_telegram_message(
-                f"🧠 Memoria cargada con {len(self.winner_biases)} sesgos ganadores"
+                f"🧠 Memoria cargada con {wins_loaded} ganadoras y {losses_loaded} perdedoras."
             )
         except Exception:
-            logging.debug("No se pudo notificar la carga de sesgos ganadores")
+            logging.debug("No se pudo notificar la carga de memoria de aprendizaje")
         self._selective_thread: Optional[threading.Thread] = None
         self._telegram_thread: Optional[threading.Thread] = None
         self.telegram_bot = telegram_bot
@@ -2804,7 +2881,6 @@ class TradingEngine:
                 filtered.append(normalized_entry)
             filtered.sort(key=lambda item: item.get("weight", 0.0), reverse=True)
             self.winner_biases = filtered
-            self.learning_memory = self.winner_biases
             save_winner_biases(self.winner_biases)
             logging.info("🧠 Selective maintenance applied, winning biases preserved.")
         except Exception as exc:
@@ -2855,9 +2931,69 @@ class TradingEngine:
                     "weight": max(weight_increment, 1.0),
                 }
             )
-        self.learning_memory = self.winner_biases
         self.winner_biases.sort(key=lambda item: item.get("weight", 0.0), reverse=True)
         save_winner_biases(self.winner_biases)
+
+    def _persist_learning_memory(self) -> None:
+        save_learning_memory(self.learning_memory)
+
+    def _append_learning_memory_entry(
+        self,
+        symbol: str,
+        action: str,
+        rsi_value: float,
+        ema_spread: float,
+        result: str,
+        confidence_value: float,
+    ) -> None:
+        entry = {
+            "symbol": symbol,
+            "action": action,
+            "direction": action,
+            "rsi": round(float(rsi_value), 1),
+            "ema": round(float(ema_spread), 1),
+            "result": result.upper(),
+            "confidence": float(confidence_value),
+            "timestamp": datetime.now(timezone.utc).isoformat(),
+            "weight": 1.0,
+        }
+        self.learning_memory.append(entry)
+        self._persist_learning_memory()
+
+    def _update_learning_weights(
+        self,
+        symbol: str,
+        action: str,
+        rsi_value: float,
+        ema_spread: float,
+        result: str,
+    ) -> None:
+        matched = False
+        rounded_rsi = round(float(rsi_value), 1)
+        rounded_ema = round(float(ema_spread), 1)
+        for entry in self.learning_memory:
+            if str(entry.get("symbol")) != symbol:
+                continue
+            if str(entry.get("action", "NONE")).upper() != action:
+                continue
+            try:
+                stored_rsi = float(entry.get("rsi", 0.0))
+                stored_ema = float(entry.get("ema", 0.0))
+            except (TypeError, ValueError):
+                continue
+            if abs(stored_rsi - rounded_rsi) > 2.0:
+                continue
+            if abs(stored_ema - rounded_ema) > 10.0:
+                continue
+            weight_value = float(entry.get("weight", 1.0) or 1.0)
+            if result.upper() == "WIN":
+                weight_value += 1.0
+            else:
+                weight_value = max(1.0, weight_value - 0.3)
+            entry["weight"] = weight_value
+            matched = True
+        if matched:
+            self._persist_learning_memory()
 
     def start_background_services(self) -> None:
         try:
@@ -3859,23 +3995,47 @@ class TradingEngine:
             )
             confidence_value *= 1.0 - VOLATILITY_CONFLICT_PENALTY
             evaluation['final_confidence'] = confidence_value
-        memory_boost = 0.0
-        for bias in self.learning_memory:
-            if (
-                bias.get('symbol') == symbol
-                and bias.get('direction') == final_action
-            ):
-                memory_boost += float(bias.get('weight', 0.0) or 0.0)
-        if memory_boost > 0.0:
-            confidence_value = float(
-                min(confidence_value * (1.0 + 0.05 * memory_boost), 1.0)
-            )
-            evaluation['final_confidence'] = confidence_value
-            logging.info(
-                "🧩 Weighted learning applied: boost=%.2f, final_conf=%.2f",
-                memory_boost,
-                confidence_value,
-            )
+        ema_spread_value = float(evaluation.get('ema_spread', 0.0))
+        context_key = f"{symbol}|{final_action}|RSI:{round(latest_rsi_value, 1)}|EMA:{round(ema_spread_value, 1)}"
+        if final_action in {'CALL', 'PUT'}:
+            for memory_entry in self.learning_memory:
+                if str(memory_entry.get('symbol', '')) != symbol:
+                    continue
+                if str(memory_entry.get('action', 'NONE')).upper() != final_action:
+                    continue
+                try:
+                    stored_rsi = float(memory_entry.get('rsi', 0.0))
+                    stored_ema = float(memory_entry.get('ema', 0.0))
+                except (TypeError, ValueError):
+                    continue
+                if abs(stored_rsi - round(latest_rsi_value, 1)) > 2.0:
+                    continue
+                if abs(stored_ema - round(ema_spread_value, 1)) > 10.0:
+                    continue
+                outcome = str(memory_entry.get('result', '')).upper()
+                if outcome == 'LOSS':
+                    logging.info(f"🚫 Blocked trade due to previous LOSS pattern → {context_key}")
+                    try:
+                        send_telegram_message(
+                            f"🚫 Operación bloqueada por patrón perdedor previo ({symbol}, {final_action}, RSI={latest_rsi_value:.2f}, EMA={ema_spread_value:.2f})"
+                        )
+                    except Exception:
+                        logging.debug('No se pudo enviar alerta de bloqueo de patrón perdedor')
+                    return False
+                if outcome == 'WIN':
+                    confidence_value = float(min(confidence_value + 0.15, 1.0))
+                    evaluation['final_confidence'] = confidence_value
+                    logging.info(
+                        "💾 Reinforced by similar WIN pattern → new confidence=%.2f",
+                        confidence_value,
+                    )
+                    try:
+                        send_telegram_message(
+                            f"💾 Patrón ganador reforzado ({symbol}, {final_action}) → confianza={confidence_value:.2f}"
+                        )
+                    except Exception:
+                        logging.debug('No se pudo enviar alerta de refuerzo de patrón ganador')
+                    break
         if (
             confidence_value < CONFIDENCE_MIN
             or aligned_strategies < MIN_ALIGNED_STRATEGIES
@@ -4012,8 +4172,8 @@ class TradingEngine:
             if win_flag:
                 self.win_operations += 1
             if MAINTENANCE_EVERY > 0 and self.total_operations % MAINTENANCE_EVERY == 0:
-                self.maintain_selective_memory()
-                self.selective_save_memory()
+                # Continuous learning active — no reset after 50 trades
+                pass
             self.last_contract_id = contract_id
             self.last_symbol = symbol
             self.last_result = trade_result
@@ -4042,6 +4202,21 @@ class TradingEngine:
                 notes = f"{notes} | Motivos: {reason_summary}"
             ema_slope_value = float(evaluation.get('ema_diff', 0.0))
             notes = f"{notes} | EMA slope: {ema_slope_value:.5f}"
+            self._append_learning_memory_entry(
+                symbol,
+                signal,
+                latest_rsi,
+                ema_spread,
+                trade_result,
+                confidence_value,
+            )
+            self._update_learning_weights(
+                symbol,
+                signal,
+                latest_rsi,
+                ema_spread,
+                trade_result,
+            )
             result_info = {
                 "hora": datetime.now().strftime("%H:%M:%S"),
                 "simbolo": symbol,
