@@ -3902,6 +3902,7 @@ class TradingEngine:
         if final_action in {'CALL', 'PUT'}:
             current_rsi_rounded = round(latest_rsi_value, 1)
             current_ema_rounded = round(ema_spread_value, 1)
+            adjusted_confidence = confidence_value
             for memory_entry in self.learning_memory:
                 if str(memory_entry.get('symbol', '')) != symbol:
                     continue
@@ -3914,25 +3915,28 @@ class TradingEngine:
                     continue
                 rsi_diff = abs(stored_rsi - current_rsi_rounded)
                 ema_diff = abs(stored_ema - current_ema_rounded)
-                if rsi_diff <= 0.5 and ema_diff <= 3:
-                    if str(memory_entry.get('result', '')).upper() == 'LOSS':
-                        logging.info(
-                            f"🚫 Blocked trade due to *very similar* LOSS pattern (RSI diff={rsi_diff:.2f}, EMA diff={ema_diff:.2f}) → {context_key}"
-                        )
-                        try:
-                            send_telegram_message(
-                                f"🚫 Operación bloqueada por patrón perdedor previo ({symbol}, {final_action}, RSI diff={rsi_diff:.2f}, EMA diff={ema_diff:.2f})"
-                            )
-                        except Exception:
-                            logging.debug('No se pudo enviar alerta de bloqueo de patrón perdedor')
-                        return False
-                elif rsi_diff <= 2 and ema_diff <= 10 and str(memory_entry.get('result', '')).upper() == 'WIN':
-                    confidence_value = float(min(confidence_value + 0.15, 1.0))
-                    evaluation['final_confidence'] = confidence_value
+                if (
+                    rsi_diff <= 0.5
+                    and ema_diff <= 3
+                    and str(memory_entry.get('result', '')).upper() == 'LOSS'
+                ):
+                    penalty = 0.20 * adjusted_confidence
+                    adjusted_confidence = max(0.0, adjusted_confidence - penalty)
                     logging.info(
-                        f"💾 Reinforced by similar WIN pattern (RSI diff={rsi_diff:.2f}, EMA diff={ema_diff:.2f}) → new confidence={confidence_value:.2f}"
+                        f"⚠️ Confianza reducida por patrón perdedor muy similar ({symbol}, {final_action}, RSI diff={rsi_diff:.2f}, EMA diff={ema_diff:.2f}) → Nueva confianza={adjusted_confidence:.2f}"
                     )
-                    break
+                elif (
+                    rsi_diff <= 2
+                    and ema_diff <= 10
+                    and str(memory_entry.get('result', '')).upper() == 'WIN'
+                ):
+                    bonus = 0.20 * (1 - adjusted_confidence)
+                    adjusted_confidence = min(1.0, adjusted_confidence + bonus)
+                    logging.info(
+                        f"💾 Refuerzo por patrón ganador similar ({symbol}, {final_action}, RSI diff={rsi_diff:.2f}, EMA diff={ema_diff:.2f}) → Nueva confianza={adjusted_confidence:.2f}"
+                    )
+            confidence_value = float(adjusted_confidence)
+            evaluation['final_confidence'] = confidence_value
         if (
             confidence_value < CONFIDENCE_MIN
             or aligned_strategies < MIN_ALIGNED_STRATEGIES
@@ -4157,7 +4161,7 @@ class TradingEngine:
                     f"{emoji} Activo: {symbol}\n"
                     f"📈 Resultado: {resultado_texto}\n"
                     f"📊 Confianza: {confidence_value:.2f}\n"
-                    f"⚙️ Operaciones (sesión): {self.session_total}\n"
+                    f"⚙️ Operaciones: {self.session_total}\n"
                     f"🎯 Precisión actual: {session_accuracy:.2f}%\n"
                     f"🧠 Sesgos totales: {memory_total}"
                 )
