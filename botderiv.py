@@ -1974,16 +1974,13 @@ def strategy_divergence(df: pd.DataFrame) -> StrategyResult:
 
 def strategy_volatility_filter(df: pd.DataFrame) -> StrategyResult:
     if len(df) < 25:
-        return StrategyResult('NONE', 0.0, ['Volatilidad sin datos suficientes'], {'volatility': None, 'low': False})
+        return StrategyResult('NONE', 0.0, ['Volatilidad sin datos suficientes'], {'volatility': None})
     retornos = df['close'].pct_change().dropna()
     if retornos.empty:
-        return StrategyResult('NONE', 0.0, ['Volatilidad no calculable'], {'volatility': None, 'low': True})
+        return StrategyResult('NONE', 0.0, ['Volatilidad no calculable'], {'volatility': None})
     reciente = retornos.iloc[-20:]
-    volatilidad = float(reciente.std())
-    umbral = 0.0007
-    if volatilidad < umbral:
-        return StrategyResult('NONE', 0.0, [f"Volatilidad {volatilidad:.4f} baja → confianza limitada"], {'volatility': volatilidad, 'low': True})
-    return StrategyResult('NONE', 0.0, [f"Volatilidad {volatilidad:.4f} adecuada"], {'volatility': volatilidad, 'low': False})
+    volatilidad = float(np.nan_to_num(reciente.std(), nan=0.0))
+    return StrategyResult('NONE', 0.0, [f"Volatilidad informativa {volatilidad:.4f}"], {'volatility': volatilidad})
 
 
 STRATEGY_FUNCTIONS: List[Tuple[str, Callable[[pd.DataFrame], StrategyResult]]] = [
@@ -2152,17 +2149,6 @@ def combine_signals(results: List[Tuple[str, StrategyResult]], active_states: Di
         signal = override_signal
         confianza = max(confianza, 0.45)
         aligned = conteo_direccion.get(override_signal, 0)
-    if signal != 'NONE':
-        factor_volatilidad = _compute_volatility_factor(volatility_value)
-        if volatility_value is not None:
-            logging.debug(
-                f"[Signals] Volatilidad previa al ajuste: {volatility_value:.6f} factor={factor_volatilidad:.3f}"
-            )
-        if factor_volatilidad < 1.0:
-            confianza *= factor_volatilidad
-            reasons.append('Volatilidad baja → confianza limitada')
-        elif factor_volatilidad > 1.0:
-            confianza *= factor_volatilidad
     confianza = min(confianza, 0.98)
     if signal != 'NONE':
         confianza = max(confianza, 0.35)
@@ -2176,8 +2162,6 @@ def combine_signals(results: List[Tuple[str, StrategyResult]], active_states: Di
     main_reason = override_reason or (
         motivos_alineados[0] if motivos_alineados else (reasons[0] if reasons else 'Señal compuesta')
     )
-    if low_volatility and signal != 'NONE' and 'volatilidad' not in main_reason.lower():
-        main_reason = f"{main_reason} + baja volatilidad"
     strong_flag = 1 if signal != 'NONE' and confianza >= 0.75 else 0
     return {
         'signal': signal,
@@ -3254,23 +3238,9 @@ class TradingEngine:
                 logging.info(f"Estrategias activas: {active_total}/{TOTAL_STRATEGY_COUNT}")
             elif signal == 'NONE':
                 logging.info(f"Estrategias activas: {active_total}/{TOTAL_STRATEGY_COUNT}")
-                if consensus['low_volatility']:
-                    valor_vol = consensus['volatility_value']
-                    detalle = f" ({valor_vol:.4f})" if valor_vol is not None else ''
-                    logging.info(f"⚠️ Volatilidad baja detectada{detalle}")
             else:
                 logging.info(f"Estrategias alineadas: {consensus['aligned']}/{signals_total}")
                 logging.info(f"Estrategias activas: {active_total}/{TOTAL_STRATEGY_COUNT}")
-                if consensus['low_volatility']:
-                    valor_vol = consensus['volatility_value']
-                    detalle = f" ({valor_vol:.4f})" if valor_vol is not None else ''
-                    if consensus['override']:
-                        if 'RSI' in consensus['override_reason']:
-                            logging.info('🚫 Volatilidad baja pero señal fuerte RSI → operación anticipada')
-                        else:
-                            logging.info(f"🚫 Volatilidad baja pero {consensus['override_reason'].lower()} → operación anticipada")
-                    else:
-                        logging.info(f"⚠️ Volatilidad baja detectada{detalle}")
                 logging.info(
                     f"✅ Señal final: {signal} | Confianza {confidence:.2f} | Estrategias activas: {active_total}/{TOTAL_STRATEGY_COUNT}"
                 )
@@ -3868,7 +3838,7 @@ class TradingEngine:
                     return base
             return candidate
 
-        symbol_base = _normalize_symbol(symbol)
+        base_symbol = _normalize_symbol(symbol)
         low_vol, high_vol = 0.0003, 0.0025
         symbol_thresholds = {
             "R_25": (0.0002, 0.0015),
@@ -3876,25 +3846,36 @@ class TradingEngine:
             "R_75": (0.0004, 0.0022),
             "R_100": (0.0005, 0.0028),
         }
-        if symbol_base in symbol_thresholds:
-            low_vol, high_vol = symbol_thresholds[symbol_base]
-        volatility_reference = float(getattr(self, "current_volatility", 0.0) or 0.0)
-        if volatility_reference > 0.05:
-            volatility_reference = volatility_reference / 100.0
+        if base_symbol in symbol_thresholds:
+            low_vol, high_vol = symbol_thresholds[base_symbol]
+        evaluated_volatility = float(getattr(self, "current_volatility", 0.0) or 0.0)
+        if evaluated_volatility > 0.05:
+            evaluated_volatility = evaluated_volatility / 100.0
         epsilon = 1e-6
-        if volatility_reference > (high_vol + epsilon):
+        volatility_ok = True
+        if evaluated_volatility > (high_vol + epsilon):
             logging.info(
-                f"🌪️ High volatility ({volatility_reference:.6f}) > {high_vol:.6f} for {symbol_base} → trade skipped."
+                f"🌪️ High volatility ({evaluated_volatility:.6f}) > {high_vol:.6f} for {base_symbol} → trade skipped."
             )
-            return False
-        if volatility_reference < (low_vol - epsilon):
+            volatility_ok = False
+        elif evaluated_volatility < (low_vol - epsilon):
             logging.info(
-                f"💤 Low volatility ({volatility_reference:.6f}) < {low_vol:.6f} for {symbol_base} → trade skipped."
+                f"💤 Low volatility ({evaluated_volatility:.6f}) < {low_vol:.6f} for {base_symbol} → trade skipped."
             )
+            volatility_ok = False
+        else:
+            logging.info(
+                f"✅ Volatility OK for {base_symbol}: {evaluated_volatility:.6f} within [{low_vol:.6f}, {high_vol:.6f}]"
+            )
+        if not volatility_ok:
+            context = 'high' if evaluated_volatility > high_vol else 'low'
+            msg = f"⚠️ {base_symbol} skipped due to {context} volatility ({evaluated_volatility:.6f})"
+            logging.info(f"🚫 {msg}")
+            try:
+                send_telegram_message(msg)
+            except Exception:
+                pass
             return False
-        logging.info(
-            f"✅ Volatility OK for {symbol_base}: {volatility_reference:.6f} within [{low_vol:.6f}, {high_vol:.6f}]"
-        )
         confidence_value = float(combined_confidence) if combined_confidence is not None else 0.0
         latest_rsi_value = float(evaluation.get('latest_rsi', 0.0))
         aligned_strategies = int(
@@ -3903,15 +3884,6 @@ class TradingEngine:
         base_action = evaluation.get('base_action', signal)
         final_action = signal
         latest_prices_seq = evaluation.get('latest_prices')
-        live_volatility = None
-        if isinstance(latest_prices_seq, (list, tuple)) and len(latest_prices_seq) >= 5:
-            try:
-                live_volatility = float(np.std(latest_prices_seq[-5:]))
-            except Exception:
-                live_volatility = None
-        if live_volatility is not None and live_volatility < 0.0005:
-            logging.info("⚠️ Volatilidad en vivo baja, cancelando operación.")
-            return False
         if (
             final_action in {'CALL', 'PUT'}
             and base_action in {'CALL', 'PUT'}
@@ -3982,15 +3954,6 @@ class TradingEngine:
             return False
         if STRICT_MODE_ENABLED:
             if (
-                volatility_value is not None
-                and volatility_value < LOW_VOL_THRESHOLD
-                and confidence_value < LOW_VOL_CONFIDENCE
-            ):
-                logging.info(
-                    "🚫 Skipping trade — low volatility & weak signal (modo estricto)."
-                )
-                return False
-            if (
                 NEUTRAL_RSI_BAND[0]
                 <= latest_rsi_value
                 <= NEUTRAL_RSI_BAND[1]
@@ -4014,9 +3977,6 @@ class TradingEngine:
                 return False
         if combined_confidence is None:
             logging.info("⏭️ Trade skipped due to low confluence/confidence.")
-            return False
-        if volatility_value is not None and volatility_value < MIN_VOLATILITY:
-            logging.info(f"🚫 Skipping trade on {symbol} due to low volatility ({volatility_value:.4f})")
             return False
         if not self.risk.can_trade(ai_confidence):
             return False
