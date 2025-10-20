@@ -2744,6 +2744,10 @@ class TradingEngine:
             losses_loaded,
             total_loaded,
         )
+        self.session_total = 0
+        self.session_wins = 0
+        self.session_losses = 0
+        logging.info("🧮 Session counters reset (new session started).")
         startup_message = (
             f"🤖 Bot iniciado correctamente y conectado a Deriv\n"
             f"🧠 Memoria cargada con {wins_loaded} ganadoras y {losses_loaded} perdedoras"
@@ -4064,6 +4068,16 @@ class TradingEngine:
             self.total_operations += 1
             if win_flag:
                 self.win_operations += 1
+            self.session_total += 1
+            if win_flag:
+                self.session_wins += 1
+            else:
+                self.session_losses += 1
+            session_accuracy = (
+                (self.session_wins / self.session_total) * 100.0
+                if self.session_total > 0
+                else 0.0
+            )
             if MAINTENANCE_EVERY > 0 and self.total_operations % MAINTENANCE_EVERY == 0:
                 # Continuous learning active — no reset after 50 trades
                 pass
@@ -4139,18 +4153,12 @@ class TradingEngine:
                 resultado_texto = "GANADA" if win_flag else "PERDIDA"
                 logging.info(f"✅ Dynamic confidence applied: {confidence_value:.2f}")
                 memory_total = len(self.learning_memory)
-                wins_memory = sum(
-                    1
-                    for item in self.learning_memory
-                    if str(item.get('result', '')).upper() == 'WIN'
-                )
-                precision_actual = (wins_memory / memory_total * 100.0) if memory_total > 0 else 0.0
                 message = (
                     f"{emoji} Activo: {symbol}\n"
                     f"📈 Resultado: {resultado_texto}\n"
                     f"📊 Confianza: {confidence_value:.2f}\n"
-                    f"⚙️ Operaciones: {memory_total}\n"
-                    f"🎯 Precisión actual: {precision_actual:.2f}%\n"
+                    f"⚙️ Operaciones (sesión): {self.session_total}\n"
+                    f"🎯 Precisión actual: {session_accuracy:.2f}%\n"
                     f"🧠 Sesgos totales: {memory_total}"
                 )
                 try:
@@ -4757,41 +4765,34 @@ class BotWindow(QtWidgets.QWidget):
             if engine is None:
                 return
 
-            memory_entries = list(getattr(engine, "learning_memory", []))
-            total_ops = len(memory_entries)
-            wins = sum(
-                1
-                for entry in memory_entries
-                if str(entry.get("result", "")).upper() == "WIN"
+            session_total = int(getattr(engine, "session_total", 0))
+            session_wins = int(getattr(engine, "session_wins", 0))
+            session_losses = int(getattr(engine, "session_losses", 0))
+            precision = (
+                (session_wins / session_total) * 100.0 if session_total > 0 else 0.0
             )
-            losses = sum(
-                1
-                for entry in memory_entries
-                if str(entry.get("result", "")).upper() == "LOSS"
-            )
-            precision = (wins / total_ops * 100.0) if total_ops > 0 else 0.0
 
-            confidences = [
-                float(entry.get("confidence", 0.0))
-                for entry in memory_entries
-                if isinstance(entry.get("confidence", None), (int, float))
+            recent_confidences = [
+                float(record.confidence)
+                for record in list(engine.trade_history)[-session_total:]
+                if isinstance(record.confidence, (int, float))
             ]
-            avg_conf = float(np.mean(confidences)) if confidences else 0.0
+            avg_conf = float(np.mean(recent_confidences)) if recent_confidences else 0.0
 
             progress = 0.0
-            if total_ops > 0:
-                progress = min(100.0, (total_ops / 100.0) * max(avg_conf, 0.0) * 100.0)
+            if session_total > 0:
+                progress = min(100.0, (session_total / 100.0) * max(avg_conf, 0.0) * 100.0)
 
             if not getattr(self, "learning_enabled", True):
                 mode = "Pausado"
-            elif total_ops > 70:
+            elif session_total > 70:
                 mode = "Estable"
-            elif total_ops > 30:
+            elif session_total > 30:
                 mode = "Aprendizaje"
             else:
                 mode = "Pasivo"
 
-            self.label_operations.setText(f"Operaciones: {total_ops}")
+            self.label_operations.setText(f"Operaciones: {session_total}")
             self.label_precision.setText(f"Precisión: {precision:.2f}%")
             self.label_confidence.setText(f"Confianza media: {avg_conf:.2f}")
             self.label_progress.setText(f"Progreso adaptativo: {progress:.2f}%")
