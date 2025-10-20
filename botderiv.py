@@ -3896,6 +3896,8 @@ class TradingEngine:
         ema_spread_value = float(evaluation.get('ema_spread', 0.0))
         context_key = f"{symbol}|{final_action}|RSI:{round(latest_rsi_value, 1)}|EMA:{round(ema_spread_value, 1)}"
         if final_action in {'CALL', 'PUT'}:
+            current_rsi_rounded = round(latest_rsi_value, 1)
+            current_ema_rounded = round(ema_spread_value, 1)
             for memory_entry in self.learning_memory:
                 if str(memory_entry.get('symbol', '')) != symbol:
                     continue
@@ -3906,26 +3908,25 @@ class TradingEngine:
                     stored_ema = float(memory_entry.get('ema', 0.0))
                 except (TypeError, ValueError):
                     continue
-                if abs(stored_rsi - round(latest_rsi_value, 1)) > 2.0:
-                    continue
-                if abs(stored_ema - round(ema_spread_value, 1)) > 10.0:
-                    continue
-                outcome = str(memory_entry.get('result', '')).upper()
-                if outcome == 'LOSS':
-                    logging.info(f"🚫 Blocked trade due to previous LOSS pattern → {context_key}")
-                    try:
-                        send_telegram_message(
-                            f"🚫 Operación bloqueada por patrón perdedor previo ({symbol}, {final_action}, RSI={latest_rsi_value:.2f}, EMA={ema_spread_value:.2f})"
+                rsi_diff = abs(stored_rsi - current_rsi_rounded)
+                ema_diff = abs(stored_ema - current_ema_rounded)
+                if rsi_diff <= 0.5 and ema_diff <= 3:
+                    if str(memory_entry.get('result', '')).upper() == 'LOSS':
+                        logging.info(
+                            f"🚫 Blocked trade due to *very similar* LOSS pattern (RSI diff={rsi_diff:.2f}, EMA diff={ema_diff:.2f}) → {context_key}"
                         )
-                    except Exception:
-                        logging.debug('No se pudo enviar alerta de bloqueo de patrón perdedor')
-                    return False
-                if outcome == 'WIN':
+                        try:
+                            send_telegram_message(
+                                f"🚫 Operación bloqueada por patrón perdedor previo ({symbol}, {final_action}, RSI diff={rsi_diff:.2f}, EMA diff={ema_diff:.2f})"
+                            )
+                        except Exception:
+                            logging.debug('No se pudo enviar alerta de bloqueo de patrón perdedor')
+                        return False
+                elif rsi_diff <= 2 and ema_diff <= 10 and str(memory_entry.get('result', '')).upper() == 'WIN':
                     confidence_value = float(min(confidence_value + 0.15, 1.0))
                     evaluation['final_confidence'] = confidence_value
                     logging.info(
-                        '💾 Reinforced by similar WIN pattern → new confidence=%.2f',
-                        confidence_value,
+                        f"💾 Reinforced by similar WIN pattern (RSI diff={rsi_diff:.2f}, EMA diff={ema_diff:.2f}) → new confidence={confidence_value:.2f}"
                     )
                     break
         if (
