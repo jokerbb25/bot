@@ -6,6 +6,7 @@ import logging
 import warnings
 import csv
 import math
+import shutil
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -58,7 +59,7 @@ MAX_DAILY_PROFIT = 100.0
 COOLDOWN_AFTER_LOSS = 60
 MAX_DRAWDOWN = -150.0
 MIN_TRADE_CONFIDENCE = 0.45
-MIN_CONFIDENCE = 0.70
+MIN_CONFIDENCE = 0.75
 MIN_VOLATILITY = 0.0005
 
 # === STRICT MODE PARAMETERS ===
@@ -67,7 +68,7 @@ LOW_VOL_THRESHOLD = 0.0006
 LOW_VOL_CONFIDENCE = 0.85
 NEUTRAL_RSI_BAND = (45.0, 55.0)
 NEUTRAL_RSI_CONF = 0.95
-MIN_ALIGNED_STRATEGIES = 3
+MIN_ALIGNED_STRATEGIES = 2
 POST_LOSS_COOLDOWN_SEC = 120
 MAX_TRADES_PER_HOUR = 20
 KEEP_WIN_MIN_CONF = 0.70
@@ -106,6 +107,8 @@ CSV_LOGGED_CONTRACTS: Set[int] = set()
 BIAS_MEMORY_PATH = Path("bias_memory.json")
 WINNER_MEMORY_PATH = Path("sesgos_ganadores.json")
 LEARNING_MEMORY_PATH = Path("learning_memory.json")
+LEARNING_MEMORY_BACKUP_PATH = Path("learning_memory_backup.json")
+STATS_DATA_PATH = Path("stats.json")
 
 
 def send_telegram_message(text: str) -> None:
@@ -224,75 +227,173 @@ def save_winner_biases(entries: List[Dict[str, Any]]) -> None:
         logging.debug(f"No se pudo guardar sesgos ganadores: {exc}")
 
 
-def load_learning_memory() -> List[Dict[str, Any]]:
-    if not LEARNING_MEMORY_PATH.exists():
-        return []
+def _normalize_learning_entry(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
+    if not isinstance(item, dict):
+        return None
     try:
-        with LEARNING_MEMORY_PATH.open("r", encoding="utf-8") as handle:
-            raw_data = json.load(handle)
-    except Exception as exc:
-        logging.warning(f"⚠️ No existing learning memory found: {exc}")
+        symbol = str(item.get("symbol", ""))
+        action_value = str(item.get("action", item.get("direction", "NONE"))).upper()
+        rsi_value = round(float(item.get("rsi", 0.0)), 1)
+        ema_value = round(float(item.get("ema", 0.0)), 1)
+        result_value = str(item.get("result", "LOSS")).upper()
+        confidence_value = float(item.get("confidence", 0.0))
+        timestamp_value = str(
+            item.get("timestamp", datetime.now(timezone.utc).isoformat())
+        )
+        weight_value = float(item.get("weight", 1.0))
+    except (TypeError, ValueError):
+        return None
+    return {
+        "symbol": symbol,
+        "action": action_value,
+        "direction": action_value,
+        "rsi": rsi_value,
+        "ema": ema_value,
+        "result": result_value,
+        "confidence": confidence_value,
+        "timestamp": timestamp_value,
+        "weight": max(1.0, weight_value),
+    }
+
+
+def prune_learning_memory(
+    entries: Iterable[Dict[str, Any]], max_patterns: int = 200
+) -> List[Dict[str, Any]]:
+    normalized_entries: List[Dict[str, Any]] = []
+    seen_keys: Set[Tuple[str, str, float, float]] = set()
+    for entry in entries:
+        normalized = _normalize_learning_entry(entry)
+        if normalized is None:
+            continue
+        key = (
+            normalized["symbol"].upper(),
+            normalized["action"].upper(),
+            normalized["rsi"],
+            normalized["ema"],
+        )
+        if key in seen_keys:
+            continue
+        seen_keys.add(key)
+        normalized_entries.append(normalized)
+    if len(normalized_entries) <= max_patterns:
+        return normalized_entries
+    winners = [entry for entry in normalized_entries if entry["result"] == "WIN"]
+    losses = [entry for entry in normalized_entries if entry["result"] != "WIN"]
+    winners.sort(key=lambda item: float(item.get("weight", 1.0)), reverse=True)
+    losses.sort(key=lambda item: float(item.get("weight", 1.0)), reverse=True)
+    max_winners = min(len(winners), min(max_patterns, 150))
+    remaining_slots = max(0, max_patterns - max_winners)
+    max_losses = min(len(losses), remaining_slots)
+    pruned = winners[:max_winners] + losses[:max_losses]
+    logging.info(
+        "🧹 Pruned learning memory to %d patrones (favoring winners)",
+        len(pruned),
+    )
+    return pruned
+
+
+def load_learning_memory() -> List[Dict[str, Any]]:
+    raw_data: Any = None
+    source_path: Optional[Path] = None
+    for candidate_path in (LEARNING_MEMORY_PATH, LEARNING_MEMORY_BACKUP_PATH):
+        if not candidate_path.exists():
+            continue
+        try:
+            with candidate_path.open("r", encoding="utf-8") as handle:
+                raw_data = json.load(handle)
+            source_path = candidate_path
+            break
+        except Exception as exc:
+            logging.warning(
+                "⚠️ Unable to read learning memory from %s: %s",
+                candidate_path,
+                exc,
+            )
+    if raw_data is None or source_path is None:
+        logging.info("🧠 No previous learning memory found, starting fresh.")
         return []
+    if source_path == LEARNING_MEMORY_PATH:
+        try:
+            shutil.copy(LEARNING_MEMORY_PATH, LEARNING_MEMORY_BACKUP_PATH)
+        except Exception as exc:
+            logging.debug(f"Could not create learning memory backup: {exc}")
     if isinstance(raw_data, dict):
         candidates = raw_data.get("biases", [])
     elif isinstance(raw_data, list):
         candidates = raw_data
     else:
         candidates = []
-    normalized: List[Dict[str, Any]] = []
-    for item in candidates:
-        if not isinstance(item, dict):
-            continue
-        try:
-            symbol = str(item.get("symbol", ""))
-            action = str(item.get("action", item.get("direction", "NONE"))).upper()
-            rsi_value = float(item.get("rsi", 0.0))
-            ema_value = float(item.get("ema", 0.0))
-            result_value = str(item.get("result", "LOSS")).upper()
-            confidence_value = float(item.get("confidence", 0.0))
-            timestamp_value = str(item.get("timestamp", datetime.now(timezone.utc).isoformat()))
-            weight_value = float(item.get("weight", 1.0))
-        except (TypeError, ValueError):
-            continue
-        normalized.append(
-            {
-                "symbol": symbol,
-                "action": action,
-                "direction": action,
-                "rsi": rsi_value,
-                "ema": ema_value,
-                "result": result_value,
-                "confidence": confidence_value,
-                "timestamp": timestamp_value,
-                "weight": weight_value,
-            }
-        )
+    normalized = prune_learning_memory(candidates, max_patterns=200)
     return normalized
 
 
-def save_learning_memory(entries: List[Dict[str, Any]]) -> None:
+def save_learning_memory(entries: Iterable[Dict[str, Any]]) -> None:
+    pruned_entries = prune_learning_memory(entries, max_patterns=200)
     payload: List[Dict[str, Any]] = []
-    for item in entries:
-        if not isinstance(item, dict):
+    for item in pruned_entries:
+        normalized = _normalize_learning_entry(item)
+        if normalized is None:
             continue
-        payload.append(
-            {
-                "symbol": str(item.get("symbol", "")),
-                "action": str(item.get("action", item.get("direction", "NONE"))).upper(),
-                "direction": str(item.get("action", item.get("direction", "NONE"))).upper(),
-                "rsi": float(item.get("rsi", 0.0)),
-                "ema": float(item.get("ema", 0.0)),
-                "result": str(item.get("result", "LOSS")).upper(),
-                "confidence": float(item.get("confidence", 0.0)),
-                "timestamp": str(item.get("timestamp", datetime.now(timezone.utc).isoformat())),
-                "weight": float(item.get("weight", 1.0)),
-            }
-        )
+        payload.append(normalized)
     try:
         with LEARNING_MEMORY_PATH.open("w", encoding="utf-8") as handle:
             json.dump(payload, handle, ensure_ascii=False, indent=2)
+        try:
+            shutil.copy(LEARNING_MEMORY_PATH, LEARNING_MEMORY_BACKUP_PATH)
+        except Exception as exc:
+            logging.debug(f"Could not refresh learning memory backup: {exc}")
     except Exception as exc:
         logging.warning(f"⚠️ Unable to persist learning memory: {exc}")
+
+
+def _load_stats_data() -> Dict[str, int]:
+    if not STATS_DATA_PATH.exists():
+        return {"total_ops": 0, "wins": 0, "losses": 0}
+    try:
+        with STATS_DATA_PATH.open("r", encoding="utf-8") as handle:
+            data = json.load(handle)
+        return {
+            "total_ops": int(data.get("total_ops", 0)),
+            "wins": int(data.get("wins", 0)),
+            "losses": int(data.get("losses", data.get("loss", 0))),
+        }
+    except Exception as exc:
+        logging.debug(f"No se pudieron cargar estadísticas persistentes: {exc}")
+        return {"total_ops": 0, "wins": 0, "losses": 0}
+
+
+def _save_stats_data(stats: Dict[str, int]) -> None:
+    try:
+        with STATS_DATA_PATH.open("w", encoding="utf-8") as handle:
+            json.dump(stats, handle, ensure_ascii=False, indent=2)
+    except Exception as exc:
+        logging.warning(f"⚠️ Could not persist stats: {exc}")
+
+
+def safe_startup_accuracy(session_wins: int, session_losses: int) -> Tuple[str, int]:
+    session_total = session_wins + session_losses
+    if session_total > 0:
+        accuracy = (session_wins / session_total) * 100.0
+        return f"{accuracy:.2f}%", session_total
+    stats = _load_stats_data()
+    total_ops = stats.get("total_ops", 0)
+    if total_ops <= 0:
+        return "— (sin operaciones previas)", 0
+    wins = stats.get("wins", 0)
+    accuracy = (wins / total_ops) * 100.0 if total_ops > 0 else 0.0
+    return f"{accuracy:.2f}%", total_ops
+
+
+def update_stats_persist(win: bool) -> None:
+    stats = _load_stats_data()
+    stats["total_ops"] = int(stats.get("total_ops", 0)) + 1
+    stats["losses"] = int(stats.get("losses", stats.get("loss", 0)))
+    if win:
+        stats["wins"] = int(stats.get("wins", 0)) + 1
+    else:
+        stats["losses"] = int(stats.get("losses", 0)) + 1
+        stats.pop("loss", None)
+    _save_stats_data(stats)
 
 
 global_engine = None
@@ -2731,7 +2832,15 @@ class TradingEngine:
         self.session_total = 0
         self.session_wins = 0
         self.session_losses = 0
-        logging.info("🧮 Session counters reset (new session started).")
+        accuracy_text, reference_ops = safe_startup_accuracy(
+            self.session_wins,
+            self.session_losses,
+        )
+        logging.info(
+            "📊 Inicio de sesión → precisión histórica %s (registros=%d)",
+            accuracy_text,
+            reference_ops,
+        )
         startup_message = (
             f"🤖 Bot iniciado correctamente y conectado a Deriv\n"
             f"🧠 Memoria cargada con {wins_loaded} ganadoras y {losses_loaded} perdedoras"
@@ -2832,6 +2941,7 @@ class TradingEngine:
         save_winner_biases(self.winner_biases)
 
     def _persist_learning_memory(self) -> None:
+        self.learning_memory = prune_learning_memory(self.learning_memory)
         save_learning_memory(self.learning_memory)
 
     def _append_learning_memory_entry(
@@ -3814,6 +3924,7 @@ class TradingEngine:
     def _execute_selected_trade(self, evaluation: Dict[str, Any]) -> bool:
         global operation_active
         symbol = evaluation['symbol']
+        symbol_upper = str(symbol).upper()
         signal = evaluation['signal']
         ai_confidence = float(evaluation['ai_confidence'])
         combined_confidence = float(evaluation.get('final_confidence', ai_confidence))
@@ -3909,10 +4020,16 @@ class TradingEngine:
             and ema_signal_eval in {'CALL', 'PUT'}
             and rsi_signal_eval != ema_signal_eval
         ):
-            logging.info(
-                "⚠️ RSI y EMA en conflicto → reduciendo confianza (penalización 20%)."
-            )
-            confidence_value *= 1.0 - VOLATILITY_CONFLICT_PENALTY
+            if 'R_100' in symbol_upper:
+                logging.info(
+                    "⚠️ RSI y EMA en conflicto → penalización de 0.30 aplicada para R_100."
+                )
+                confidence_value = max(0.0, confidence_value - 0.3)
+            else:
+                logging.info(
+                    "⚠️ RSI y EMA en conflicto → reduciendo confianza (penalización 20%)."
+                )
+                confidence_value *= 1.0 - VOLATILITY_CONFLICT_PENALTY
             evaluation['final_confidence'] = confidence_value
         ema_spread_value = float(evaluation.get('ema_spread', 0.0))
         context_key = f"{symbol}|{final_action}|RSI:{round(latest_rsi_value, 1)}|EMA:{round(ema_spread_value, 1)}"
@@ -4093,6 +4210,7 @@ class TradingEngine:
                 if self.session_total > 0
                 else 0.0
             )
+            update_stats_persist(win_flag)
             if MAINTENANCE_EVERY > 0 and self.total_operations % MAINTENANCE_EVERY == 0:
                 # Continuous learning active — no reset after 50 trades
                 pass
