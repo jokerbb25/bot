@@ -7,6 +7,7 @@ import warnings
 import csv
 import math
 import shutil
+import os
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -73,7 +74,6 @@ POST_LOSS_COOLDOWN_SEC = 120
 MAX_TRADES_PER_HOUR = 20
 KEEP_WIN_MIN_CONF = 0.70
 MAINTENANCE_EVERY = 50
-VOLATILITY_CONFLICT_PENALTY = 0.20
 STRICT_MODE_ENABLED = True
 
 # === TELEGRAM BOT CONFIGURATION ===
@@ -253,6 +253,7 @@ def _normalize_learning_entry(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
             timestamp_value = float(timestamp_raw or time.time())
         weight_value = float(item.get("weight", 1.0))
         wins_row = int(item.get("wins_in_a_row", 0) or 0)
+        losses_row = int(item.get("loss_streak", 0) or 0)
     except (TypeError, ValueError):
         return None
     pattern_key = build_learning_pattern_key(symbol, action_value, rsi_value, ema_value)
@@ -267,98 +268,161 @@ def _normalize_learning_entry(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "timestamp": float(timestamp_value),
         "weight": max(1.0, weight_value),
         "wins_in_a_row": max(0, wins_row),
+        "loss_streak": max(0, losses_row),
         "pattern_key": pattern_key,
     }
 
 
 def prune_learning_memory(
-    entries: Iterable[Dict[str, Any]], max_patterns: int = 200
-) -> List[Dict[str, Any]]:
-    normalized_entries: List[Dict[str, Any]] = []
-    seen_keys: Set[Tuple[str, str, float, float]] = set()
-    for entry in entries:
+    entries: Dict[str, Dict[str, Any]], max_patterns: int = 200
+) -> Dict[str, Dict[str, Any]]:
+    normalized_entries: Dict[str, Dict[str, Any]] = {}
+    for key, entry in entries.items():
         normalized = _normalize_learning_entry(entry)
         if normalized is None:
             continue
-        key = (
-            normalized["symbol"].upper(),
-            normalized["action"].upper(),
-            normalized["rsi"],
-            normalized["ema"],
-        )
-        if key in seen_keys:
+        pattern_key = normalized.get("pattern_key")
+        if not pattern_key:
             continue
-        seen_keys.add(key)
-        normalized_entries.append(normalized)
+        normalized_entries[pattern_key] = normalized
     if len(normalized_entries) <= max_patterns:
         return normalized_entries
-    winners = [entry for entry in normalized_entries if entry["result"] == "WIN"]
-    losses = [entry for entry in normalized_entries if entry["result"] != "WIN"]
-    winners.sort(key=lambda item: float(item.get("weight", 1.0)), reverse=True)
-    losses.sort(key=lambda item: float(item.get("weight", 1.0)), reverse=True)
+    winners = [
+        item
+        for item in normalized_entries.values()
+        if item.get("result") == "WIN"
+    ]
+    losses = [
+        item
+        for item in normalized_entries.values()
+        if item.get("result") != "WIN"
+    ]
+    winners.sort(
+        key=lambda entry: (
+            float(entry.get("weight", 1.0)),
+            int(entry.get("wins_in_a_row", 0)),
+        ),
+        reverse=True,
+    )
+    losses.sort(
+        key=lambda entry: (
+            float(entry.get("weight", 1.0)),
+            -int(entry.get("loss_streak", 0)),
+        ),
+        reverse=True,
+    )
     max_winners = min(len(winners), min(max_patterns, 150))
     remaining_slots = max(0, max_patterns - max_winners)
     max_losses = min(len(losses), remaining_slots)
-    pruned = winners[:max_winners] + losses[:max_losses]
+    pruned_list = winners[:max_winners] + losses[:max_losses]
     logging.info(
         "🧹 Pruned learning memory to %d patrones (favoring winners)",
-        len(pruned),
+        len(pruned_list),
     )
-    return pruned
-
-
-def load_learning_memory() -> List[Dict[str, Any]]:
-    raw_data: Any = None
-    source_path: Optional[Path] = None
-    for candidate_path in (LEARNING_MEMORY_PATH, LEARNING_MEMORY_BACKUP_PATH):
-        if not candidate_path.exists():
+    pruned_entries: Dict[str, Dict[str, Any]] = {}
+    for entry in pruned_list:
+        pattern_key = entry.get("pattern_key")
+        if not pattern_key:
             continue
-        try:
-            with candidate_path.open("r", encoding="utf-8") as handle:
-                raw_data = json.load(handle)
-            source_path = candidate_path
-            break
-        except Exception as exc:
-            logging.warning(
-                "⚠️ Unable to read learning memory from %s: %s",
-                candidate_path,
-                exc,
-            )
-    if raw_data is None or source_path is None:
-        logging.info("🧠 No previous learning memory found, starting fresh.")
-        return []
-    if source_path == LEARNING_MEMORY_PATH:
-        try:
-            shutil.copy(LEARNING_MEMORY_PATH, LEARNING_MEMORY_BACKUP_PATH)
-        except Exception as exc:
-            logging.debug(f"Could not create learning memory backup: {exc}")
-    if isinstance(raw_data, dict):
-        candidates = raw_data.get("biases", [])
-    elif isinstance(raw_data, list):
-        candidates = raw_data
-    else:
-        candidates = []
-    normalized = prune_learning_memory(candidates, max_patterns=200)
-    return normalized
+        pruned_entries[pattern_key] = entry
+    return pruned_entries
 
 
-def save_learning_memory(entries: Iterable[Dict[str, Any]]) -> None:
-    pruned_entries = prune_learning_memory(entries, max_patterns=200)
-    payload: List[Dict[str, Any]] = []
-    for item in pruned_entries:
-        normalized = _normalize_learning_entry(item)
-        if normalized is None:
-            continue
-        payload.append(normalized)
+def load_learning_memory() -> Dict[str, Dict[str, Any]]:
     try:
-        with LEARNING_MEMORY_PATH.open("w", encoding="utf-8") as handle:
-            json.dump(payload, handle, ensure_ascii=False, indent=2)
-        try:
-            shutil.copy(LEARNING_MEMORY_PATH, LEARNING_MEMORY_BACKUP_PATH)
-        except Exception as exc:
-            logging.debug(f"Could not refresh learning memory backup: {exc}")
+        if os.path.exists(MEMORY_FILE):
+            with open(MEMORY_FILE, "r", encoding="utf-8") as handle:
+                data = json.load(handle)
+            if isinstance(data, list):
+                candidate_map: Dict[str, Dict[str, Any]] = {}
+                for item in data:
+                    normalized_entry = _normalize_learning_entry(item)
+                    if normalized_entry is None:
+                        continue
+                    key = normalized_entry.get("pattern_key")
+                    if key:
+                        candidate_map[key] = normalized_entry
+                data = candidate_map
+            if isinstance(data, dict):
+                normalized = prune_learning_memory(data, max_patterns=200)
+                total = len(normalized)
+                win_count = sum(
+                    1 for item in normalized.values() if item.get("result") == "WIN"
+                )
+                loss_count = sum(
+                    1 for item in normalized.values() if item.get("result") == "LOSS"
+                )
+                logging.info(
+                    "🧠 Learning memory loaded (%d WIN / %d LOSS, total=%d)",
+                    win_count,
+                    loss_count,
+                    total,
+                )
+                try:
+                    shutil.copy(MEMORY_FILE, BACKUP_FILE)
+                except Exception as exc:
+                    logging.debug(f"Could not backup learning memory: {exc}")
+                return normalized
+            logging.warning("⚠️ Memory file is not a dictionary, attempting backup restore...")
+        else:
+            logging.info("🧠 No previous learning memory found, creating a new one.")
+        if os.path.exists(BACKUP_FILE):
+            with open(BACKUP_FILE, "r", encoding="utf-8") as handle:
+                backup_data = json.load(handle)
+            if isinstance(backup_data, list):
+                backup_map: Dict[str, Dict[str, Any]] = {}
+                for item in backup_data:
+                    normalized_entry = _normalize_learning_entry(item)
+                    if normalized_entry is None:
+                        continue
+                    key = normalized_entry.get("pattern_key")
+                    if key:
+                        backup_map[key] = normalized_entry
+                backup_data = backup_map
+            if isinstance(backup_data, dict):
+                restored = prune_learning_memory(backup_data, max_patterns=200)
+                total = len(restored)
+                win_count = sum(
+                    1 for item in restored.values() if item.get("result") == "WIN"
+                )
+                loss_count = sum(
+                    1 for item in restored.values() if item.get("result") == "LOSS"
+                )
+                shutil.copy(BACKUP_FILE, MEMORY_FILE)
+                logging.info(
+                    "♻️ Restored learning memory from backup (%d WIN / %d LOSS, total=%d)",
+                    win_count,
+                    loss_count,
+                    total,
+                )
+                return restored
     except Exception as exc:
-        logging.warning(f"⚠️ Unable to persist learning memory: {exc}")
+        logging.error(f"❌ Error loading learning memory: {exc}")
+    return {}
+
+
+def save_learning_memory(mem: Dict[str, Dict[str, Any]]) -> None:
+    try:
+        pruned = prune_learning_memory(mem, max_patterns=200)
+        if not pruned:
+            logging.warning("⚠️ Attempted to save empty memory, skipping save.")
+            return
+        with open(MEMORY_FILE, "w", encoding="utf-8") as handle:
+            json.dump(pruned, handle, ensure_ascii=False, indent=2)
+        try:
+            shutil.copy(MEMORY_FILE, BACKUP_FILE)
+        except Exception as exc:
+            logging.debug(f"Could not backup learning memory: {exc}")
+        win_count = sum(1 for item in pruned.values() if item.get("result") == "WIN")
+        loss_count = sum(1 for item in pruned.values() if item.get("result") == "LOSS")
+        logging.info(
+            "💾 Learning memory saved (%d WIN / %d LOSS, total=%d)",
+            win_count,
+            loss_count,
+            len(pruned),
+        )
+    except Exception as exc:
+        logging.error(f"❌ Error saving learning memory: {exc}")
 
 
 def _load_stats_data() -> Dict[str, int]:
@@ -2835,18 +2899,7 @@ class TradingEngine:
         self.bias_memory: Dict[str, Dict[str, Any]] = load_biases()
         self.winner_biases: List[Dict[str, Any]] = load_winner_biases()
         raw_learning_entries = load_learning_memory()
-        self.learning_memory: Dict[str, Dict[str, Any]] = {}
-        for entry in raw_learning_entries:
-            pattern_key = entry.get('pattern_key')
-            if not pattern_key:
-                pattern_key = build_learning_pattern_key(
-                    entry.get('symbol', ''),
-                    entry.get('action', ''),
-                    entry.get('rsi', 0.0),
-                    entry.get('ema', 0.0),
-                )
-                entry['pattern_key'] = pattern_key
-            self.learning_memory[pattern_key] = entry
+        self.learning_memory = dict(raw_learning_entries)
         wins_loaded = sum(
             1
             for item in self.learning_memory.values()
@@ -2977,21 +3030,10 @@ class TradingEngine:
         save_winner_biases(self.winner_biases)
 
     def _persist_learning_memory(self) -> None:
-        pruned_entries = prune_learning_memory(self.learning_memory.values())
-        refreshed: Dict[str, Dict[str, Any]] = {}
-        for entry in pruned_entries:
-            pattern_key = entry.get('pattern_key')
-            if not pattern_key:
-                pattern_key = build_learning_pattern_key(
-                    entry.get('symbol', ''),
-                    entry.get('action', ''),
-                    entry.get('rsi', 0.0),
-                    entry.get('ema', 0.0),
-                )
-                entry['pattern_key'] = pattern_key
-            refreshed[pattern_key] = entry
-        self.learning_memory = refreshed
-        save_learning_memory(self.learning_memory.values())
+        self.learning_memory = prune_learning_memory(
+            self.learning_memory, max_patterns=200
+        )
+        save_learning_memory(self.learning_memory)
 
     def _append_learning_memory_entry(
         self,
@@ -3009,9 +3051,11 @@ class TradingEngine:
         normalized_result = result.upper()
         existing = self.learning_memory.get(pattern_key)
         wins_row = 0
+        losses_row = 0
         weight_value = 1.0
         if existing is not None:
             wins_row = int(existing.get("wins_in_a_row", 0) or 0)
+            losses_row = int(existing.get("loss_streak", 0) or 0)
             weight_value = float(existing.get("weight", 1.0) or 1.0)
         entry = {
             "symbol": symbol,
@@ -3024,6 +3068,7 @@ class TradingEngine:
             "timestamp": timestamp_value,
             "weight": weight_value,
             "wins_in_a_row": wins_row,
+            "loss_streak": losses_row,
             "pattern_key": pattern_key,
         }
         self.learning_memory[pattern_key] = entry
@@ -3048,9 +3093,11 @@ class TradingEngine:
         if normalized_result == "WIN":
             weight_value += 1.0
             entry["wins_in_a_row"] = int(entry.get("wins_in_a_row", 0) or 0) + 1
+            entry["loss_streak"] = 0
         else:
             weight_value = max(1.0, weight_value - 0.3)
             entry["wins_in_a_row"] = 0
+            entry["loss_streak"] = int(entry.get("loss_streak", 0) or 0) + 1
         entry["weight"] = weight_value
         entry["result"] = normalized_result
         entry["timestamp"] = time.time()
@@ -4050,6 +4097,13 @@ class TradingEngine:
             except Exception:
                 pass
             return False
+        mid_low = low_vol + (high_vol - low_vol) * 0.2
+        mid_high = high_vol - (high_vol - low_vol) * 0.2
+        if not (mid_low - epsilon <= evaluated_volatility <= mid_high + epsilon):
+            logging.info(
+                f"⚠️ Volatility {evaluated_volatility:.6f} outside safe zone [{mid_low:.6f}, {mid_high:.6f}], skipping."
+            )
+            return False
         confidence_value = float(combined_confidence) if combined_confidence is not None else 0.0
         latest_rsi_value = float(evaluation.get('latest_rsi', 0.0))
         aligned_strategies = int(
@@ -4070,27 +4124,30 @@ class TradingEngine:
             return False
         rsi_signal_eval = evaluation.get('rsi_signal')
         ema_signal_eval = evaluation.get('ema_signal')
-        if (
-            rsi_signal_eval in {'CALL', 'PUT'}
-            and ema_signal_eval in {'CALL', 'PUT'}
-            and rsi_signal_eval != ema_signal_eval
-        ):
-            if 'R_100' in symbol_upper:
-                logging.info(
-                    "⚠️ RSI y EMA en conflicto → penalización de 0.30 aplicada para R_100."
-                )
-                confidence_value = max(0.0, confidence_value - 0.3)
-            else:
-                logging.info(
-                    "⚠️ RSI y EMA en conflicto → reduciendo confianza (penalización 20%)."
-                )
-                confidence_value *= 1.0 - VOLATILITY_CONFLICT_PENALTY
-            evaluation['final_confidence'] = confidence_value
+        if rsi_signal_eval == 'CALL' and ema_signal_eval == 'PUT':
+            logging.info("🚫 Skipped: RSI CALL contradicts EMA PUT (conflict)")
+            return False
+        if rsi_signal_eval == 'PUT' and ema_signal_eval == 'CALL':
+            logging.info("🚫 Skipped: RSI PUT contradicts EMA CALL (conflict)")
+            return False
         ema_spread_value = float(evaluation.get('ema_spread', 0.0))
         context_key = f"{symbol}|{final_action}|RSI:{round(latest_rsi_value, 1)}|EMA:{round(ema_spread_value, 1)}"
         if final_action in {'CALL', 'PUT'}:
             current_rsi_rounded = round(latest_rsi_value, 1)
             current_ema_rounded = round(ema_spread_value, 1)
+            bias_pattern_key = build_learning_pattern_key(
+                symbol, final_action, current_rsi_rounded, current_ema_rounded
+            )
+            bias_entry = self.learning_memory.get(bias_pattern_key)
+            if (
+                bias_entry
+                and str(bias_entry.get('result', '')).upper() == 'LOSS'
+                and int(bias_entry.get('loss_streak', 0) or 0) >= 2
+            ):
+                logging.info(
+                    f"🧱 Pattern blocked due to repeated losses (streak={bias_entry['loss_streak']})"
+                )
+                return False
             adjusted_confidence = confidence_value
             for memory_entry in self.learning_memory.values():
                 if str(memory_entry.get('symbol', '')) != symbol:
