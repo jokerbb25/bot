@@ -59,11 +59,11 @@ MAX_DAILY_PROFIT = 100.0
 COOLDOWN_AFTER_LOSS = 60
 MAX_DRAWDOWN = -150.0
 MIN_TRADE_CONFIDENCE = 0.45
-MIN_CONFIDENCE = 0.85
+MIN_CONFIDENCE = 0.80
 MIN_VOLATILITY = 0.0005
 
 # === STRICT MODE PARAMETERS ===
-CONFIDENCE_MIN = 0.85
+CONFIDENCE_MIN = 0.80
 LOW_VOL_THRESHOLD = 0.0006
 LOW_VOL_CONFIDENCE = 0.85
 NEUTRAL_RSI_BAND = (45.0, 55.0)
@@ -228,8 +228,27 @@ def save_winner_biases(entries: List[Dict[str, Any]]) -> None:
 
 def build_learning_pattern_key(symbol: str, action: str, rsi_value: float, ema_value: float) -> str:
     return (
-        f"{symbol}|{action}|RSI:{round(float(rsi_value), 1)}|EMA:{round(float(ema_value), 1)}"
+        f"{symbol.upper()}|{action.upper()}|RSI:{round(float(rsi_value), 1)}|EMA:{round(float(ema_value), 1)}"
     )
+
+
+def is_similar_pattern(
+    current_signals: Dict[str, str],
+    stored_signals: Optional[Dict[str, Any]],
+) -> Tuple[int, int]:
+    if not isinstance(stored_signals, dict):
+        stored_signals = {}
+    matches = 0
+    considered = 0
+    for name, current_value in current_signals.items():
+        current_signal = str(current_value or "NONE").upper()
+        if current_signal == "NONE":
+            continue
+        stored_signal = str(stored_signals.get(name, "NONE") or "NONE").upper()
+        considered += 1
+        if stored_signal == current_signal:
+            matches += 1
+    return matches, considered
 
 
 def _normalize_learning_entry(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
@@ -253,6 +272,11 @@ def _normalize_learning_entry(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         weight_value = float(item.get("weight", 1.0))
         wins_row = int(item.get("wins_in_a_row", 0) or 0)
         losses_row = int(item.get("loss_streak", 0) or 0)
+        signals_raw = item.get("signals", {})
+        normalized_signals: Dict[str, str] = {}
+        if isinstance(signals_raw, dict):
+            for key, value in signals_raw.items():
+                normalized_signals[str(key)] = str(value or "NONE").upper()
     except (TypeError, ValueError):
         return None
     pattern_key = build_learning_pattern_key(symbol, action_value, rsi_value, ema_value)
@@ -269,6 +293,7 @@ def _normalize_learning_entry(item: Dict[str, Any]) -> Optional[Dict[str, Any]]:
         "wins_in_a_row": max(0, wins_row),
         "loss_streak": max(0, losses_row),
         "pattern_key": pattern_key,
+        "signals": normalized_signals,
     }
 
 
@@ -3045,6 +3070,7 @@ class TradingEngine:
         ema_spread: float,
         result: str,
         confidence_value: float,
+        signals_map: Optional[Dict[str, str]] = None,
     ) -> None:
         rounded_rsi = round(float(rsi_value), 1)
         rounded_ema = round(float(ema_spread), 1)
@@ -3059,6 +3085,12 @@ class TradingEngine:
             wins_row = int(existing.get("wins_in_a_row", 0) or 0)
             losses_row = int(existing.get("loss_streak", 0) or 0)
             weight_value = float(existing.get("weight", 1.0) or 1.0)
+        signals_snapshot: Dict[str, str] = {}
+        if isinstance(signals_map, dict):
+            signals_snapshot = {
+                str(key): str(value or "NONE").upper()
+                for key, value in signals_map.items()
+            }
         entry = {
             "symbol": symbol,
             "action": action,
@@ -3072,6 +3104,7 @@ class TradingEngine:
             "wins_in_a_row": wins_row,
             "loss_streak": losses_row,
             "pattern_key": pattern_key,
+            "signals": signals_snapshot,
         }
         self.learning_memory[pattern_key] = entry
         self._persist_learning_memory()
@@ -3083,6 +3116,7 @@ class TradingEngine:
         rsi_value: float,
         ema_spread: float,
         result: str,
+        signals_map: Optional[Dict[str, str]] = None,
     ) -> None:
         rounded_rsi = round(float(rsi_value), 1)
         rounded_ema = round(float(ema_spread), 1)
@@ -3100,6 +3134,11 @@ class TradingEngine:
             weight_value = max(1.0, weight_value - 0.3)
             entry["wins_in_a_row"] = 0
             entry["loss_streak"] = int(entry.get("loss_streak", 0) or 0) + 1
+        if isinstance(signals_map, dict):
+            entry["signals"] = {
+                str(key): str(value or "NONE").upper()
+                for key, value in signals_map.items()
+            }
         entry["weight"] = weight_value
         entry["result"] = normalized_result
         entry["timestamp"] = time.time()
@@ -4039,6 +4078,10 @@ class TradingEngine:
         entry_price = float(evaluation['entry_price'])
         signal_source = evaluation['signal_source']
         results: List[Tuple[str, StrategyResult]] = evaluation.get('results', [])
+        strategy_signals_map: Dict[str, str] = {
+            name: str(res.signal or "NONE").upper()
+            for name, res in results
+        }
         if 'stake' not in evaluation:
             evaluation['stake'] = self._calculate_kelly_stake(evaluation.get('predicted_probability', 0.5))
         stake_amount = float(max(0.1, evaluation.get('stake', self.trade_amount)))
@@ -4118,7 +4161,7 @@ class TradingEngine:
             final_action in {'CALL', 'PUT'}
             and base_action in {'CALL', 'PUT'}
             and final_action != base_action
-            and confidence_value < 0.85
+            and confidence_value < MIN_CONFIDENCE
         ):
             logging.info(
                 f"⚠️ Señal inconsistente: {base_action} vs {final_action} (conf={confidence_value:.2f}) → Cancelada"
@@ -4156,6 +4199,8 @@ class TradingEngine:
                     continue
                 if str(memory_entry.get('action', 'NONE')).upper() != final_action:
                     continue
+                if str(memory_entry.get('pattern_key', '')) == bias_pattern_key:
+                    continue
                 try:
                     stored_rsi = float(memory_entry.get('rsi', 0.0))
                     stored_ema = float(memory_entry.get('ema', 0.0))
@@ -4178,11 +4223,40 @@ class TradingEngine:
                     and ema_diff <= 10
                     and str(memory_entry.get('result', '')).upper() == 'WIN'
                 ):
-                    bonus = 0.20 * (1 - adjusted_confidence)
-                    adjusted_confidence = min(1.0, adjusted_confidence + bonus)
-                    logging.info(
-                        f"💾 Refuerzo por patrón ganador similar ({symbol}, {final_action}, RSI diff={rsi_diff:.2f}, EMA diff={ema_diff:.2f}) → Nueva confianza={adjusted_confidence:.2f}"
+                    match_count, considered = is_similar_pattern(
+                        strategy_signals_map, memory_entry.get('signals')
                     )
+                    total_reference = considered
+                    if total_reference <= 0:
+                        total_reference = sum(
+                            1 for value in strategy_signals_map.values() if value != 'NONE'
+                        )
+                    if total_reference <= 0:
+                        total_reference = max(
+                            1,
+                            len(
+                                {
+                                    key: value
+                                    for key, value in (memory_entry.get('signals') or {}).items()
+                                }
+                            ),
+                        )
+                    if match_count >= 5:
+                        bonus = 0.20 * (1 - adjusted_confidence)
+                        adjusted_confidence = min(1.0, adjusted_confidence + bonus)
+                        logging.info(
+                            f"✅ Strong match ({match_count}/{total_reference}) → full boost applied"
+                        )
+                    elif match_count >= 3:
+                        bonus = 0.10 * (1 - adjusted_confidence)
+                        adjusted_confidence = min(0.80, adjusted_confidence + bonus)
+                        logging.info(
+                            f"⚠️ Partial match ({match_count}/{total_reference}) → confidence capped at 0.80"
+                        )
+                    else:
+                        logging.info(
+                            f"❌ Weak match ({match_count}/{total_reference}) → pattern ignored"
+                        )
             confidence_value = float(adjusted_confidence)
             evaluation['final_confidence'] = confidence_value
         pattern_key = build_learning_pattern_key(
@@ -4200,17 +4274,45 @@ class TradingEngine:
             if result_flag == "LOSS":
                 logging.info("❌ LOSS pattern ignored.")
             elif result_flag == "WIN":
-                if age_seconds > 3600:
-                    logging.info(f"🟡 Old WIN bias applied ({age_seconds:.0f}s)")
-                else:
-                    logging.info(f"✅ Recent WIN bias applied ({age_seconds:.0f}s)")
-                streak = int(bias_entry.get("wins_in_a_row", 0) or 0)
-                confidence_boost = 0.2 if streak >= 2 else 0.1
-                confidence_boost = min(confidence_boost, 0.2)
-                if confidence_boost > 0:
+                stored_signals = bias_entry.get("signals")
+                match_count, considered = is_similar_pattern(
+                    strategy_signals_map, stored_signals
+                )
+                total_reference = considered
+                if total_reference <= 0:
+                    total_reference = sum(
+                        1 for value in strategy_signals_map.values() if value != 'NONE'
+                    )
+                if total_reference <= 0:
+                    total_reference = max(
+                        1,
+                        len({key: value for key, value in (stored_signals or {}).items()}),
+                    )
+                if match_count >= 5:
+                    if age_seconds > 3600:
+                        logging.info(f"🟡 Old WIN bias applied ({age_seconds:.0f}s)")
+                    else:
+                        logging.info(f"✅ Recent WIN bias applied ({age_seconds:.0f}s)")
+                    streak = int(bias_entry.get("wins_in_a_row", 0) or 0)
+                    confidence_boost = 0.2 if streak >= 2 else 0.1
+                    confidence_boost = min(confidence_boost, 0.2)
                     confidence_value = min(1.0, confidence_value + confidence_boost)
                     evaluation['final_confidence'] = confidence_value
-                    logging.info(f"🎯 Contextual boost +{confidence_boost:.2f} applied.")
+                    logging.info(
+                        f"✅ Strong match ({match_count}/{total_reference}) → full boost applied"
+                    )
+                elif match_count >= 3:
+                    streak = int(bias_entry.get("wins_in_a_row", 0) or 0)
+                    confidence_boost = 0.1 if streak >= 2 else 0.05
+                    confidence_value = min(0.80, confidence_value + confidence_boost)
+                    evaluation['final_confidence'] = confidence_value
+                    logging.info(
+                        f"⚠️ Partial match ({match_count}/{total_reference}) → confidence capped at 0.80"
+                    )
+                else:
+                    logging.info(
+                        f"❌ Weak match ({match_count}/{total_reference}) → pattern ignored"
+                    )
             else:
                 logging.info("❌ LOSS pattern ignored.")
         self.last_volatility = current_vol_reference
@@ -4392,6 +4494,7 @@ class TradingEngine:
                 ema_spread,
                 trade_result,
                 confidence_value,
+                strategy_signals_map,
             )
             self._update_learning_weights(
                 symbol,
@@ -4399,6 +4502,7 @@ class TradingEngine:
                 latest_rsi,
                 ema_spread,
                 trade_result,
+                strategy_signals_map,
             )
             result_info = {
                 "hora": datetime.now().strftime("%H:%M:%S"),
