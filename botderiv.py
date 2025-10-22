@@ -4068,107 +4068,91 @@ class TradingEngine:
             return
         self._cycle_id_counter += 1
         self._current_cycle_id = self._cycle_id_counter
-        evaluations: List[Dict[str, Any]] = []
-        confidence_lines: List[str] = []
         trade_executed = False
         symbols = list(SYMBOLS)
         def _cycle_pause(delay: float = 0.5) -> None:
             QtWidgets.QApplication.processEvents(QtCore.QEventLoop.AllEvents, 50)
             self._next_cycle_time = time.time() + delay
 
+        evaluations_found = False
+        min_required = auto_learn.get_min_confidence()
+
         for symbol in symbols:
             if not self.running.is_set():
                 break
             evaluation = self._evaluate_symbol(symbol)
-            if evaluation is not None:
-                probability = float(evaluation.get('predicted_probability', 0.5))
-                evaluation['stake'] = self._calculate_kelly_stake(probability)
-                confidence_lines.append(
-                    f"{symbol}: {float(evaluation.get('final_confidence', 0.0)):.2f}"
+            if evaluation is None:
+                continue
+            evaluations_found = True
+            probability = float(evaluation.get('predicted_probability', 0.5))
+            evaluation['stake'] = self._calculate_kelly_stake(probability)
+            if evaluation.get('confluence_confirmed'):
+                if self.confirm_and_execute(evaluation):
+                    trade_executed = True
+                    break
+
+            signal = evaluation.get('signal')
+            if signal not in {'CALL', 'PUT'}:
+                continue
+
+            is_strong = int(evaluation.get('strong', 0)) == 1
+            confidence_raw = evaluation.get('final_confidence')
+            confidence_value = float(confidence_raw) if confidence_raw is not None else 0.0
+            if not is_strong and confidence_value < min_required:
+                continue
+
+            volatility_value_raw = evaluation.get('volatility')
+            volatility_value: Optional[float] = None
+            if volatility_value_raw is not None:
+                try:
+                    volatility_value = float(volatility_value_raw)
+                except (TypeError, ValueError):
+                    volatility_value = None
+            volatility_display = f"{volatility_value:.4f}" if volatility_value is not None else "N/A"
+            logging.info(
+                f"📊 Final confidence {symbol}: {confidence_value:.2f} | Volatility: {volatility_display} | Action: {signal}"
+            )
+
+            aligned_total = int(
+                evaluation.get('aligned', evaluation.get('consensus', {}).get('aligned', 0))
+            )
+            min_confidence = CONFIDENCE_MIN
+            min_confluence = MIN_ALIGNED_STRATEGIES
+
+            if confidence_value < min_confidence:
+                logging.info(
+                    f"🚫 Trade skipped due to low confidence ({confidence_value:.2f} < {min_confidence:.2f})"
                 )
-                if evaluation.get('confluence_confirmed'):
-                    if self.confirm_and_execute(evaluation):
-                        trade_executed = True
-                        break
-                evaluations.append(evaluation)
-            if not self.running.is_set():
-                break
+                continue
+            if aligned_total < min_confluence:
+                logging.info(
+                    f"🚫 Trade skipped due to low confluence ({aligned_total}/{min_confluence})"
+                )
+                continue
+            if volatility_value is not None and volatility_value < MIN_VOLATILITY:
+                logging.info(
+                    f"🚫 Skipping trade on {symbol} due to low volatility ({volatility_value:.4f})"
+                )
+                continue
+
+            volatility_output = f"{volatility_value:.6f}" if volatility_value is not None else "N/A"
+            logging.info(
+                f"🚀 Executing trade on {symbol} | Confidence={confidence_value:.2f} | Confluence={aligned_total}/{min_confluence} | Volatility={volatility_output}"
+            )
+            self._execute_selected_trade(evaluation)
+            trade_executed = True
+            break
+
         if not self.running.is_set():
             _cycle_pause()
             return
         if trade_executed:
             _cycle_pause(0.75)
             return
-        if not evaluations:
+        if not evaluations_found:
             _cycle_pause()
             return
-        min_required = auto_learn.get_min_confidence()
-        strong_signal_count = sum(1 for item in evaluations if int(item.get('strong', 0)) == 1)
-        if strong_signal_count > 0:
-            candidates = [item for item in evaluations if int(item.get('strong', 0)) == 1]
-        else:
-            candidates = [
-                item
-                for item in evaluations
-                if item.get('signal') in {'CALL', 'PUT'}
-                and float(item.get('final_confidence', 0.0)) >= min_required
-            ]
-        if not candidates:
-            summary_line = " | ".join(confidence_lines)
-            if summary_line:
-                logging.info(f"{summary_line} → Selected: ninguno")
-            _cycle_pause()
-            return
-        selected = max(candidates, key=lambda item: float(item.get('final_confidence', 0.0)))
-        summary_line = " | ".join(confidence_lines)
-        selected_text = f"{selected['symbol']} ({float(selected['final_confidence']):.2f})"
-        if summary_line:
-            logging.info(f"{summary_line} → Selected: {selected_text} | strong={strong_signal_count}")
-        if selected.get('signal') not in {'CALL', 'PUT'}:
-            _cycle_pause()
-            return
-        if strong_signal_count == 0 and float(selected['final_confidence']) < min_required:
-            _cycle_pause()
-            return
-        confidence_value_raw = selected.get('final_confidence')
-        confidence_value = float(confidence_value_raw) if confidence_value_raw is not None else 0.0
-        volatility_value_raw = selected.get('volatility')
-        volatility_value: Optional[float] = None
-        if volatility_value_raw is not None:
-            try:
-                volatility_value = float(volatility_value_raw)
-            except (TypeError, ValueError):
-                volatility_value = None
-        volatility_display = f"{volatility_value:.4f}" if volatility_value is not None else "N/A"
-        logging.info(
-            f"📊 Final confidence {selected['symbol']}: {confidence_value:.2f} | Volatility: {volatility_display} | Action: {selected['signal']}"
-        )
-        aligned_total = int(
-            selected.get('aligned', selected.get('consensus', {}).get('aligned', 0))
-        )
-        min_confidence = CONFIDENCE_MIN
-        min_confluence = MIN_ALIGNED_STRATEGIES
-        confluence_value = aligned_total
-        if confidence_value < min_confidence:
-            logging.info(f"🚫 Trade skipped due to low confidence ({confidence_value:.2f} < {min_confidence:.2f})")
-            _cycle_pause()
-            return
-        if confluence_value < min_confluence:
-            logging.info(f"🚫 Trade skipped due to low confluence ({confluence_value}/{min_confluence})")
-            _cycle_pause()
-            return
-        if volatility_value is not None and volatility_value < MIN_VOLATILITY:
-            logging.info(
-                f"🚫 Skipping trade on {selected['symbol']} due to low volatility ({volatility_value:.4f})"
-            )
-            _cycle_pause()
-            return
-        volatility_output = f"{volatility_value:.6f}" if volatility_value is not None else "N/A"
-        logging.info(
-            f"🚀 Executing trade on {selected['symbol']} | Confidence={confidence_value:.2f} | Confluence={confluence_value}/{min_confluence} | Volatility={volatility_output}"
-        )
-        self._execute_selected_trade(selected)
-        _cycle_pause(0.75)
+        _cycle_pause()
         return
 
     def confirm_and_execute(self, evaluation: Dict[str, Any]) -> bool:
