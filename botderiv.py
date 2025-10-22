@@ -5249,7 +5249,7 @@ class BotWindow(QtWidgets.QWidget):
             caja_layout = QtWidgets.QVBoxLayout(caja)
             confianza = QtWidgets.QLabel("Confianza: -")
             activas = QtWidgets.QLabel(f"Estrategias activas: 0/{TOTAL_STRATEGY_COUNT}")
-            alineadas = QtWidgets.QLabel("Estrategias alineadas: 0/0")
+            alineadas = QtWidgets.QLabel(f"Estrategias alineadas: 0/{MIN_ALIGNED_STRATEGIES}")
             direccion = QtWidgets.QLabel("Dirección dominante: -")
             motivo = QtWidgets.QLabel("Motivo principal: -")
             motivo.setWordWrap(True)
@@ -5754,12 +5754,10 @@ class BotWindow(QtWidgets.QWidget):
         etiquetas['confidence'].setText(f"Confianza: {confianza_label} ({confianza_valor:.2f})")
         activos = int(data.get('active', 0))
         etiquetas['active'].setText(f"Estrategias activas: {activos}/{TOTAL_STRATEGY_COUNT}")
-        señales = int(data.get('signals', 0))
         alineadas = int(data.get('aligned', 0))
-        divisor = señales if señales else activos
-        if divisor <= 0:
-            divisor = 1
-        etiquetas['aligned'].setText(f"Estrategias alineadas: {alineadas}/{divisor}")
+        etiquetas['aligned'].setText(
+            f"Estrategias alineadas: {alineadas}/{MIN_ALIGNED_STRATEGIES}"
+        )
         direccion = str(data.get('signal', 'NONE'))
         if direccion == 'NONE':
             direccion = str(data.get('dominant', 'NONE'))
