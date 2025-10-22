@@ -4191,39 +4191,28 @@ class TradingEngine:
             latest_rsi_value,
             ema_spread_value,
         )
-        confidence_boost = 0.0
         current_vol_reference = float(getattr(self, "current_volatility", 0.0) or 0.0)
         bias_entry = self.learning_memory.get(pattern_key)
-        if (
-            bias_entry is not None
-            and str(bias_entry.get("result", "")).upper() == "WIN"
-        ):
+        if isinstance(bias_entry, dict):
             timestamp_value = float(bias_entry.get("timestamp", 0.0) or 0.0)
             age_seconds = time.time() - timestamp_value if timestamp_value else float("inf")
-            market_regime = str(evaluation.get("regime", "")).upper()
-            same_trend = (
-                (market_regime == "BULLISH" and final_action == "CALL")
-                or (market_regime == "BEARISH" and final_action == "PUT")
-            )
-            last_vol = getattr(self, "last_volatility", 0.0)
-            volatility_delta = abs(current_vol_reference - last_vol)
-            if age_seconds < 600:
-                if same_trend:
-                    confidence_boost += 0.1
-                if volatility_delta < 0.0003:
-                    confidence_boost += 0.05
-                if int(bias_entry.get("wins_in_a_row", 0) or 0) >= 2:
-                    confidence_boost += 0.05
+            result_flag = str(bias_entry.get("result", "")).upper()
+            if result_flag == "LOSS":
+                logging.info("❌ LOSS pattern ignored.")
+            elif result_flag == "WIN":
+                if age_seconds > 3600:
+                    logging.info(f"🟡 Old WIN bias applied ({age_seconds:.0f}s)")
+                else:
+                    logging.info(f"✅ Recent WIN bias applied ({age_seconds:.0f}s)")
+                streak = int(bias_entry.get("wins_in_a_row", 0) or 0)
+                confidence_boost = 0.2 if streak >= 2 else 0.1
                 confidence_boost = min(confidence_boost, 0.2)
                 if confidence_boost > 0:
-                    logging.info(
-                        f"🎯 Contextual boost +{confidence_boost:.2f} (trend={same_trend}, vol_diff={volatility_delta:.6f})"
-                    )
+                    confidence_value = min(1.0, confidence_value + confidence_boost)
+                    evaluation['final_confidence'] = confidence_value
+                    logging.info(f"🎯 Contextual boost +{confidence_boost:.2f} applied.")
             else:
-                logging.info(f"🧊 Bias too old ({age_seconds:.0f}s), no boost applied.")
-            if confidence_boost > 0:
-                confidence_value = min(1.0, confidence_value + confidence_boost)
-                evaluation['final_confidence'] = confidence_value
+                logging.info("❌ LOSS pattern ignored.")
         self.last_volatility = current_vol_reference
         min_confidence = CONFIDENCE_MIN
         min_confluence = MIN_ALIGNED_STRATEGIES
