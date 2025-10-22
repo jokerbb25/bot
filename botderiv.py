@@ -3520,7 +3520,7 @@ class TradingEngine:
             elif signal == 'NONE':
                 logging.info(f"Estrategias activas: {active_total}/{TOTAL_STRATEGY_COUNT}")
             else:
-                logging.info(f"Estrategias alineadas: {consensus['aligned']}/{signals_total}")
+                logging.info(f"Estrategias alineadas: {consensus['aligned']}/{MIN_ALIGNED_STRATEGIES}")
                 logging.info(f"Estrategias activas: {active_total}/{TOTAL_STRATEGY_COUNT}")
                 logging.info(
                     f"✅ Señal final: {signal} | Confianza {confidence:.2f} | Estrategias activas: {active_total}/{TOTAL_STRATEGY_COUNT}"
