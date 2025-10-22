@@ -4018,9 +4018,10 @@ class TradingEngine:
             return True
         symbol = evaluation.get('symbol', 'UNKNOWN')
         logging.info(
-            "🚫 High-confidence trade skipped for %s: insufficient confirmation (%d/3).",
+            "🚫 High-confidence trade skipped for %s: insufficient confirmation (%d/%d).",
             symbol,
             score,
+            MIN_ALIGNED_STRATEGIES,
         )
         return False
 
@@ -4083,7 +4084,7 @@ class TradingEngine:
                 probability = float(evaluation.get('predicted_probability', 0.5))
                 evaluation['stake'] = self._calculate_kelly_stake(probability)
                 confidence_lines.append(
-                    f"{symbol}: {float(evaluation.get('final_confidence', 0.0)):.2f} (p={probability:.2f})"
+                    f"{symbol}: {float(evaluation.get('final_confidence', 0.0)):.2f}"
                 )
                 if evaluation.get('confluence_confirmed'):
                     if self.confirm_and_execute(evaluation):
