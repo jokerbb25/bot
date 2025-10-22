@@ -3037,6 +3037,9 @@ class TradingEngine:
                 entry["volatility"] = float(volatility)
                 entry["regime"] = regime or entry.get("regime", "DESCONOCIDO")
                 entry["weight"] = float(entry.get("weight", 0.0) or 0.0) + weight_increment
+                entry["rsi_direction"] = self._classify_rsi_direction(rsi_value)
+                entry["ema_direction"] = self._classify_ema_direction(ema_spread)
+                entry["volatility_level"] = self._classify_volatility_level(volatility)
                 updated = True
                 break
         if not updated:
@@ -3051,6 +3054,9 @@ class TradingEngine:
                     "volatility": float(volatility),
                     "regime": regime or "DESCONOCIDO",
                     "weight": max(weight_increment, 1.0),
+                    "rsi_direction": self._classify_rsi_direction(rsi_value),
+                    "ema_direction": self._classify_ema_direction(ema_spread),
+                    "volatility_level": self._classify_volatility_level(volatility),
                 }
             )
         self.winner_biases.sort(key=lambda item: item.get("weight", 0.0), reverse=True)
@@ -3068,6 +3074,7 @@ class TradingEngine:
         action: str,
         rsi_value: float,
         ema_spread: float,
+        volatility: float,
         result: str,
         confidence_value: float,
         signals_map: Optional[Dict[str, str]] = None,
@@ -3077,6 +3084,12 @@ class TradingEngine:
         pattern_key = build_learning_pattern_key(symbol, action, rounded_rsi, rounded_ema)
         timestamp_value = time.time()
         normalized_result = result.upper()
+        volatility_value = float(volatility)
+        context_snapshot = self._build_context_snapshot(
+            rsi_value,
+            ema_spread,
+            volatility_value,
+        )
         existing = self.learning_memory.get(pattern_key)
         wins_row = 0
         losses_row = 0
@@ -3105,6 +3118,10 @@ class TradingEngine:
             "loss_streak": losses_row,
             "pattern_key": pattern_key,
             "signals": signals_snapshot,
+            "volatility": volatility_value,
+            "rsi_direction": context_snapshot['RSI_direction'],
+            "ema_direction": context_snapshot['EMA_direction'],
+            "volatility_level": context_snapshot['volatility_level'],
         }
         self.learning_memory[pattern_key] = entry
         self._persist_learning_memory()
@@ -3115,6 +3132,7 @@ class TradingEngine:
         action: str,
         rsi_value: float,
         ema_spread: float,
+        volatility: float,
         result: str,
         signals_map: Optional[Dict[str, str]] = None,
     ) -> None:
@@ -3126,6 +3144,7 @@ class TradingEngine:
             return
         weight_value = float(entry.get("weight", 1.0) or 1.0)
         normalized_result = result.upper()
+        volatility_value = float(volatility)
         if normalized_result == "WIN":
             weight_value += 1.0
             entry["wins_in_a_row"] = int(entry.get("wins_in_a_row", 0) or 0) + 1
@@ -3142,6 +3161,15 @@ class TradingEngine:
         entry["weight"] = weight_value
         entry["result"] = normalized_result
         entry["timestamp"] = time.time()
+        entry["volatility"] = volatility_value
+        context_snapshot = self._build_context_snapshot(
+            rsi_value,
+            ema_spread,
+            volatility_value,
+        )
+        entry["rsi_direction"] = context_snapshot['RSI_direction']
+        entry["ema_direction"] = context_snapshot['EMA_direction']
+        entry["volatility_level"] = context_snapshot['volatility_level']
         self.learning_memory[pattern_key] = entry
         self._persist_learning_memory()
 
@@ -3575,6 +3603,18 @@ class TradingEngine:
             rsi_signal = next((out.signal for name, out in results if name == 'RSI'), 'NONE')
             ema_signal = next((out.signal for name, out in results if name == 'EMA Trend'), 'NONE')
             macd_signal = 'CALL' if macd_value > 0 else 'PUT' if macd_value < 0 else 'NONE'
+            range_break_result = next(
+                (out for name, out in results if name == 'Range Breakout'),
+                None,
+            )
+            if range_break_result is not None:
+                range_break_signal = range_break_result.signal or 'NONE'
+            divergence_result = next(
+                (out for name, out in results if name == 'Divergence'),
+                None,
+            )
+            if divergence_result is not None:
+                divergence_signal = divergence_result.signal or 'NONE'
             ema_spread = ema_corto_valor - ema_largo_valor
             indicator_conf = auto_learn.calculate_confidence(
                 latest_rsi,
@@ -3596,6 +3636,15 @@ class TradingEngine:
             elif volatility_factor > 1.0:
                 indicator_conf *= volatility_factor
             indicator_conf = float(np.clip(indicator_conf, 0.0, 1.0))
+            ema50_series = ema(df['close'], 50, symbol)
+            ema50_current = (
+                float(ema50_series.iloc[-1]) if not ema50_series.empty else 0.0
+            )
+            ema50_previous = (
+                float(ema50_series.iloc[-2])
+                if len(ema50_series) > 1
+                else ema50_current
+            )
             evaluation.update(
                 {
                     'latest_rsi': latest_rsi,
@@ -3613,7 +3662,23 @@ class TradingEngine:
                     'latest_prices': df['close'].tail(5).tolist(),
                     'macd_signal': macd_signal,
                     'aligned': consensus['aligned'],
+                    'breakout_detected': bool(
+                        range_break_signal in {'CALL', 'PUT'}
+                    ),
+                    'breakout_signal': range_break_signal,
+                    'divergence_detected': bool(
+                        divergence_signal in {'CALL', 'PUT'}
+                    ),
+                    'divergence_signal': divergence_signal,
+                    'ema50_current': ema50_current,
+                    'ema50_previous': ema50_previous,
+                    'ema50_slope': ema50_current - ema50_previous,
                 }
+            )
+            evaluation['current_context'] = self._build_context_snapshot(
+                latest_rsi,
+                ema_spread,
+                smoothed_volatility,
             )
             self._latest_regime_inputs = {'symbol': symbol, 'ema_slope': ema_slope, 'boll_width': boll_width}
             regime = self.detect_market_regime(adx_value, boll_width, smoothed_volatility)
@@ -3843,6 +3908,152 @@ class TradingEngine:
                 primary_signals = []
             auto_learn.set_active_symbol(None)
 
+    @staticmethod
+    def _classify_rsi_direction(rsi_value: float) -> str:
+        try:
+            value = float(rsi_value)
+        except (TypeError, ValueError):
+            value = 0.0
+        if value > NEUTRAL_RSI_BAND[1]:
+            return 'UP'
+        if value < NEUTRAL_RSI_BAND[0]:
+            return 'DOWN'
+        return 'FLAT'
+
+    @staticmethod
+    def _classify_ema_direction(ema_spread: float) -> str:
+        try:
+            spread = float(ema_spread)
+        except (TypeError, ValueError):
+            spread = 0.0
+        if spread > 0:
+            return 'UP'
+        if spread < 0:
+            return 'DOWN'
+        return 'FLAT'
+
+    @staticmethod
+    def _classify_volatility_level(volatility: float) -> str:
+        try:
+            value = float(volatility)
+        except (TypeError, ValueError):
+            return 'UNKNOWN'
+        if value < MIN_VOLATILITY:
+            return 'LOW'
+        if value > 0.002:
+            return 'HIGH'
+        return 'MEDIUM'
+
+    def _build_context_snapshot(
+        self,
+        rsi_value: float,
+        ema_spread: float,
+        volatility: float,
+    ) -> Dict[str, str]:
+        return {
+            'RSI_direction': self._classify_rsi_direction(rsi_value),
+            'EMA_direction': self._classify_ema_direction(ema_spread),
+            'volatility_level': self._classify_volatility_level(volatility),
+        }
+
+    def _extract_pattern_context(
+        self,
+        entry: Dict[str, Any],
+        fallback_rsi: float,
+        fallback_ema: float,
+        fallback_volatility: float,
+    ) -> Dict[str, str]:
+        rsi_direction = entry.get('rsi_direction')
+        ema_direction = entry.get('ema_direction')
+        volatility_level = entry.get('volatility_level')
+        if not rsi_direction:
+            rsi_direction = self._classify_rsi_direction(fallback_rsi)
+        if not ema_direction:
+            ema_direction = self._classify_ema_direction(fallback_ema)
+        if not volatility_level:
+            volatility_level = self._classify_volatility_level(fallback_volatility)
+        return {
+            'RSI_direction': str(rsi_direction).upper(),
+            'EMA_direction': str(ema_direction).upper(),
+            'volatility_level': str(volatility_level).upper(),
+        }
+
+    @staticmethod
+    def _context_match_score(
+        pattern_context: Dict[str, str],
+        current_context: Dict[str, str],
+    ) -> int:
+        matches = 0
+        for key in ('RSI_direction', 'EMA_direction', 'volatility_level'):
+            pattern_value = str(pattern_context.get(key, '')).upper()
+            current_value = str(current_context.get(key, '')).upper()
+            if pattern_value and current_value and pattern_value == current_value:
+                matches += 1
+        return matches
+
+    def _passes_high_confidence_checks(
+        self,
+        evaluation: Dict[str, Any],
+        direction: str,
+    ) -> bool:
+        try:
+            confidence_value = float(evaluation.get('final_confidence', 0.0))
+        except (TypeError, ValueError):
+            confidence_value = 0.0
+        if confidence_value < 0.85:
+            return True
+        try:
+            latest_rsi = float(evaluation.get('latest_rsi', 0.0))
+        except (TypeError, ValueError):
+            latest_rsi = 0.0
+        breakout_signal = str(evaluation.get('breakout_signal', 'NONE')).upper()
+        divergence_signal = str(evaluation.get('divergence_signal', 'NONE')).upper()
+        rsi_outside_neutral = (
+            latest_rsi < NEUTRAL_RSI_BAND[0] or latest_rsi > NEUTRAL_RSI_BAND[1]
+        )
+        breakout_confirmed = breakout_signal == direction
+        divergence_confirmed = divergence_signal == direction
+        score = int(rsi_outside_neutral) + int(breakout_confirmed) + int(divergence_confirmed)
+        if score >= 2:
+            return True
+        symbol = evaluation.get('symbol', 'UNKNOWN')
+        logging.info(
+            "🚫 High-confidence trade skipped for %s: insufficient confirmation (%d/3).",
+            symbol,
+            score,
+        )
+        return False
+
+    def _is_macro_trend_aligned(
+        self,
+        evaluation: Dict[str, Any],
+        direction: str,
+    ) -> bool:
+        try:
+            ema_current = float(evaluation.get('ema50_current'))
+            ema_previous = float(evaluation.get('ema50_previous'))
+        except (TypeError, ValueError):
+            return True
+        slope = ema_current - ema_previous
+        evaluation['ema50_slope'] = slope
+        if direction == 'CALL' and slope <= 0:
+            symbol = evaluation.get('symbol', 'UNKNOWN')
+            logging.info(
+                "🚫 Trade skipped for %s: EMA50 slope %.6f opposes CALL direction.",
+                symbol,
+                slope,
+            )
+            return False
+        if direction == 'PUT' and slope >= 0:
+            symbol = evaluation.get('symbol', 'UNKNOWN')
+            logging.info(
+                "🚫 Trade skipped for %s: EMA50 slope %.6f opposes PUT direction.",
+                symbol,
+                slope,
+            )
+            return False
+        return True
+
     def scan_market(self) -> None:
         if not self.running.is_set():
             return
@@ -4024,6 +4235,11 @@ class TradingEngine:
                 )
                 skip_trade = True
                 pass
+            if not skip_trade:
+                if not self._passes_high_confidence_checks(evaluation, direction):
+                    skip_trade = True
+                elif not self._is_macro_trend_aligned(evaluation, direction):
+                    skip_trade = True
         except Exception as exc:
             logging.error(f"⚠️ Error in pre-trade validation for {symbol}: {exc}")
             skip_trade = True
@@ -4151,6 +4367,15 @@ class TradingEngine:
             return False
         confidence_value = float(combined_confidence) if combined_confidence is not None else 0.0
         latest_rsi_value = float(evaluation.get('latest_rsi', 0.0))
+        ema_spread_value = float(evaluation.get('ema_spread', 0.0))
+        current_context = evaluation.get('current_context')
+        if not isinstance(current_context, dict):
+            current_context = self._build_context_snapshot(
+                latest_rsi_value,
+                ema_spread_value,
+                evaluated_volatility,
+            )
+            evaluation['current_context'] = current_context
         aligned_strategies = int(
             evaluation.get('aligned', evaluation.get('consensus', {}).get('aligned', 0))
         )
@@ -4175,7 +4400,6 @@ class TradingEngine:
         if rsi_signal_eval == 'PUT' and ema_signal_eval == 'CALL':
             logging.info("🚫 Skipped: RSI PUT contradicts EMA CALL (conflict)")
             return False
-        ema_spread_value = float(evaluation.get('ema_spread', 0.0))
         context_key = f"{symbol}|{final_action}|RSI:{round(latest_rsi_value, 1)}|EMA:{round(ema_spread_value, 1)}"
         if final_action in {'CALL', 'PUT'}:
             current_rsi_rounded = round(latest_rsi_value, 1)
@@ -4223,6 +4447,25 @@ class TradingEngine:
                     and ema_diff <= 10
                     and str(memory_entry.get('result', '')).upper() == 'WIN'
                 ):
+                    stored_volatility = float(
+                        memory_entry.get('volatility', evaluated_volatility)
+                        or evaluated_volatility
+                    )
+                    pattern_context = self._extract_pattern_context(
+                        memory_entry,
+                        stored_rsi,
+                        stored_ema,
+                        stored_volatility,
+                    )
+                    context_matches = self._context_match_score(
+                        pattern_context,
+                        current_context,
+                    )
+                    if context_matches < 2:
+                        logging.info(
+                            f"❌ Context mismatch ({context_matches}/3) → pattern boost skipped"
+                        )
+                        continue
                     match_count, considered = is_similar_pattern(
                         strategy_signals_map, memory_entry.get('signals')
                     )
@@ -4275,46 +4518,75 @@ class TradingEngine:
                 logging.info("❌ LOSS pattern ignored.")
             elif result_flag == "WIN":
                 stored_signals = bias_entry.get("signals")
-                match_count, considered = is_similar_pattern(
-                    strategy_signals_map, stored_signals
+                stored_rsi_bias = float(
+                    bias_entry.get('rsi', latest_rsi_value) or latest_rsi_value
                 )
-                total_reference = considered
-                if total_reference <= 0:
-                    total_reference = sum(
-                        1 for value in strategy_signals_map.values() if value != 'NONE'
-                    )
-                if total_reference <= 0:
-                    total_reference = max(
-                        1,
-                        len({key: value for key, value in (stored_signals or {}).items()}),
-                    )
-                if match_count >= 5:
-                    if age_seconds > 3600:
-                        logging.info(f"🟡 Old WIN bias applied ({age_seconds:.0f}s)")
-                    else:
-                        logging.info(f"✅ Recent WIN bias applied ({age_seconds:.0f}s)")
-                    streak = int(bias_entry.get("wins_in_a_row", 0) or 0)
-                    confidence_boost = 0.2 if streak >= 2 else 0.1
-                    confidence_boost = min(confidence_boost, 0.2)
-                    confidence_value = min(1.0, confidence_value + confidence_boost)
-                    evaluation['final_confidence'] = confidence_value
+                stored_ema_bias = float(
+                    bias_entry.get('ema', ema_spread_value) or ema_spread_value
+                )
+                stored_volatility_bias = float(
+                    bias_entry.get('volatility', current_vol_reference)
+                    or current_vol_reference
+                )
+                pattern_context = self._extract_pattern_context(
+                    bias_entry,
+                    stored_rsi_bias,
+                    stored_ema_bias,
+                    stored_volatility_bias,
+                )
+                context_matches = self._context_match_score(
+                    pattern_context,
+                    current_context,
+                )
+                if context_matches < 2:
                     logging.info(
-                        f"✅ Strong match ({match_count}/{total_reference}) → full boost applied"
-                    )
-                elif match_count >= 3:
-                    streak = int(bias_entry.get("wins_in_a_row", 0) or 0)
-                    confidence_boost = 0.1 if streak >= 2 else 0.05
-                    confidence_value = min(0.80, confidence_value + confidence_boost)
-                    evaluation['final_confidence'] = confidence_value
-                    logging.info(
-                        f"⚠️ Partial match ({match_count}/{total_reference}) → confidence capped at 0.80"
+                        f"❌ Context mismatch ({context_matches}/3) → bias boost skipped"
                     )
                 else:
-                    logging.info(
-                        f"❌ Weak match ({match_count}/{total_reference}) → pattern ignored"
+                    match_count, considered = is_similar_pattern(
+                        strategy_signals_map, stored_signals
                     )
+                    total_reference = considered
+                    if total_reference <= 0:
+                        total_reference = sum(
+                            1 for value in strategy_signals_map.values() if value != 'NONE'
+                        )
+                    if total_reference <= 0:
+                        total_reference = max(
+                            1,
+                            len({key: value for key, value in (stored_signals or {}).items()}),
+                        )
+                    if match_count >= 5:
+                        if age_seconds > 3600:
+                            logging.info(f"🟡 Old WIN bias applied ({age_seconds:.0f}s)")
+                        else:
+                            logging.info(f"✅ Recent WIN bias applied ({age_seconds:.0f}s)")
+                        streak = int(bias_entry.get("wins_in_a_row", 0) or 0)
+                        confidence_boost = 0.2 if streak >= 2 else 0.1
+                        confidence_boost = min(confidence_boost, 0.2)
+                        confidence_value = min(1.0, confidence_value + confidence_boost)
+                        evaluation['final_confidence'] = confidence_value
+                        logging.info(
+                            f"✅ Strong match ({match_count}/{total_reference}) → full boost applied"
+                        )
+                    elif match_count >= 3:
+                        streak = int(bias_entry.get("wins_in_a_row", 0) or 0)
+                        confidence_boost = 0.1 if streak >= 2 else 0.05
+                        confidence_value = min(0.80, confidence_value + confidence_boost)
+                        evaluation['final_confidence'] = confidence_value
+                        logging.info(
+                            f"⚠️ Partial match ({match_count}/{total_reference}) → confidence capped at 0.80"
+                        )
+                    else:
+                        logging.info(
+                            f"❌ Weak match ({match_count}/{total_reference}) → pattern ignored"
+                        )
             else:
                 logging.info("❌ LOSS pattern ignored.")
+        if not self._passes_high_confidence_checks(evaluation, final_action):
+            return False
+        if not self._is_macro_trend_aligned(evaluation, final_action):
+            return False
         self.last_volatility = current_vol_reference
         min_confidence = CONFIDENCE_MIN
         min_confluence = MIN_ALIGNED_STRATEGIES
@@ -4492,6 +4764,7 @@ class TradingEngine:
                 signal,
                 latest_rsi,
                 ema_spread,
+                volatilidad_actual,
                 trade_result,
                 confidence_value,
                 strategy_signals_map,
@@ -4501,6 +4774,7 @@ class TradingEngine:
                 signal,
                 latest_rsi,
                 ema_spread,
+                volatilidad_actual,
                 trade_result,
                 strategy_signals_map,
             )
