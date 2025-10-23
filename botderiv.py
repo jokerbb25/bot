@@ -5364,32 +5364,6 @@ class BotWindow(QtWidgets.QWidget):
         monto_layout.addStretch()
         vbox.addLayout(monto_layout)
 
-        self.strategy_group = QtWidgets.QGroupBox("Active Strategies")
-        self.strategy_layout = QtWidgets.QVBoxLayout()
-        self.strategy_group.setLayout(self.strategy_layout)
-        self.chk_rsi = QtWidgets.QCheckBox("RSI")
-        self.chk_ema = QtWidgets.QCheckBox("EMA")
-        self.chk_boll = QtWidgets.QCheckBox("Bollinger")
-        self.chk_adx = QtWidgets.QCheckBox("ADX")
-        self.chk_macd = QtWidgets.QCheckBox("MACD")
-        self.chk_candle = QtWidgets.QCheckBox("Candle Momentum")
-        toggle_states = self.engine.get_strategy_states()
-        toggles: List[Tuple[str, QtWidgets.QCheckBox, str]] = [
-            ('RSI', self.chk_rsi, self._primary_strategy_aliases['RSI']),
-            ('EMA', self.chk_ema, self._primary_strategy_aliases['EMA']),
-            ('Bollinger', self.chk_boll, self._primary_strategy_aliases['Bollinger']),
-            ('ADX', self.chk_adx, self._primary_strategy_aliases['ADX']),
-            ('MACD', self.chk_macd, self._primary_strategy_aliases['MACD']),
-            ('Candle', self.chk_candle, self._primary_strategy_aliases['Candle']),
-        ]
-        self.strategy_states.clear()
-        for alias, checkbox, strategy_name in toggles:
-            checkbox.setChecked(toggle_states.get(strategy_name, True))
-            checkbox.stateChanged.connect(lambda state, n=strategy_name: self._handle_strategy_toggle(n, state))
-            self.strategy_layout.addWidget(checkbox)
-            self.strategy_states[alias] = checkbox
-        vbox.addWidget(self.strategy_group)
-
         stats_group = QtWidgets.QGroupBox("Desempeño")
         stats_layout = QtWidgets.QGridLayout(stats_group)
         labels = [
