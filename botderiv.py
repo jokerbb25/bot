@@ -2967,6 +2967,8 @@ class TradingEngine:
         self._telegram_thread: Optional[threading.Thread] = None
         self.telegram_bot = telegram_bot
         self.last_volatility: float = 0.0
+        self._keepalive_thread: Optional[threading.Thread] = None
+        self.failed_candle_count = 0
 
     def add_trade_listener(self, callback: Callable[[TradeRecord, Dict[str, float]], None]) -> None:
         self._trade_listeners.append(callback)
@@ -3188,6 +3190,37 @@ class TradingEngine:
         except Exception as exc:
             logging.error(f"❌ Error starting background services: {exc}")
 
+    def _silent_keepalive_ping(self) -> None:
+        """Silently keep the Deriv WebSocket alive."""
+        import json
+        import time
+
+        while True:
+            try:
+                socket = getattr(self.api, "socket", None)
+                if socket is not None and getattr(socket, "connected", False):
+                    socket.send(json.dumps({"ping": 1}))
+                else:
+                    self.api.connect()
+            except Exception:
+                try:
+                    self.api.connect()
+                except Exception:
+                    pass
+            time.sleep(90)
+
+    def save_learning_data(self) -> None:
+        try:
+            self.aprendizaje.save_data()
+        except Exception:
+            pass
+
+    def save_learning_memory(self) -> None:
+        try:
+            self._persist_learning_memory()
+        except Exception:
+            pass
+
     def start_engine(self) -> None:
         global operation_active
         if self.running.is_set():
@@ -3196,6 +3229,12 @@ class TradingEngine:
         self._notify_status("connecting")
         try:
             self.api.connect()
+            if self._keepalive_thread is None or not self._keepalive_thread.is_alive():
+                self._keepalive_thread = threading.Thread(
+                    target=self._silent_keepalive_ping,
+                    daemon=True,
+                )
+                self._keepalive_thread.start()
             try:
                 send_telegram_message("🤖 Bot iniciado correctamente y conectado a Deriv")
             except Exception:
@@ -3495,7 +3534,28 @@ class TradingEngine:
                 candles = self.api.fetch_candles(symbol)
             except Exception as exc:
                 logging.warning(f"Error al obtener velas de {symbol}: {exc}")
-                return None
+                candles = []
+            candle_data = candles
+            import os, sys, time
+
+            failed_candle_count = getattr(self, "failed_candle_count", 0)
+            if not candle_data or "Error" in str(candle_data):
+                self.failed_candle_count = failed_candle_count + 1
+            else:
+                self.failed_candle_count = 0
+            if self.failed_candle_count >= 4:
+                logging.error("❌ 4 consecutive candle fetch errors — triggering safe restart")
+                try:
+                    self.save_learning_data()
+                    self.save_learning_memory()
+                    send_telegram_message(
+                        "⚠️ Error de conexión detectado en los 4 símbolos.\n♻️ Reinicio automático del bot ejecutado correctamente."
+                    )
+                except Exception as e:
+                    logging.error(f"Error during pre-restart saving: {e}")
+
+                time.sleep(2)
+                os.execl(sys.executable, sys.executable, *sys.argv)
             if not candles:
                 logging.warning(f"Sin velas disponibles para {symbol}, se omite del ciclo")
                 return None
