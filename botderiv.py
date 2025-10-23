@@ -4189,7 +4189,8 @@ class TradingEngine:
                     continue
                 simple_key = None
                 normalized_name = str(name).strip().upper()
-                normalized_signal = outcome.normalized_signal()
+                raw_signal = getattr(outcome, 'signal', None)
+                normalized_signal = str(raw_signal or 'NONE').strip().upper()
                 if 'ADX' in normalized_name:
                     simple_key = 'ADX'
                     metadata = getattr(outcome, 'metadata', {}) or {}
