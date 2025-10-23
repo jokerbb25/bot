@@ -61,7 +61,7 @@ MAX_DAILY_PROFIT = 100.0
 COOLDOWN_AFTER_LOSS = 60
 MAX_DRAWDOWN = -150.0
 MIN_TRADE_CONFIDENCE = 0.45
-MIN_CONFIDENCE = 0.80
+MIN_CONFIDENCE = 0.75
 MIN_VOLATILITY = 0.0005
 
 # === STRICT MODE PARAMETERS ===
@@ -4074,7 +4074,7 @@ class TradingEngine:
             confidence_value = float(evaluation.get('final_confidence', 0.0))
         except (TypeError, ValueError):
             confidence_value = 0.0
-        if confidence_value < 0.85:
+        if confidence_value < MIN_CONFIDENCE:
             return True
         try:
             latest_rsi = float(evaluation.get('latest_rsi', 0.0))
@@ -4317,7 +4317,7 @@ class TradingEngine:
             final_snapshot = 1.0
         else:
             final_snapshot = float(np.clip(final_snapshot, 0.0, 0.95))
-        consensus_snapshot['confidence_label'] = 'Alta' if final_snapshot >= 0.85 else 'Media'
+        consensus_snapshot['confidence_label'] = 'Alta' if final_snapshot >= MIN_CONFIDENCE else 'Media'
         consensus_snapshot['confidence'] = final_snapshot
         consensus_snapshot['main_reason'] = 'multi-confirmation'
         consensus_snapshot['override'] = True
