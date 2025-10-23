@@ -20,7 +20,7 @@ import numpy as np
 import pandas as pd
 import requests
 from ta.momentum import RSIIndicator
-from ta.trend import EMAIndicator, SMAIndicator
+from ta.trend import EMAIndicator, SMAIndicator, ADXIndicator, MACD
 from ta.volatility import BollingerBands, AverageTrueRange
 from sklearn.linear_model import LogisticRegression
 from sklearn.ensemble import RandomForestClassifier
@@ -2178,6 +2178,90 @@ def strategy_range_breakout(df: pd.DataFrame) -> StrategyResult:
     return StrategyResult('NONE', 0.0, ['Sin ruptura relevante'], extra)
 
 
+def strategy_adx(df: pd.DataFrame) -> StrategyResult:
+    if len(df) < 20:
+        return StrategyResult('NONE', 0.0, ['ADX sin datos suficientes'], {'adx': None})
+    try:
+        adx_indicator = ADXIndicator(df['high'], df['low'], df['close'], window=14, fillna=False)
+        adx_series = adx_indicator.adx()
+        plus_di_series = adx_indicator.adx_pos()
+        minus_di_series = adx_indicator.adx_neg()
+        last_adx = float(np.nan_to_num(adx_series.iloc[-1], nan=0.0))
+        last_plus = float(np.nan_to_num(plus_di_series.iloc[-1], nan=0.0))
+        last_minus = float(np.nan_to_num(minus_di_series.iloc[-1], nan=0.0))
+    except Exception as exc:
+        return StrategyResult('NONE', 0.0, [f"ADX error: {exc}"], {'adx': None})
+    extra = {
+        'adx': last_adx,
+        'plus_di': last_plus,
+        'minus_di': last_minus,
+    }
+    if last_adx > 25 and last_plus > last_minus:
+        return StrategyResult('CALL', 1.4, [f"ADX {last_adx:.2f} strong uptrend"], {**extra, 'strong_call': True})
+    if last_adx > 25 and last_minus > last_plus:
+        return StrategyResult('PUT', -1.4, [f"ADX {last_adx:.2f} strong downtrend"], {**extra, 'strong_put': True})
+    return StrategyResult('NONE', 0.0, [f"ADX {last_adx:.2f} weak or mixed trend"], extra)
+
+
+def strategy_macd(df: pd.DataFrame) -> StrategyResult:
+    if len(df) < 26:
+        return StrategyResult('NONE', 0.0, ['MACD sin datos suficientes'], {'macd': None, 'signal': None})
+    try:
+        macd_indicator = MACD(df['close'], window_slow=26, window_fast=12, window_sign=9, fillna=False)
+        macd_line = float(np.nan_to_num(macd_indicator.macd().iloc[-1], nan=0.0))
+        signal_line = float(np.nan_to_num(macd_indicator.macd_signal().iloc[-1], nan=0.0))
+        histogram = float(np.nan_to_num(macd_indicator.macd_diff().iloc[-1], nan=0.0))
+    except Exception as exc:
+        return StrategyResult('NONE', 0.0, [f"MACD error: {exc}"], {'macd': None, 'signal': None})
+    extra = {
+        'macd': macd_line,
+        'signal': signal_line,
+        'histogram': histogram,
+    }
+    if macd_line > signal_line:
+        return StrategyResult('CALL', 1.3, ['MACD above signal line → bullish momentum'], extra)
+    if macd_line < signal_line:
+        return StrategyResult('PUT', -1.3, ['MACD below signal line → bearish momentum'], extra)
+    return StrategyResult('NONE', 0.0, ['MACD neutral'], extra)
+
+
+def strategy_candle_momentum(df: pd.DataFrame) -> StrategyResult:
+    if len(df) < 2:
+        return StrategyResult('NONE', 0.0, ['Candle momentum sin datos suficientes'], {})
+    try:
+        last_candle = df.iloc[-1]
+    except Exception as exc:
+        return StrategyResult('NONE', 0.0, [f"Candle error: {exc}"], {})
+    body = float(abs(last_candle['close'] - last_candle['open']))
+    high = float(last_candle['high'])
+    low = float(last_candle['low'])
+    range_candle = float(high - low)
+    if range_candle <= 0:
+        return StrategyResult('NONE', 0.0, ['Candle momentum sin rango definido'], {'body_ratio': 0.0})
+    upper_wick = float(high - max(last_candle['close'], last_candle['open']))
+    lower_wick = float(min(last_candle['close'], last_candle['open']) - low)
+    body_ratio = body / range_candle
+    extra = {
+        'body_ratio': body_ratio,
+        'upper_wick': upper_wick,
+        'lower_wick': lower_wick,
+        'range': range_candle,
+    }
+    if (
+        last_candle['close'] > last_candle['open']
+        and body_ratio > 0.6
+        and upper_wick < body * 0.2
+    ):
+        return StrategyResult('CALL', 1.1, ['Strong bullish candle momentum'], {**extra, 'direction': 'bullish'})
+    if (
+        last_candle['close'] < last_candle['open']
+        and body_ratio > 0.6
+        and lower_wick < body * 0.2
+    ):
+        return StrategyResult('PUT', -1.1, ['Strong bearish candle momentum'], {**extra, 'direction': 'bearish'})
+    return StrategyResult('NONE', 0.0, ['Low momentum or indecision'], extra)
+
+
 def strategy_divergence(df: pd.DataFrame) -> StrategyResult:
     if len(df) < 12:
         return StrategyResult('NONE', 0.0, ['Divergencias sin datos suficientes'], {})
@@ -2210,6 +2294,9 @@ STRATEGY_FUNCTIONS: List[Tuple[str, Callable[[pd.DataFrame], StrategyResult]]] =
     ('RSI', strategy_rsi),
     ('EMA Trend', strategy_ema_trend),
     ('Bollinger Rebound', strategy_bollinger_rebound),
+    ('ADX', strategy_adx),
+    ('MACD', strategy_macd),
+    ('Candle Momentum', strategy_candle_momentum),
     ('Pullback', strategy_pullback),
     ('Range Breakout', strategy_range_breakout),
 ]
@@ -2218,6 +2305,9 @@ STRATEGY_WEIGHTS: Dict[str, float] = {
     'RSI': 2.3,
     'EMA Trend': 1.8,
     'Bollinger Rebound': 1.4,
+    'ADX': 1.6,
+    'MACD': 1.7,
+    'Candle Momentum': 1.2,
     'Pullback': 1.1,
     'Range Breakout': 1.0,
     'Divergence': 1.7,
@@ -2232,6 +2322,9 @@ STRATEGY_DISPLAY_NAMES: Dict[str, str] = {
     'RSI': 'RSI',
     'EMA Trend': 'Tendencia EMA',
     'Bollinger Rebound': 'Rebote Bollinger',
+    'ADX': 'ADX',
+    'MACD': 'MACD',
+    'Candle Momentum': 'Candle Momentum',
     'Pullback': 'Pullback',
     'Range Breakout': 'Ruptura de rango',
     'Divergence': 'Divergencia',
@@ -3535,6 +3628,9 @@ class TradingEngine:
         rsi_signal = 'NONE'
         ema_signal = 'NONE'
         bollinger_signal = 'NONE'
+        adx_signal = 'NONE'
+        macd_signal = 'NONE'
+        candle_signal = 'NONE'
         pullback_signal = 'NONE'
         range_break_signal = 'NONE'
         divergence_signal = 'NONE'
@@ -3676,7 +3772,30 @@ class TradingEngine:
             macd_value = auto_learn.calculate_macd(df['close'].values)
             rsi_signal = next((out.signal for name, out in results if name == 'RSI'), 'NONE')
             ema_signal = next((out.signal for name, out in results if name == 'EMA Trend'), 'NONE')
-            macd_signal = 'CALL' if macd_value > 0 else 'PUT' if macd_value < 0 else 'NONE'
+            bollinger_result = next(
+                (out for name, out in results if name == 'Bollinger Rebound'),
+                None,
+            )
+            if bollinger_result is not None:
+                bollinger_signal = bollinger_result.signal or 'NONE'
+            adx_result = next(
+                (out for name, out in results if name == 'ADX'),
+                None,
+            )
+            if adx_result is not None:
+                adx_signal = adx_result.signal or 'NONE'
+            macd_result = next(
+                (out for name, out in results if name == 'MACD'),
+                None,
+            )
+            if macd_result is not None:
+                macd_signal = macd_result.signal or 'NONE'
+            candle_result = next(
+                (out for name, out in results if name == 'Candle Momentum'),
+                None,
+            )
+            if candle_result is not None:
+                candle_signal = candle_result.signal or 'NONE'
             range_break_result = next(
                 (out for name, out in results if name == 'Range Breakout'),
                 None,
@@ -3735,6 +3854,9 @@ class TradingEngine:
                     'primary_signals': primary_signals,
                     'latest_prices': df['close'].tail(5).tolist(),
                     'macd_signal': macd_signal,
+                    'bollinger_signal': bollinger_signal,
+                    'adx_signal': adx_signal,
+                    'candle_signal': candle_signal,
                     'aligned': consensus['aligned'],
                     'breakout_detected': bool(
                         range_break_signal in {'CALL', 'PUT'}
@@ -3970,6 +4092,12 @@ class TradingEngine:
                 pullback_signal = 'NONE'
             if bollinger_signal is None:
                 bollinger_signal = 'NONE'
+            if adx_signal is None:
+                adx_signal = 'NONE'
+            if macd_signal is None:
+                macd_signal = 'NONE'
+            if candle_signal is None:
+                candle_signal = 'NONE'
             if divergence_signal is None:
                 divergence_signal = 'NONE'
             if range_break_signal is None:
@@ -5149,6 +5277,15 @@ class BotWindow(QtWidgets.QWidget):
             "accuracy": 0.0,
         }
         self.strategy_checkboxes: Dict[str, QtWidgets.QCheckBox] = {}
+        self.strategy_states: Dict[str, QtWidgets.QCheckBox] = {}
+        self._primary_strategy_aliases: Dict[str, str] = {
+            'RSI': 'RSI',
+            'EMA': 'EMA Trend',
+            'Bollinger': 'Bollinger Rebound',
+            'ADX': 'ADX',
+            'MACD': 'MACD',
+            'Candle': 'Candle Momentum',
+        }
         self.asset_summary_labels: Dict[str, Dict[str, QtWidgets.QLabel]] = {}
         self.auto_shutdown_active = False
         self.history_accuracy_labels: Dict[str, QtWidgets.QLabel] = {}
@@ -5227,6 +5364,32 @@ class BotWindow(QtWidgets.QWidget):
         monto_layout.addStretch()
         vbox.addLayout(monto_layout)
 
+        self.strategy_group = QtWidgets.QGroupBox("Active Strategies")
+        self.strategy_layout = QtWidgets.QVBoxLayout()
+        self.strategy_group.setLayout(self.strategy_layout)
+        self.chk_rsi = QtWidgets.QCheckBox("RSI")
+        self.chk_ema = QtWidgets.QCheckBox("EMA")
+        self.chk_boll = QtWidgets.QCheckBox("Bollinger")
+        self.chk_adx = QtWidgets.QCheckBox("ADX")
+        self.chk_macd = QtWidgets.QCheckBox("MACD")
+        self.chk_candle = QtWidgets.QCheckBox("Candle Momentum")
+        toggle_states = self.engine.get_strategy_states()
+        toggles: List[Tuple[str, QtWidgets.QCheckBox, str]] = [
+            ('RSI', self.chk_rsi, self._primary_strategy_aliases['RSI']),
+            ('EMA', self.chk_ema, self._primary_strategy_aliases['EMA']),
+            ('Bollinger', self.chk_boll, self._primary_strategy_aliases['Bollinger']),
+            ('ADX', self.chk_adx, self._primary_strategy_aliases['ADX']),
+            ('MACD', self.chk_macd, self._primary_strategy_aliases['MACD']),
+            ('Candle', self.chk_candle, self._primary_strategy_aliases['Candle']),
+        ]
+        self.strategy_states.clear()
+        for alias, checkbox, strategy_name in toggles:
+            checkbox.setChecked(toggle_states.get(strategy_name, True))
+            checkbox.stateChanged.connect(lambda state, n=strategy_name: self._handle_strategy_toggle(n, state))
+            self.strategy_layout.addWidget(checkbox)
+            self.strategy_states[alias] = checkbox
+        vbox.addWidget(self.strategy_group)
+
         stats_group = QtWidgets.QGroupBox("Desempeño")
         stats_layout = QtWidgets.QGridLayout(stats_group)
         labels = [
@@ -5273,6 +5436,9 @@ class BotWindow(QtWidgets.QWidget):
             'RSI': 'RSI extremo → busca sobreventa (<30) o sobrecompra (>70)',
             'EMA Trend': 'Cruce de EMA → confirmar dirección de corto contra largo plazo',
             'Bollinger Rebound': 'Rebote Bollinger → aprovechar extremos con impulso del RSI',
+            'ADX': 'ADX → evaluar fortaleza direccional mediante +DI y -DI',
+            'MACD': 'MACD → seguir momentum por cruce de línea y señal',
+            'Candle Momentum': 'Candle Momentum → detectar velas de impulso dominante',
             'Pullback': 'Pullback → retroceso controlado con recuperación del RSI',
             'Range Breakout': 'Ruptura de rango → validar cierres sobre resistencia o bajo soporte',
             'Divergence': 'Divergencia → alerta cuando el RSI contradice al precio',
@@ -5282,6 +5448,9 @@ class BotWindow(QtWidgets.QWidget):
             'RSI': 'RSI',
             'EMA Trend': 'Tendencia EMA',
             'Bollinger Rebound': 'Rebote Bollinger',
+            'ADX': 'ADX',
+            'MACD': 'MACD',
+            'Candle Momentum': 'Candle Momentum',
             'Pullback': 'Pullback',
             'Range Breakout': 'Ruptura',
             'Divergence': 'Divergencia',
@@ -5568,6 +5737,19 @@ class BotWindow(QtWidgets.QWidget):
     def _handle_strategy_toggle(self, name: str, state: int) -> None:
         enabled = state == QtCore.Qt.Checked
         self.engine.set_strategy_state(name, enabled)
+        alias = next(
+            (alias for alias, strategy_name in self._primary_strategy_aliases.items() if strategy_name == name),
+            None,
+        )
+        if alias is not None:
+            checkbox = self.strategy_states.get(alias)
+            if checkbox is not None and checkbox.isChecked() != enabled:
+                blocker = QtCore.QSignalBlocker(checkbox)
+                checkbox.setChecked(enabled)
+        checkbox = self.strategy_checkboxes.get(name)
+        if checkbox is not None and checkbox.isChecked() != enabled:
+            blocker = QtCore.QSignalBlocker(checkbox)
+            checkbox.setChecked(enabled)
         self._save_strategy_config()
 
     def _update_auto_shutdown(self) -> None:
@@ -5868,6 +6050,14 @@ class BotWindow(QtWidgets.QWidget):
         states = self.engine.get_strategy_states()
         for name, checkbox in self.strategy_checkboxes.items():
             desired = states.get(name, True)
+            if checkbox.isChecked() != desired:
+                blocker = QtCore.QSignalBlocker(checkbox)
+                checkbox.setChecked(desired)
+        for alias, strategy_name in self._primary_strategy_aliases.items():
+            checkbox = self.strategy_states.get(alias)
+            if checkbox is None:
+                continue
+            desired = states.get(strategy_name, True)
             if checkbox.isChecked() != desired:
                 blocker = QtCore.QSignalBlocker(checkbox)
                 checkbox.setChecked(desired)
