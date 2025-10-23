@@ -3631,6 +3631,7 @@ class TradingEngine:
         adx_signal = 'NONE'
         macd_signal = 'NONE'
         candle_signal = 'NONE'
+        adx_last_value = None
         pullback_signal = 'NONE'
         range_break_signal = 'NONE'
         divergence_signal = 'NONE'
@@ -3784,6 +3785,14 @@ class TradingEngine:
             )
             if adx_result is not None:
                 adx_signal = adx_result.signal or 'NONE'
+                adx_meta = getattr(adx_result, 'metadata', {}) or {}
+                if adx_meta and adx_last_value is None:
+                    raw_adx_value = adx_meta.get('adx')
+                    if raw_adx_value is not None:
+                        try:
+                            adx_last_value = float(raw_adx_value)
+                        except (TypeError, ValueError):
+                            adx_last_value = None
             macd_result = next(
                 (out for name, out in results if name == 'MACD'),
                 None,
@@ -3846,6 +3855,7 @@ class TradingEngine:
                     'volatility': smoothed_volatility,
                     'indicator_confidence': indicator_conf,
                     'adx': adx_value,
+                    'adx_last_value': adx_last_value,
                     'macd': macd_value,
                     'rsi_signal': rsi_signal,
                     'ema_signal': ema_signal,
@@ -4158,6 +4168,77 @@ class TradingEngine:
             'volatility_level': self._classify_volatility_level(volatility),
         }
 
+
+    
+    def _passes_confluence_validation(self, evaluation: Dict[str, Any]) -> bool:
+        symbol = evaluation.get('symbol', 'UNKNOWN')
+        try:
+            results = evaluation.get('results', []) or []
+            signals_map: Dict[str, str] = {}
+            last_adx_value = evaluation.get('adx_last_value', evaluation.get('adx'))
+            if last_adx_value is not None:
+                try:
+                    last_adx_value = float(last_adx_value)
+                except (TypeError, ValueError):
+                    last_adx_value = None
+            adx_signal = str(evaluation.get('adx_signal', 'NONE') or 'NONE').upper()
+            macd_signal = str(evaluation.get('macd_signal', 'NONE') or 'NONE').upper()
+            candle_signal = str(evaluation.get('candle_signal', 'NONE') or 'NONE').upper()
+            for name, outcome in results:
+                if outcome is None:
+                    continue
+                simple_key = None
+                normalized_name = str(name).strip().upper()
+                normalized_signal = outcome.normalized_signal()
+                if 'ADX' in normalized_name:
+                    simple_key = 'ADX'
+                    metadata = getattr(outcome, 'metadata', {}) or {}
+                    if metadata and last_adx_value is None:
+                        raw_adx = metadata.get('adx')
+                        if raw_adx is not None:
+                            try:
+                                last_adx_value = float(raw_adx)
+                            except (TypeError, ValueError):
+                                last_adx_value = None
+                elif 'MACD' in normalized_name:
+                    simple_key = 'MACD'
+                elif 'CANDLE' in normalized_name:
+                    simple_key = 'Candle'
+                if simple_key:
+                    signals_map[simple_key] = normalized_signal
+            if last_adx_value is None:
+                raw_fallback = evaluation.get('adx')
+                if raw_fallback is not None:
+                    try:
+                        last_adx_value = float(raw_fallback)
+                    except (TypeError, ValueError):
+                        last_adx_value = None
+            if 'ADX' in signals_map and adx_signal in {'CALL', 'PUT'}:
+                if last_adx_value is not None and last_adx_value < 22.0:
+                    logging.info(f"[{symbol}] ❌ Blocked trade: ADX {last_adx_value:.2f} indicates weak trend")
+                    return False
+            if (
+                'MACD' in signals_map
+                and 'ADX' in signals_map
+                and macd_signal in {'CALL', 'PUT'}
+                and adx_signal in {'CALL', 'PUT'}
+                and macd_signal != adx_signal
+            ):
+                logging.info(f"[{symbol}] ⚠️ Blocked trade: MACD–ADX conflict ({macd_signal} vs {adx_signal})")
+                return False
+            if (
+                'MACD' in signals_map
+                and 'Candle' in signals_map
+                and macd_signal in {'CALL', 'PUT'}
+                and candle_signal in {'CALL', 'PUT'}
+                and macd_signal != candle_signal
+            ):
+                logging.info(f"[{symbol}] ⚠️ Blocked trade: MACD–Candle conflict ({macd_signal} vs {candle_signal})")
+                return False
+        except Exception as exc:
+            logging.warning(f"[{symbol}] Confluence validation error: {exc}")
+        return True
+    
     def _extract_pattern_context(
         self,
         entry: Dict[str, Any],
@@ -4337,6 +4418,9 @@ class TradingEngine:
                 )
                 continue
 
+            if not self._passes_confluence_validation(evaluation):
+                continue
+
             volatility_output = f"{volatility_value:.6f}" if volatility_value is not None else "N/A"
             logging.info(
                 f"🚀 Executing trade on {symbol} | Confidence={confidence_value:.2f} | Confluence={aligned_total}/{min_confluence} | Volatility={volatility_output}"
@@ -4432,6 +4516,8 @@ class TradingEngine:
             skip_trade = True
             pass
         if skip_trade:
+            return False
+        if not self._passes_confluence_validation(evaluation):
             return False
         enriched = dict(evaluation)
         enriched['signal'] = direction
