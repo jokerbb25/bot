@@ -70,7 +70,7 @@ LOW_VOL_THRESHOLD = 0.0006
 LOW_VOL_CONFIDENCE = 0.85
 NEUTRAL_RSI_BAND = (45.0, 55.0)
 NEUTRAL_RSI_CONF = 0.95
-MIN_ALIGNED_STRATEGIES = 2
+MIN_ALIGNED_STRATEGIES = 3
 POST_LOSS_COOLDOWN_SEC = 120
 MAX_TRADES_PER_HOUR = 20
 KEEP_WIN_MIN_CONF = 0.70
@@ -4215,17 +4215,10 @@ class TradingEngine:
                         last_adx_value = None
             if 'ADX' in signals_map and adx_signal in {'CALL', 'PUT'}:
                 if last_adx_value is not None and last_adx_value < 22.0:
-                    logging.info(f"[{symbol}] ❌ Blocked trade: ADX {last_adx_value:.2f} indicates weak trend")
+                    logging.info(
+                        f"[{symbol}] ❌ Skipped trade: weak trend detected (ADX {last_adx_value:.2f})"
+                    )
                     return False
-            if (
-                'MACD' in signals_map
-                and 'ADX' in signals_map
-                and macd_signal in {'CALL', 'PUT'}
-                and adx_signal in {'CALL', 'PUT'}
-                and macd_signal != adx_signal
-            ):
-                logging.info(f"[{symbol}] ⚠️ Blocked trade: MACD–ADX conflict ({macd_signal} vs {adx_signal})")
-                return False
             if (
                 'MACD' in signals_map
                 and 'Candle' in signals_map
@@ -4233,7 +4226,9 @@ class TradingEngine:
                 and candle_signal in {'CALL', 'PUT'}
                 and macd_signal != candle_signal
             ):
-                logging.info(f"[{symbol}] ⚠️ Blocked trade: MACD–Candle conflict ({macd_signal} vs {candle_signal})")
+                logging.info(
+                    f"[{symbol}] ⚠️ Skipped trade: MACD–Candle conflict ({macd_signal} vs {candle_signal})"
+                )
                 return False
         except Exception as exc:
             logging.warning(f"[{symbol}] Confluence validation error: {exc}")
@@ -4400,7 +4395,8 @@ class TradingEngine:
                 evaluation.get('aligned', evaluation.get('consensus', {}).get('aligned', 0))
             )
             min_confidence = CONFIDENCE_MIN
-            min_confluence = MIN_ALIGNED_STRATEGIES
+            # === GLOBAL CONFLUENCE RULE ===
+            min_confluence = MIN_ALIGNED_STRATEGIES  # fixed at 3 for all symbols
 
             if confidence_value < min_confidence:
                 logging.info(
@@ -4862,7 +4858,8 @@ class TradingEngine:
             return False
         self.last_volatility = current_vol_reference
         min_confidence = CONFIDENCE_MIN
-        min_confluence = MIN_ALIGNED_STRATEGIES
+        # === GLOBAL CONFLUENCE RULE ===
+        min_confluence = MIN_ALIGNED_STRATEGIES  # fixed at 3 for all symbols
         confluence_value = aligned_strategies
         if confidence_value < min_confidence:
             logging.info(f"🚫 Trade skipped due to low confidence ({confidence_value:.2f} < {min_confidence:.2f})")
