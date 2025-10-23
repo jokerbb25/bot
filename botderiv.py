@@ -7,6 +7,8 @@ import warnings
 import csv
 import math
 import shutil
+import os
+import subprocess
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -117,6 +119,20 @@ def send_telegram_message(text: str) -> None:
         requests.post(url, json=payload, timeout=5)
     except Exception as exc:
         logging.warning(f"⚠️ Telegram message failed: {exc}")
+
+
+
+def safe_restart_windows() -> None:
+    """Safely restart the bot on Windows, even if Python path contains spaces."""
+    try:
+        python_path = sys.executable
+        script_path = os.path.abspath(sys.argv[0])
+        logging.info(f"♻️ Restarting bot using: {python_path} {script_path}")
+        subprocess.Popen([python_path, script_path], close_fds=True)
+        logging.info("✅ Restart command executed successfully. Exiting current process.")
+        os._exit(0)
+    except Exception as exc:
+        logging.error(f"❌ Failed to restart bot: {exc}")
 
 
 def load_biases() -> Dict[str, Dict[str, Any]]:
@@ -3536,8 +3552,6 @@ class TradingEngine:
                 logging.warning(f"Error al obtener velas de {symbol}: {exc}")
                 candles = []
             candle_data = candles
-            import os, sys, time
-
             failed_candle_count = getattr(self, "failed_candle_count", 0)
             if not candle_data or "Error" in str(candle_data):
                 self.failed_candle_count = failed_candle_count + 1
@@ -3555,7 +3569,7 @@ class TradingEngine:
                     logging.error(f"Error during pre-restart saving: {e}")
 
                 time.sleep(2)
-                os.execl(sys.executable, sys.executable, *sys.argv)
+                safe_restart_windows()
             if not candles:
                 logging.warning(f"Sin velas disponibles para {symbol}, se omite del ciclo")
                 return None
