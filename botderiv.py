@@ -4215,11 +4215,24 @@ class TradingEngine:
                     except (TypeError, ValueError):
                         last_adx_value = None
             if 'ADX' in signals_map and adx_signal in {'CALL', 'PUT'}:
-                if last_adx_value is not None and last_adx_value < 22.0:
-                    logging.info(
-                        f"[{symbol}] ❌ Skipped trade: weak trend detected (ADX {last_adx_value:.2f})"
-                    )
-                    return False
+                try:
+                    adx_threshold = 22.0
+                    symbol_upper = str(symbol).upper()
+                    if 'R_25' in symbol_upper:
+                        adx_threshold = 19.0
+                    elif 'R_50' in symbol_upper:
+                        adx_threshold = 20.0
+                    elif 'R_75' in symbol_upper:
+                        adx_threshold = 22.0
+                    elif 'R_100' in symbol_upper:
+                        adx_threshold = 24.0
+                    if last_adx_value is not None and last_adx_value < adx_threshold:
+                        logging.info(
+                            f"[{symbol}] ❌ Blocked trade: weak trend (ADX {last_adx_value:.2f} < {adx_threshold})"
+                        )
+                        return False
+                except Exception as exc:
+                    logging.warning(f"[{symbol}] ADX dynamic filter error: {exc}")
             if (
                 'MACD' in signals_map
                 and 'Candle' in signals_map
