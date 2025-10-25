@@ -49,24 +49,24 @@ JSON_MEMORY = "learning_memory.json"
 IQ_EMAIL = os.environ.get("IQ_EMAIL", "YOUR_EMAIL")
 IQ_PASSWORD = os.environ.get("IQ_PASSWORD", "YOUR_PASSWORD")
 
+print("🔌 Connecting to IQ Option...")
 Iq = IQ_Option(IQ_EMAIL, IQ_PASSWORD)
 Iq.connect()
 Iq.change_balance("PRACTICE")
 
 if not Iq.check_connect():
     print("❌ Failed to connect to IQ Option.")
-    sys.exit(1)
+    sys.exit()
 print("✅ Connected to IQ Option (Practice Mode)\n")
 
 
 def calculate_rsi(df, period=14):
-    close = df["close"]
-    delta = close.diff()
-    gain = delta.clip(lower=0)
-    loss = -delta.clip(upper=0)
-    avg_gain = gain.rolling(window=period, min_periods=period).mean()
-    avg_loss = loss.rolling(window=period, min_periods=period).mean()
-    rs = avg_gain / avg_loss.replace(to_replace=0, value=np.nan)
+    delta = df["close"].diff()
+    gain = delta.where(delta > 0, 0.0)
+    loss = -delta.where(delta < 0, 0.0)
+    avg_gain = gain.rolling(period, min_periods=period).mean()
+    avg_loss = loss.rolling(period, min_periods=period).mean()
+    rs = avg_gain / avg_loss.replace(0, np.nan)
     rsi = 100 - (100 / (1 + rs))
     return rsi.fillna(method="bfill").fillna(method="ffill")
 
@@ -75,28 +75,29 @@ def calculate_ema(df, period):
     return df["close"].ewm(span=period, adjust=False).mean()
 
 
-def calculate_macd(df, fast=12, slow=26, signal=9):
-    ema_fast = df["close"].ewm(span=fast, adjust=False).mean()
-    ema_slow = df["close"].ewm(span=slow, adjust=False).mean()
-    macd_line = ema_fast - ema_slow
-    signal_line = macd_line.ewm(span=signal, adjust=False).mean()
-    return macd_line, signal_line
+def calculate_macd(df):
+    ema12 = df["close"].ewm(span=12, adjust=False).mean()
+    ema26 = df["close"].ewm(span=26, adjust=False).mean()
+    macd = ema12 - ema26
+    signal = macd.ewm(span=9, adjust=False).mean()
+    return macd, signal
 
 
-def calculate_bollinger(df, period=20, std_dev=2):
-    middle = df["close"].rolling(window=period, min_periods=period).mean()
-    deviation = df["close"].rolling(window=period, min_periods=period).std()
-    upper = middle + std_dev * deviation
-    lower = middle - std_dev * deviation
-    return upper, middle, lower
+def calculate_bollinger(df, window=20):
+    mid = df["close"].rolling(window, min_periods=window).mean()
+    std = df["close"].rolling(window, min_periods=window).std()
+    upper = mid + (2 * std)
+    lower = mid - (2 * std)
+    return upper, mid, lower
 
 
 def calculate_stochastic(df, k_period=14, d_period=3):
-    lowest_low = df["low"].rolling(window=k_period, min_periods=k_period).min()
-    highest_high = df["high"].rolling(window=k_period, min_periods=k_period).max()
-    stoch_k = ((df["close"] - lowest_low) / (highest_high - lowest_low)) * 100
-    stoch_k = stoch_k.clip(lower=0, upper=100)
-    stoch_d = stoch_k.rolling(window=d_period, min_periods=d_period).mean()
+    low_min = df["min"].rolling(k_period, min_periods=k_period).min()
+    high_max = df["max"].rolling(k_period, min_periods=k_period).max()
+    range_span = high_max - low_min
+    stoch_k = 100 * (df["close"] - low_min) / range_span.replace(0, np.nan)
+    stoch_k = stoch_k.replace([np.inf, -np.inf], np.nan)
+    stoch_d = stoch_k.rolling(d_period, min_periods=d_period).mean()
     return stoch_k.fillna(method="bfill").fillna(method="ffill"), stoch_d.fillna(method="bfill").fillna(method="ffill")
 
 
@@ -105,9 +106,8 @@ def calculate_momentum(df, period=10):
     return momentum.fillna(method="bfill").fillna(method="ffill")
 
 
-def calculate_volatility(df, period=14):
-    returns = df["close"].pct_change()
-    volatility = returns.rolling(window=period, min_periods=period).std() * np.sqrt(period)
+def calculate_volatility(df, period=10):
+    volatility = df["close"].pct_change().rolling(period, min_periods=period).std()
     return volatility.fillna(method="bfill").fillna(method="ffill")
 
 
@@ -117,14 +117,14 @@ def get_signal(df, active_strategies):
     votes_call = 0
     votes_put = 0
     votes_detail = {}
-    enabled_strategies = 0
+    enabled = 0
 
     def register_vote(name, decision):
-        nonlocal votes_call, votes_put, enabled_strategies
+        nonlocal votes_call, votes_put, enabled
         if not active_strategies.get(name, True):
             votes_detail[name] = "OFF"
             return
-        enabled_strategies += 1
+        enabled += 1
         votes_detail[name] = decision
         if decision == "CALL":
             votes_call += 1
@@ -181,9 +181,8 @@ def get_signal(df, active_strategies):
         volatility_decision = "CALL"
     register_vote("Volatility", volatility_decision)
 
-    total_strategies = max(1, enabled_strategies)
-    confidence = max(votes_call, votes_put) / total_strategies
-
+    total = max(1, enabled)
+    confidence = max(votes_call, votes_put) / total
     signal = "NONE"
     if votes_call >= 3 and votes_call > votes_put:
         signal = "CALL"
@@ -232,17 +231,17 @@ class SignalLogger:
                             entry["symbol"],
                             entry["signal"],
                             f"{entry['confidence']:.2f}",
-                            f"{indicators.get('rsi', 0):.2f}",
-                            f"{indicators.get('ema_fast', 0):.5f}",
-                            f"{indicators.get('ema_slow', 0):.5f}",
-                            f"{indicators.get('macd', 0):.5f}",
-                            f"{indicators.get('signal_macd', 0):.5f}",
-                            f"{indicators.get('boll_upper', 0):.5f}",
-                            f"{indicators.get('boll_lower', 0):.5f}",
-                            f"{indicators.get('stoch_k', 0):.2f}",
-                            f"{indicators.get('stoch_d', 0):.2f}",
-                            f"{indicators.get('momentum', 0):.2f}",
-                            f"{indicators.get('volatility', 0):.5f}",
+                            f"{indicators.get('rsi', 0.0):.2f}",
+                            f"{indicators.get('ema_fast', 0.0):.5f}",
+                            f"{indicators.get('ema_slow', 0.0):.5f}",
+                            f"{indicators.get('macd', 0.0):.5f}",
+                            f"{indicators.get('signal_macd', 0.0):.5f}",
+                            f"{indicators.get('boll_upper', 0.0):.5f}",
+                            f"{indicators.get('boll_lower', 0.0):.5f}",
+                            f"{indicators.get('stoch_k', 0.0):.2f}",
+                            f"{indicators.get('stoch_d', 0.0):.2f}",
+                            f"{indicators.get('momentum', 0.0):.2f}",
+                            f"{indicators.get('volatility', 0.0):.5f}",
                         ]
                     )
                     + "\n"
@@ -278,7 +277,6 @@ class Worker(threading.Thread):
                     if self.last_processed.get(symbol) == last_candle_time:
                         continue
                     df = pd.DataFrame(candles)
-                    df.rename(columns={"min": "low", "max": "high"}, inplace=True)
                     df["time"] = pd.to_datetime(df["from"], unit="s")
                     df.set_index("time", inplace=True)
                     df.sort_index(inplace=True)
@@ -289,9 +287,9 @@ class Worker(threading.Thread):
                     macd_line, signal_line = calculate_macd(df)
                     df["macd"] = macd_line
                     df["signal_macd"] = signal_line
-                    boll_upper, boll_middle, boll_lower = calculate_bollinger(df)
+                    boll_upper, boll_mid, boll_lower = calculate_bollinger(df)
                     df["boll_upper"] = boll_upper
-                    df["boll_middle"] = boll_middle
+                    df["boll_mid"] = boll_mid
                     df["boll_lower"] = boll_lower
                     stoch_k, stoch_d = calculate_stochastic(df)
                     df["stoch_k"] = stoch_k
@@ -337,15 +335,17 @@ class Worker(threading.Thread):
                 except Exception as exc:
                     error_message = f"⚠️ {symbol} error: {exc}"
                     print(error_message)
-                    self.signal_queue.put({
-                        "datetime": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        "symbol": symbol,
-                        "signal": "ERROR",
-                        "confidence": 0.0,
-                        "indicators": {},
-                        "votes": {"Error": str(exc)},
-                        "log_only": error_message,
-                    })
+                    self.signal_queue.put(
+                        {
+                            "datetime": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            "symbol": symbol,
+                            "signal": "ERROR",
+                            "confidence": 0.0,
+                            "indicators": {},
+                            "votes": {"Error": str(exc)},
+                            "log_only": error_message,
+                        }
+                    )
                     continue
             elapsed = time.time() - cycle_start
             remaining = max(0, SLEEP_TIME - elapsed)
@@ -590,39 +590,43 @@ class MainWindow(QMainWindow):
         row = SYMBOLS.index(symbol)
         indicators = entry.get("indicators", {})
 
+        symbol_item = self.signal_table.item(row, 0)
+        if symbol_item is None:
+            symbol_item = QTableWidgetItem(symbol)
+            symbol_item.setTextAlignment(Qt.AlignCenter)
+            self.signal_table.setItem(row, 0, symbol_item)
+
         signal_item = QTableWidgetItem(entry["signal"])
         signal_item.setTextAlignment(Qt.AlignCenter)
         confidence_item = QTableWidgetItem(f"{entry['confidence']:.2f}")
         confidence_item.setTextAlignment(Qt.AlignCenter)
-        rsi_item = QTableWidgetItem(f"{indicators.get('rsi', 0):.2f}")
+        rsi_item = QTableWidgetItem(f"{indicators.get('rsi', 0.0):.2f}")
         rsi_item.setTextAlignment(Qt.AlignCenter)
         ema_item = QTableWidgetItem(
-            f"{indicators.get('ema_fast', 0):.5f} / {indicators.get('ema_slow', 0):.5f}"
+            f"{indicators.get('ema_fast', 0.0):.5f} / {indicators.get('ema_slow', 0.0):.5f}"
         )
         ema_item.setTextAlignment(Qt.AlignCenter)
         time_item = QTableWidgetItem(entry["datetime"])
         time_item.setTextAlignment(Qt.AlignCenter)
 
-        base_color = QColor(14, 17, 22)
+        neutral_color = QColor(14, 17, 22)
+        call_color = QColor(34, 139, 34)
+        put_color = QColor(178, 34, 34)
         if entry["signal"] == "CALL":
-            background = QColor(34, 139, 34)
+            background = call_color
         elif entry["signal"] == "PUT":
-            background = QColor(178, 34, 34)
+            background = put_color
         else:
-            background = base_color
+            background = neutral_color
 
-        for col, item in enumerate([
-            signal_item,
-            confidence_item,
-            rsi_item,
-            ema_item,
-            time_item,
-        ], start=1):
-            if entry["signal"] in {"CALL", "PUT"}:
-                item.setBackground(background)
-            else:
-                item.setBackground(base_color)
+        for col, item in enumerate(
+            [signal_item, confidence_item, rsi_item, ema_item, time_item],
+            start=1,
+        ):
+            item.setBackground(background)
             self.signal_table.setItem(row, col, item)
+        symbol_item.setBackground(background)
+        self.signal_table.resizeColumnsToContents()
 
     def closeEvent(self, event):
         self.toggle_start(False)
@@ -633,9 +637,10 @@ def main():
     app = QApplication(sys.argv)
     window = MainWindow()
     window.show()
-    print("✅ Starting GUI...")
+    print("✅ GUI initialized. Ready.")
     sys.exit(app.exec_())
 
 
 if __name__ == "__main__":
+    print("🟢 Starting botIQ Ultimate GUI...")
     main()
