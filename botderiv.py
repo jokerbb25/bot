@@ -4428,6 +4428,14 @@ class TradingEngine:
                 )
                 continue
 
+            rsi_signal = str(evaluation.get('rsi_signal', 'NONE')).upper()
+            ema_signal = str(evaluation.get('ema_signal', 'NONE')).upper()
+            if (rsi_signal != 'NONE' and ema_signal != 'NONE' and rsi_signal != ema_signal):
+                logging.info(
+                    f"🚫 Skipping trade on {symbol} due to RSI/EMA conflict → RSI={rsi_signal}, EMA={ema_signal}"
+                )
+                continue
+
             if not self._passes_confluence_validation(evaluation):
                 continue
 
@@ -4604,15 +4612,17 @@ class TradingEngine:
             return candidate
 
         base_symbol = _normalize_symbol(symbol)
+        symbol_upper = str(symbol).upper()
+        # === ADAPTIVE VOLATILITY THRESHOLDS BY SYMBOL ===
         low_vol, high_vol = 0.0003, 0.0025
-        symbol_thresholds = {
-            "R_25": (0.0002, 0.0015),
-            "R_50": (0.0003, 0.0018),
-            "R_75": (0.0004, 0.0022),
-            "R_100": (0.0005, 0.0028),
-        }
-        if base_symbol in symbol_thresholds:
-            low_vol, high_vol = symbol_thresholds[base_symbol]
+        if "R_25" in symbol_upper:
+            low_vol, high_vol = 0.00015, 0.0012
+        elif "R_50" in symbol_upper:
+            low_vol, high_vol = 0.00025, 0.0015
+        elif "R_75" in symbol_upper:
+            low_vol, high_vol = 0.0003, 0.0018
+        elif "R_100" in symbol_upper:
+            low_vol, high_vol = 0.00035, 0.002
         evaluated_volatility = float(getattr(self, "current_volatility", 0.0) or 0.0)
         if evaluated_volatility > 0.05:
             evaluated_volatility = evaluated_volatility / 100.0
@@ -4675,13 +4685,16 @@ class TradingEngine:
                 f"⚠️ Señal inconsistente: {base_action} vs {final_action} (conf={confidence_value:.2f}) → Cancelada"
             )
             return False
-        rsi_signal_eval = evaluation.get('rsi_signal')
-        ema_signal_eval = evaluation.get('ema_signal')
-        if rsi_signal_eval == 'CALL' and ema_signal_eval == 'PUT':
-            logging.info("🚫 Skipped: RSI CALL contradicts EMA PUT (conflict)")
-            return False
-        if rsi_signal_eval == 'PUT' and ema_signal_eval == 'CALL':
-            logging.info("🚫 Skipped: RSI PUT contradicts EMA CALL (conflict)")
+        rsi_signal_eval = str(evaluation.get('rsi_signal', 'NONE')).upper()
+        ema_signal_eval = str(evaluation.get('ema_signal', 'NONE')).upper()
+        if (
+            rsi_signal_eval != 'NONE'
+            and ema_signal_eval != 'NONE'
+            and rsi_signal_eval != ema_signal_eval
+        ):
+            logging.info(
+                f"🚫 Skipping trade on {symbol} due to RSI/EMA conflict → RSI={rsi_signal_eval}, EMA={ema_signal_eval}"
+            )
             return False
         context_key = f"{symbol}|{final_action}|RSI:{round(latest_rsi_value, 1)}|EMA:{round(ema_spread_value, 1)}"
         if final_action in {'CALL', 'PUT'}:
