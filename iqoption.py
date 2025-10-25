@@ -22,9 +22,14 @@ from PyQt5.QtWidgets import (
     QTableWidget,
     QTableWidgetItem,
     QHBoxLayout,
+    QHeaderView,
 )
 from PyQt5.QtCore import QTimer, Qt
+from PyQt5.QtGui import QColor
+from dotenv import load_dotenv
 
+
+load_dotenv()
 
 SYMBOLS = [
     "EURUSD",
@@ -41,8 +46,6 @@ CANDLE_COUNT = 200
 SLEEP_TIME = 60
 CSV_FILE = "signals_iq.csv"
 JSON_MEMORY = "learning_memory.json"
-
-
 IQ_EMAIL = os.environ.get("IQ_EMAIL", "YOUR_EMAIL")
 IQ_PASSWORD = os.environ.get("IQ_PASSWORD", "YOUR_PASSWORD")
 
@@ -50,9 +53,14 @@ Iq = IQ_Option(IQ_EMAIL, IQ_PASSWORD)
 Iq.connect()
 Iq.change_balance("PRACTICE")
 
+if not Iq.check_connect():
+    print("❌ Failed to connect to IQ Option.")
+    sys.exit(1)
+print("✅ Connected to IQ Option (Practice Mode)\n")
 
-def calculate_rsi(data, period=14):
-    close = data["close"]
+
+def calculate_rsi(df, period=14):
+    close = df["close"]
     delta = close.diff()
     gain = delta.clip(lower=0)
     loss = -delta.clip(upper=0)
@@ -60,127 +68,129 @@ def calculate_rsi(data, period=14):
     avg_loss = loss.rolling(window=period, min_periods=period).mean()
     rs = avg_gain / avg_loss.replace(to_replace=0, value=np.nan)
     rsi = 100 - (100 / (1 + rs))
-    return rsi.fillna(method="bfill")
+    return rsi.fillna(method="bfill").fillna(method="ffill")
 
 
-def calculate_ema(data, period):
-    return data["close"].ewm(span=period, adjust=False).mean()
+def calculate_ema(df, period):
+    return df["close"].ewm(span=period, adjust=False).mean()
 
 
-def calculate_macd(data, fast=12, slow=26, signal=9):
-    ema_fast = data["close"].ewm(span=fast, adjust=False).mean()
-    ema_slow = data["close"].ewm(span=slow, adjust=False).mean()
+def calculate_macd(df, fast=12, slow=26, signal=9):
+    ema_fast = df["close"].ewm(span=fast, adjust=False).mean()
+    ema_slow = df["close"].ewm(span=slow, adjust=False).mean()
     macd_line = ema_fast - ema_slow
     signal_line = macd_line.ewm(span=signal, adjust=False).mean()
-    histogram = macd_line - signal_line
-    return macd_line, signal_line, histogram
+    return macd_line, signal_line
 
 
-def calculate_bollinger(data, period=20, std_dev=2):
-    middle_band = data["close"].rolling(window=period, min_periods=period).mean()
-    rolling_std = data["close"].rolling(window=period, min_periods=period).std()
-    upper_band = middle_band + std_dev * rolling_std
-    lower_band = middle_band - std_dev * rolling_std
-    return middle_band, upper_band, lower_band
+def calculate_bollinger(df, period=20, std_dev=2):
+    middle = df["close"].rolling(window=period, min_periods=period).mean()
+    deviation = df["close"].rolling(window=period, min_periods=period).std()
+    upper = middle + std_dev * deviation
+    lower = middle - std_dev * deviation
+    return upper, middle, lower
 
 
-def calculate_stochastic(data, k_period=14, d_period=3):
-    lowest_low = data["low"].rolling(window=k_period, min_periods=k_period).min()
-    highest_high = data["high"].rolling(window=k_period, min_periods=k_period).max()
-    stoch_k = ((data["close"] - lowest_low) / (highest_high - lowest_low)) * 100
+def calculate_stochastic(df, k_period=14, d_period=3):
+    lowest_low = df["low"].rolling(window=k_period, min_periods=k_period).min()
+    highest_high = df["high"].rolling(window=k_period, min_periods=k_period).max()
+    stoch_k = ((df["close"] - lowest_low) / (highest_high - lowest_low)) * 100
     stoch_k = stoch_k.clip(lower=0, upper=100)
     stoch_d = stoch_k.rolling(window=d_period, min_periods=d_period).mean()
-    return stoch_k.fillna(method="bfill"), stoch_d.fillna(method="bfill")
+    return stoch_k.fillna(method="bfill").fillna(method="ffill"), stoch_d.fillna(method="bfill").fillna(method="ffill")
 
 
-def calculate_momentum(data, period=10):
-    return data["close"].diff(period)
+def calculate_momentum(df, period=10):
+    momentum = (df["close"] / df["close"].shift(period)) * 100
+    return momentum.fillna(method="bfill").fillna(method="ffill")
 
 
-def calculate_volatility(data, period=14):
-    returns = data["close"].pct_change()
+def calculate_volatility(df, period=14):
+    returns = df["close"].pct_change()
     volatility = returns.rolling(window=period, min_periods=period).std() * np.sqrt(period)
-    return volatility.fillna(method="bfill")
+    return volatility.fillna(method="bfill").fillna(method="ffill")
 
 
 def get_signal(df, active_strategies):
     latest = df.iloc[-1]
     previous = df.iloc[-2]
-    strategy_votes = {}
+    votes_call = 0
+    votes_put = 0
+    votes_detail = {}
+    enabled_strategies = 0
 
-    if active_strategies.get("RSI", True):
-        if latest["rsi"] < 30:
-            strategy_votes["RSI"] = "CALL"
-        elif latest["rsi"] > 70:
-            strategy_votes["RSI"] = "PUT"
-        else:
-            strategy_votes["RSI"] = "NONE"
+    def register_vote(name, decision):
+        nonlocal votes_call, votes_put, enabled_strategies
+        if not active_strategies.get(name, True):
+            votes_detail[name] = "OFF"
+            return
+        enabled_strategies += 1
+        votes_detail[name] = decision
+        if decision == "CALL":
+            votes_call += 1
+        elif decision == "PUT":
+            votes_put += 1
 
-    if active_strategies.get("EMA", True):
-        if latest["ema_fast"] > latest["ema_slow"] and previous["ema_fast"] <= previous["ema_slow"]:
-            strategy_votes["EMA"] = "CALL"
-        elif latest["ema_fast"] < latest["ema_slow"] and previous["ema_fast"] >= previous["ema_slow"]:
-            strategy_votes["EMA"] = "PUT"
-        else:
-            strategy_votes["EMA"] = "NONE"
+    rsi_decision = "NONE"
+    if latest["rsi"] < 30:
+        rsi_decision = "CALL"
+    elif latest["rsi"] > 70:
+        rsi_decision = "PUT"
+    register_vote("RSI", rsi_decision)
 
-    if active_strategies.get("MACD", True):
-        if latest["macd"] > latest["macd_signal"] and previous["macd"] <= previous["macd_signal"]:
-            strategy_votes["MACD"] = "CALL"
-        elif latest["macd"] < latest["macd_signal"] and previous["macd"] >= previous["macd_signal"]:
-            strategy_votes["MACD"] = "PUT"
-        else:
-            strategy_votes["MACD"] = "NONE"
+    ema_decision = "NONE"
+    if latest["ema_fast"] > latest["ema_slow"] and previous["ema_fast"] <= previous["ema_slow"]:
+        ema_decision = "CALL"
+    elif latest["ema_fast"] < latest["ema_slow"] and previous["ema_fast"] >= previous["ema_slow"]:
+        ema_decision = "PUT"
+    register_vote("EMA", ema_decision)
 
-    if active_strategies.get("Bollinger", True):
-        if latest["close"] <= latest["bb_lower"]:
-            strategy_votes["Bollinger"] = "CALL"
-        elif latest["close"] >= latest["bb_upper"]:
-            strategy_votes["Bollinger"] = "PUT"
-        else:
-            strategy_votes["Bollinger"] = "NONE"
+    macd_decision = "NONE"
+    if latest["macd"] > latest["signal_macd"]:
+        macd_decision = "CALL"
+    elif latest["macd"] < latest["signal_macd"]:
+        macd_decision = "PUT"
+    register_vote("MACD", macd_decision)
 
-    if active_strategies.get("Stochastic", True):
-        if latest["stoch_k"] > latest["stoch_d"] and previous["stoch_k"] <= previous["stoch_d"]:
-            strategy_votes["Stochastic"] = "CALL"
-        elif latest["stoch_k"] < latest["stoch_d"] and previous["stoch_k"] >= previous["stoch_d"]:
-            strategy_votes["Stochastic"] = "PUT"
-        else:
-            strategy_votes["Stochastic"] = "NONE"
+    bollinger_decision = "NONE"
+    if latest["close"] <= latest["boll_lower"]:
+        bollinger_decision = "CALL"
+    elif latest["close"] >= latest["boll_upper"]:
+        bollinger_decision = "PUT"
+    register_vote("Bollinger", bollinger_decision)
 
-    if active_strategies.get("Momentum", True):
-        if latest["momentum"] > 0:
-            strategy_votes["Momentum"] = "CALL"
-        elif latest["momentum"] < 0:
-            strategy_votes["Momentum"] = "PUT"
-        else:
-            strategy_votes["Momentum"] = "NONE"
+    stochastic_decision = "NONE"
+    if latest["stoch_k"] < 20 and latest["stoch_d"] < 20:
+        stochastic_decision = "CALL"
+    elif latest["stoch_k"] > 80 and latest["stoch_d"] > 80:
+        stochastic_decision = "PUT"
+    register_vote("Stochastic", stochastic_decision)
 
-    if active_strategies.get("Volatility", True):
-        volatility_threshold = df["volatility"].rolling(window=20, min_periods=20).mean().iloc[-1]
-        if latest["volatility"] >= volatility_threshold and latest["close"] > latest["ema_slow"]:
-            strategy_votes["Volatility"] = "CALL"
-        elif latest["volatility"] >= volatility_threshold and latest["close"] < latest["ema_slow"]:
-            strategy_votes["Volatility"] = "PUT"
-        else:
-            strategy_votes["Volatility"] = "NONE"
+    momentum_decision = "NONE"
+    if latest["momentum"] > 100:
+        momentum_decision = "CALL"
+    elif latest["momentum"] < 100:
+        momentum_decision = "PUT"
+    register_vote("Momentum", momentum_decision)
 
-    active_count = sum(1 for key, enabled in active_strategies.items() if enabled)
-    call_votes = sum(1 for vote in strategy_votes.values() if vote == "CALL")
-    put_votes = sum(1 for vote in strategy_votes.values() if vote == "PUT")
+    volatility_decision = "NONE"
+    volatility_threshold = df["volatility"].mean() * 1.5
+    if latest["volatility"] > volatility_threshold:
+        volatility_decision = "PUT"
+    else:
+        volatility_decision = "CALL"
+    register_vote("Volatility", volatility_decision)
+
+    total_strategies = max(1, enabled_strategies)
+    confidence = max(votes_call, votes_put) / total_strategies
 
     signal = "NONE"
-    aligned = 0
-    if call_votes >= 3:
+    if votes_call >= 3 and votes_call > votes_put:
         signal = "CALL"
-        aligned = call_votes
-    elif put_votes >= 3:
+    elif votes_put >= 3 and votes_put > votes_call:
         signal = "PUT"
-        aligned = put_votes
 
-    confidence = round(aligned / active_count, 2) if signal != "NONE" and active_count else 0.0
-
-    return signal, confidence, strategy_votes
+    return signal, round(confidence, 2), votes_detail
 
 
 class SignalLogger:
@@ -188,26 +198,31 @@ class SignalLogger:
         self.csv_path = csv_path
         self.json_path = json_path
         self.lock = threading.Lock()
-        self.memory = []
+        self.memory = {"signals": []}
         self._prepare_files()
 
     def _prepare_files(self):
         if not os.path.exists(self.csv_path):
             with open(self.csv_path, "w", encoding="utf-8") as file:
                 file.write(
-                    "datetime,symbol,signal,confidence,rsi,ema_fast,ema_slow,macd,macd_signal,bb_upper,bb_lower,stoch_k,stoch_d,momentum,volatility\n"
+                    "datetime,symbol,signal,confidence,rsi,ema_fast,ema_slow,macd,signal_macd,boll_upper,boll_lower,stoch_k,stoch_d,momentum,volatility\n"
                 )
         if os.path.exists(self.json_path):
             with open(self.json_path, "r", encoding="utf-8") as file:
                 try:
-                    self.memory = json.load(file)
+                    data = json.load(file)
                 except json.JSONDecodeError:
-                    self.memory = []
+                    data = {"signals": []}
         else:
-            with open(self.json_path, "w", encoding="utf-8") as file:
-                json.dump(self.memory, file, indent=2)
+            data = {"signals": []}
+        if not isinstance(data, dict) or "signals" not in data:
+            data = {"signals": []}
+        self.memory = data
+        with open(self.json_path, "w", encoding="utf-8") as file:
+            json.dump(self.memory, file, indent=2)
 
     def append(self, entry):
+        indicators = entry.get("indicators", {})
         with self.lock:
             with open(self.csv_path, "a", encoding="utf-8") as file:
                 file.write(
@@ -217,73 +232,79 @@ class SignalLogger:
                             entry["symbol"],
                             entry["signal"],
                             f"{entry['confidence']:.2f}",
-                            f"{entry['indicators']['rsi']:.2f}",
-                            f"{entry['indicators']['ema_fast']:.5f}",
-                            f"{entry['indicators']['ema_slow']:.5f}",
-                            f"{entry['indicators']['macd']:.5f}",
-                            f"{entry['indicators']['macd_signal']:.5f}",
-                            f"{entry['indicators']['bb_upper']:.5f}",
-                            f"{entry['indicators']['bb_lower']:.5f}",
-                            f"{entry['indicators']['stoch_k']:.2f}",
-                            f"{entry['indicators']['stoch_d']:.2f}",
-                            f"{entry['indicators']['momentum']:.5f}",
-                            f"{entry['indicators']['volatility']:.5f}",
+                            f"{indicators.get('rsi', 0):.2f}",
+                            f"{indicators.get('ema_fast', 0):.5f}",
+                            f"{indicators.get('ema_slow', 0):.5f}",
+                            f"{indicators.get('macd', 0):.5f}",
+                            f"{indicators.get('signal_macd', 0):.5f}",
+                            f"{indicators.get('boll_upper', 0):.5f}",
+                            f"{indicators.get('boll_lower', 0):.5f}",
+                            f"{indicators.get('stoch_k', 0):.2f}",
+                            f"{indicators.get('stoch_d', 0):.2f}",
+                            f"{indicators.get('momentum', 0):.2f}",
+                            f"{indicators.get('volatility', 0):.5f}",
                         ]
                     )
                     + "\n"
                 )
-            self.memory.append(entry)
+            self.memory.setdefault("signals", []).append(entry)
             with open(self.json_path, "w", encoding="utf-8") as file:
                 json.dump(self.memory, file, indent=2)
 
 
 class Worker(threading.Thread):
-    def __init__(self, iq_api, signal_queue, logger, strategy_provider):
+    def __init__(self, iq_api, signal_queue, logger, strategy_supplier):
         super().__init__(daemon=True)
         self.iq_api = iq_api
         self.signal_queue = signal_queue
         self.logger = logger
-        self.strategy_provider = strategy_provider
+        self.strategy_supplier = strategy_supplier
         self.stop_event = threading.Event()
+        self.last_processed = {symbol: None for symbol in SYMBOLS}
 
     def run(self):
         while not self.stop_event.is_set():
-            try:
-                strategies = self.strategy_provider()
-                end_time = time.time()
-                for symbol in SYMBOLS:
-                    candles = self.iq_api.get_candles(symbol, INTERVAL, CANDLE_COUNT, end_time)
+            cycle_start = time.time()
+            strategies = self.strategy_supplier()
+            for symbol in SYMBOLS:
+                if self.stop_event.is_set():
+                    break
+                try:
+                    end_timestamp = time.time()
+                    candles = self.iq_api.get_candles(symbol, INTERVAL, CANDLE_COUNT, end_timestamp)
                     if not candles:
                         continue
-                    frame = pd.DataFrame(candles)
-                    frame.rename(columns={"min": "low", "max": "high"}, inplace=True)
-                    frame["time"] = pd.to_datetime(frame["from"], unit="s")
-                    frame.set_index("time", inplace=True)
-                    frame.sort_index(inplace=True)
+                    last_candle_time = int(candles[-1]["from"])
+                    if self.last_processed.get(symbol) == last_candle_time:
+                        continue
+                    df = pd.DataFrame(candles)
+                    df.rename(columns={"min": "low", "max": "high"}, inplace=True)
+                    df["time"] = pd.to_datetime(df["from"], unit="s")
+                    df.set_index("time", inplace=True)
+                    df.sort_index(inplace=True)
 
-                    frame["rsi"] = calculate_rsi(frame)
-                    frame["ema_fast"] = calculate_ema(frame, 9)
-                    frame["ema_slow"] = calculate_ema(frame, 21)
-                    macd_line, signal_line, histogram = calculate_macd(frame)
-                    frame["macd"] = macd_line
-                    frame["macd_signal"] = signal_line
-                    frame["macd_hist"] = histogram
-                    bb_middle, bb_upper, bb_lower = calculate_bollinger(frame)
-                    frame["bb_middle"] = bb_middle
-                    frame["bb_upper"] = bb_upper
-                    frame["bb_lower"] = bb_lower
-                    stoch_k, stoch_d = calculate_stochastic(frame)
-                    frame["stoch_k"] = stoch_k
-                    frame["stoch_d"] = stoch_d
-                    frame["momentum"] = calculate_momentum(frame)
-                    frame["volatility"] = calculate_volatility(frame)
+                    df["rsi"] = calculate_rsi(df)
+                    df["ema_fast"] = calculate_ema(df, 9)
+                    df["ema_slow"] = calculate_ema(df, 21)
+                    macd_line, signal_line = calculate_macd(df)
+                    df["macd"] = macd_line
+                    df["signal_macd"] = signal_line
+                    boll_upper, boll_middle, boll_lower = calculate_bollinger(df)
+                    df["boll_upper"] = boll_upper
+                    df["boll_middle"] = boll_middle
+                    df["boll_lower"] = boll_lower
+                    stoch_k, stoch_d = calculate_stochastic(df)
+                    df["stoch_k"] = stoch_k
+                    df["stoch_d"] = stoch_d
+                    df["momentum"] = calculate_momentum(df)
+                    df["volatility"] = calculate_volatility(df)
 
-                    clean_frame = frame.dropna()
-                    if len(clean_frame) < 5:
+                    analysis_df = df.dropna().copy()
+                    if len(analysis_df) < 2:
                         continue
 
-                    signal, confidence, votes = get_signal(clean_frame, strategies)
-                    latest = clean_frame.iloc[-1]
+                    signal, confidence, votes = get_signal(analysis_df, strategies)
+                    latest = analysis_df.iloc[-1]
                     timestamp = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
 
                     entry = {
@@ -296,9 +317,9 @@ class Worker(threading.Thread):
                             "ema_fast": float(latest["ema_fast"]),
                             "ema_slow": float(latest["ema_slow"]),
                             "macd": float(latest["macd"]),
-                            "macd_signal": float(latest["macd_signal"]),
-                            "bb_upper": float(latest["bb_upper"]),
-                            "bb_lower": float(latest["bb_lower"]),
+                            "signal_macd": float(latest["signal_macd"]),
+                            "boll_upper": float(latest["boll_upper"]),
+                            "boll_lower": float(latest["boll_lower"]),
                             "stoch_k": float(latest["stoch_k"]),
                             "stoch_d": float(latest["stoch_d"]),
                             "momentum": float(latest["momentum"]),
@@ -311,24 +332,93 @@ class Worker(threading.Thread):
                     log_message = f"[{timestamp}] {symbol} → {signal} (Conf: {confidence:.2f})"
                     print(log_message)
                     self.logger.append(entry)
-                    self.signal_queue.put({"type": "update", "data": entry})
-
-                if self.stop_event.wait(SLEEP_TIME):
-                    break
-            except Exception as error:
-                print(f"Worker error: {error}")
-                if self.stop_event.wait(5):
-                    break
+                    self.signal_queue.put(entry)
+                    self.last_processed[symbol] = last_candle_time
+                except Exception as exc:
+                    error_message = f"⚠️ {symbol} error: {exc}"
+                    print(error_message)
+                    self.signal_queue.put({
+                        "datetime": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "symbol": symbol,
+                        "signal": "ERROR",
+                        "confidence": 0.0,
+                        "indicators": {},
+                        "votes": {"Error": str(exc)},
+                        "log_only": error_message,
+                    })
+                    continue
+            elapsed = time.time() - cycle_start
+            remaining = max(0, SLEEP_TIME - elapsed)
+            if self.stop_event.wait(remaining):
+                break
 
     def stop(self):
         self.stop_event.set()
 
 
-class BotIQWindow(QMainWindow):
+class MainWindow(QMainWindow):
     def __init__(self):
         super().__init__()
-        self.setWindowTitle("botIQ Ultimate v1 - Analysis Mode")
-        self.resize(1100, 700)
+        self.setWindowTitle("botIQ Ultimate v1 – Demo Mode")
+        self.resize(1180, 720)
+        self.setStyleSheet(
+            """
+            QMainWindow {
+                background-color: #101419;
+                color: #f0f0f0;
+            }
+            QLabel {
+                color: #f0f0f0;
+                font-size: 14px;
+            }
+            QPushButton {
+                background-color: #1f2630;
+                color: #f0f0f0;
+                padding: 8px 16px;
+                border: 1px solid #2c3440;
+                border-radius: 4px;
+            }
+            QPushButton:hover {
+                background-color: #2c3440;
+            }
+            QPushButton:disabled {
+                background-color: #1a1f27;
+                color: #777777;
+            }
+            QTabWidget::pane {
+                border: 1px solid #1f2630;
+            }
+            QTabBar::tab {
+                background: #1a1f27;
+                color: #f0f0f0;
+                padding: 10px 20px;
+            }
+            QTabBar::tab:selected {
+                background: #2c3440;
+            }
+            QTextEdit {
+                background-color: #0e1116;
+                color: #b9d1f0;
+                border: 1px solid #1f2630;
+                font-family: Consolas, monospace;
+            }
+            QTableWidget {
+                background-color: #0e1116;
+                color: #f0f0f0;
+                gridline-color: #1f2630;
+                selection-background-color: #2c3440;
+            }
+            QHeaderView::section {
+                background-color: #1a1f27;
+                color: #f0f0f0;
+                border: none;
+                padding: 6px;
+            }
+            QCheckBox {
+                color: #f0f0f0;
+            }
+            """
+        )
 
         self.signal_queue = Queue()
         self.logger = SignalLogger(CSV_FILE, JSON_MEMORY)
@@ -343,60 +433,65 @@ class BotIQWindow(QMainWindow):
             "Momentum": True,
             "Volatility": True,
         }
-        self.balance_mode = "PRACTICE"
 
         self.tabs = QTabWidget()
         self.dashboard_tab = QWidget()
         self.strategies_tab = QWidget()
         self.log_tab = QWidget()
         self.settings_tab = QWidget()
-
         self.tabs.addTab(self.dashboard_tab, "Dashboard")
         self.tabs.addTab(self.strategies_tab, "Strategies")
         self.tabs.addTab(self.log_tab, "Log")
         self.tabs.addTab(self.settings_tab, "Settings")
+
+        container = QWidget()
+        main_layout = QVBoxLayout()
+        main_layout.addWidget(self.tabs)
+        container.setLayout(main_layout)
+        self.setCentralWidget(container)
 
         self._build_dashboard_tab()
         self._build_strategies_tab()
         self._build_log_tab()
         self._build_settings_tab()
 
-        container = QWidget()
-        layout = QVBoxLayout()
-        layout.addWidget(self.tabs)
-        container.setLayout(layout)
-        self.setCentralWidget(container)
-
         self.update_timer = QTimer()
-        self.update_timer.setInterval(1000)
+        self.update_timer.setInterval(500)
         self.update_timer.timeout.connect(self.process_queue)
         self.update_timer.start()
 
     def _build_dashboard_tab(self):
         layout = QVBoxLayout()
-        self.signal_table = QTableWidget(len(SYMBOLS), 7)
+        self.signal_table = QTableWidget(len(SYMBOLS), 6)
         self.signal_table.setHorizontalHeaderLabels(
-            ["Symbol", "RSI", "EMA", "MACD", "Signal", "Confidence", "Time"]
+            ["Symbol", "Signal", "Confidence", "RSI", "EMA (9/21)", "Last Update"]
         )
         self.signal_table.verticalHeader().setVisible(False)
         self.signal_table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.signal_table.setAlternatingRowColors(True)
+        header = self.signal_table.horizontalHeader()
+        header.setSectionResizeMode(QHeaderView.Stretch)
         for row, symbol in enumerate(SYMBOLS):
-            self.signal_table.setItem(row, 0, QTableWidgetItem(symbol))
-            for column in range(1, 7):
-                self.signal_table.setItem(row, column, QTableWidgetItem("--"))
+            symbol_item = QTableWidgetItem(symbol)
+            symbol_item.setTextAlignment(Qt.AlignCenter)
+            self.signal_table.setItem(row, 0, symbol_item)
+            for col in range(1, 6):
+                placeholder = QTableWidgetItem("--")
+                placeholder.setTextAlignment(Qt.AlignCenter)
+                self.signal_table.setItem(row, col, placeholder)
         layout.addWidget(self.signal_table)
         self.dashboard_tab.setLayout(layout)
 
     def _build_strategies_tab(self):
         layout = QVBoxLayout()
-        info_label = QLabel("Enable or disable analysis strategies:")
-        layout.addWidget(info_label)
-        for strategy in self.active_strategies:
-            checkbox = QCheckBox(strategy)
+        info = QLabel("Enable or disable the analysis strategies:")
+        layout.addWidget(info)
+        for name in self.active_strategies:
+            checkbox = QCheckBox(name)
             checkbox.setChecked(True)
-            checkbox.stateChanged.connect(lambda state, name=strategy: self.toggle_strategy(name, state))
+            checkbox.stateChanged.connect(lambda state, strategy=name: self.toggle_strategy(strategy, state))
             layout.addWidget(checkbox)
-        layout.addStretch()
+        layout.addStretch(1)
         self.strategies_tab.setLayout(layout)
 
     def _build_log_tab(self):
@@ -410,27 +505,24 @@ class BotIQWindow(QMainWindow):
         layout = QVBoxLayout()
         status_layout = QHBoxLayout()
         self.status_label = QLabel("Status: Idle")
+        self.mode_label = QLabel("Mode: Practice")
         status_layout.addWidget(self.status_label)
-        status_layout.addStretch()
+        status_layout.addStretch(1)
+        status_layout.addWidget(self.mode_label)
         layout.addLayout(status_layout)
 
-        buttons_layout = QHBoxLayout()
+        button_layout = QHBoxLayout()
         self.start_button = QPushButton("Start Analysis")
         self.start_button.clicked.connect(self.start_analysis)
-        buttons_layout.addWidget(self.start_button)
+        button_layout.addWidget(self.start_button)
 
         self.stop_button = QPushButton("Stop")
         self.stop_button.clicked.connect(self.stop_analysis)
         self.stop_button.setEnabled(False)
-        buttons_layout.addWidget(self.stop_button)
+        button_layout.addWidget(self.stop_button)
 
-        layout.addLayout(buttons_layout)
-
-        self.balance_button = QPushButton("Mode: PRACTICE")
-        self.balance_button.clicked.connect(self.toggle_balance_mode)
-        layout.addWidget(self.balance_button)
-
-        layout.addStretch()
+        layout.addLayout(button_layout)
+        layout.addStretch(1)
         self.settings_tab.setLayout(layout)
 
     def toggle_strategy(self, name, state):
@@ -445,18 +537,18 @@ class BotIQWindow(QMainWindow):
         if self.worker and self.worker.is_alive():
             return
         if not Iq.check_connect():
-            self.log_message("Connection lost. Trying to reconnect...")
+            self.append_log("Connection lost. Reconnecting...")
             Iq.connect()
+            Iq.change_balance("PRACTICE")
             if not Iq.check_connect():
-                self.log_message("Unable to connect to IQ Option.")
+                self.append_log("Unable to reconnect to IQ Option.")
                 return
-            Iq.change_balance(self.balance_mode)
         self.worker = Worker(Iq, self.signal_queue, self.logger, self.get_active_strategies)
         self.worker.start()
         self.status_label.setText("Status: Running")
         self.start_button.setEnabled(False)
         self.stop_button.setEnabled(True)
-        self.log_message("Analysis started.")
+        self.append_log("Analysis started.")
 
     def stop_analysis(self):
         if self.worker:
@@ -466,52 +558,71 @@ class BotIQWindow(QMainWindow):
         self.status_label.setText("Status: Idle")
         self.start_button.setEnabled(True)
         self.stop_button.setEnabled(False)
-        self.log_message("Analysis stopped.")
+        self.append_log("Analysis stopped.")
 
-    def toggle_balance_mode(self):
-        self.balance_mode = "REAL" if self.balance_mode == "PRACTICE" else "PRACTICE"
-        try:
-            Iq.change_balance(self.balance_mode)
-        except Exception as error:
-            self.log_message(f"Unable to switch balance: {error}")
-            self.balance_mode = "PRACTICE"
-            Iq.change_balance(self.balance_mode)
-        self.balance_button.setText(f"Mode: {self.balance_mode}")
-        self.log_message(f"Balance mode set to {self.balance_mode}.")
-
-    def log_message(self, message):
+    def append_log(self, message):
         timestamp = dt.datetime.now().strftime("%H:%M:%S")
         formatted = f"[{timestamp}] {message}"
         print(formatted)
         self.log_view.append(formatted)
+        scrollbar = self.log_view.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
 
     def process_queue(self):
         while not self.signal_queue.empty():
-            update = self.signal_queue.get()
-            if update.get("type") == "update":
-                self.apply_update(update["data"])
+            entry = self.signal_queue.get()
+            if entry.get("log_only"):
+                self.append_log(entry["log_only"])
+                continue
+            self.update_table(entry)
+            votes_summary = ", ".join(f"{key}:{value}" for key, value in entry.get("votes", {}).items())
+            log_text = f"{entry['datetime']} | {entry['symbol']} | {entry['signal']} | Conf: {entry['confidence']:.2f}"
+            if votes_summary:
+                log_text += f" | {votes_summary}"
+            self.log_view.append(log_text)
+            scrollbar = self.log_view.verticalScrollBar()
+            scrollbar.setValue(scrollbar.maximum())
 
-    def apply_update(self, entry):
+    def update_table(self, entry):
         symbol = entry["symbol"]
         if symbol not in SYMBOLS:
             return
         row = SYMBOLS.index(symbol)
-        indicators = entry["indicators"]
-        votes = entry.get("votes", {})
+        indicators = entry.get("indicators", {})
 
-        self.signal_table.setItem(row, 1, QTableWidgetItem(f"{indicators['rsi']:.2f}"))
-        ema_text = f"{indicators['ema_fast']:.5f} / {indicators['ema_slow']:.5f}"
-        self.signal_table.setItem(row, 2, QTableWidgetItem(ema_text))
-        macd_text = f"{indicators['macd']:.5f} / {indicators['macd_signal']:.5f}"
-        self.signal_table.setItem(row, 3, QTableWidgetItem(macd_text))
-        self.signal_table.setItem(row, 4, QTableWidgetItem(entry["signal"]))
-        self.signal_table.setItem(row, 5, QTableWidgetItem(f"{entry['confidence']:.2f}"))
-        self.signal_table.setItem(row, 6, QTableWidgetItem(entry["datetime"]))
-
-        vote_summary = ", ".join(f"{key}:{value}" for key, value in votes.items())
-        self.log_view.append(
-            f"{entry['datetime']} | {symbol} | {entry['signal']} | Conf: {entry['confidence']:.2f} | {vote_summary}"
+        signal_item = QTableWidgetItem(entry["signal"])
+        signal_item.setTextAlignment(Qt.AlignCenter)
+        confidence_item = QTableWidgetItem(f"{entry['confidence']:.2f}")
+        confidence_item.setTextAlignment(Qt.AlignCenter)
+        rsi_item = QTableWidgetItem(f"{indicators.get('rsi', 0):.2f}")
+        rsi_item.setTextAlignment(Qt.AlignCenter)
+        ema_item = QTableWidgetItem(
+            f"{indicators.get('ema_fast', 0):.5f} / {indicators.get('ema_slow', 0):.5f}"
         )
+        ema_item.setTextAlignment(Qt.AlignCenter)
+        time_item = QTableWidgetItem(entry["datetime"])
+        time_item.setTextAlignment(Qt.AlignCenter)
+
+        base_color = QColor(14, 17, 22)
+        if entry["signal"] == "CALL":
+            background = QColor(34, 139, 34)
+        elif entry["signal"] == "PUT":
+            background = QColor(178, 34, 34)
+        else:
+            background = base_color
+
+        for col, item in enumerate([
+            signal_item,
+            confidence_item,
+            rsi_item,
+            ema_item,
+            time_item,
+        ], start=1):
+            if entry["signal"] in {"CALL", "PUT"}:
+                item.setBackground(background)
+            else:
+                item.setBackground(base_color)
+            self.signal_table.setItem(row, col, item)
 
     def closeEvent(self, event):
         self.stop_analysis()
@@ -519,11 +630,8 @@ class BotIQWindow(QMainWindow):
 
 
 def main():
-    if not Iq.check_connect():
-        print("Connection to IQ Option failed. Please verify your credentials.")
-        return
     app = QApplication(sys.argv)
-    window = BotIQWindow()
+    window = MainWindow()
     window.show()
     sys.exit(app.exec_())
 
