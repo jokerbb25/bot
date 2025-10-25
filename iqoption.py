@@ -49,15 +49,35 @@ JSON_MEMORY = "learning_memory.json"
 IQ_EMAIL = os.environ.get("IQ_EMAIL", "YOUR_EMAIL")
 IQ_PASSWORD = os.environ.get("IQ_PASSWORD", "YOUR_PASSWORD")
 
-print("🔌 Connecting to IQ Option...")
-Iq = IQ_Option(IQ_EMAIL, IQ_PASSWORD)
-Iq.connect()
-Iq.change_balance("PRACTICE")
 
-if not Iq.check_connect():
-    print("❌ Failed to connect to IQ Option.")
-    sys.exit()
-print("✅ Connected to IQ Option (Practice Mode)\n")
+def connect_iq(email, password, retries=3):
+    from iqoptionapi.stable_api import IQ_Option as IQClient
+
+    for attempt in range(retries):
+        try:
+            print(f"🔌 Attempt {attempt + 1}: Connecting to IQ Option...")
+            iq_instance = IQClient(email, password)
+            iq_instance.connect()
+            time.sleep(2)
+            if iq_instance.check_connect():
+                iq_instance.change_balance("PRACTICE")
+                print("✅ Connected successfully.")
+                return iq_instance
+            print("⚠️ Connection failed, retrying...")
+        except Exception as error:
+            print(f"❌ Error: {error}")
+        time.sleep(3)
+    print("🚫 Could not connect after retries.")
+    return None
+
+
+Iq = connect_iq(IQ_EMAIL, IQ_PASSWORD)
+if not Iq:
+    print("❌ IQ Option not responding. GUI will still open in offline mode.")
+    print("⚠️ Running in offline/demo mode (no data).")
+else:
+    print("✅ IQ Option connected (Practice).")
+    print("📡 Connection verified, fetching candles.")
 
 
 def calculate_rsi(df, period=14):
@@ -260,9 +280,57 @@ class Worker(threading.Thread):
         self.logger = gui.logger
         self.stop_event = threading.Event()
         self.last_processed = {symbol: None for symbol in SYMBOLS}
+        self.offline_logged = False
 
     def run(self):
         while not self.stop_event.is_set():
+            if self.iq_api is None:
+                if not self.offline_logged:
+                    message = "IQ Option connection unavailable. Running offline."
+                    print(message)
+                    self.signal_queue.put(
+                        {
+                            "datetime": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            "symbol": "SYSTEM",
+                            "signal": "OFFLINE",
+                            "confidence": 0.0,
+                            "indicators": {},
+                            "votes": {},
+                            "log_only": message,
+                        }
+                    )
+                    self.offline_logged = True
+                if self.stop_event.wait(SLEEP_TIME):
+                    break
+                continue
+
+            try:
+                connected = self.iq_api.check_connect()
+            except Exception as error:
+                print(f"⚠️ Connection check failed: {error}")
+                connected = False
+
+            if not connected:
+                if not self.offline_logged:
+                    warning = "IQ Option connection lost. Waiting to reconnect..."
+                    print(warning)
+                    self.signal_queue.put(
+                        {
+                            "datetime": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                            "symbol": "SYSTEM",
+                            "signal": "DISCONNECTED",
+                            "confidence": 0.0,
+                            "indicators": {},
+                            "votes": {},
+                            "log_only": warning,
+                        }
+                    )
+                    self.offline_logged = True
+                if self.stop_event.wait(5):
+                    break
+                continue
+
+            self.offline_logged = False
             cycle_start = time.time()
             strategies = self.gui.get_active_strategies()
             for symbol in SYMBOLS:
@@ -534,16 +602,33 @@ class MainWindow(QMainWindow):
             return dict(self.active_strategies)
 
     def toggle_start(self, start):
+        global Iq
         if start:
             if self.worker and self.worker.is_alive():
                 return
-            if not Iq.check_connect():
-                self.append_log("Connection lost. Reconnecting...")
-                Iq.connect()
-                Iq.change_balance("PRACTICE")
-                if not Iq.check_connect():
-                    self.append_log("Unable to reconnect to IQ Option.")
-                    return
+            if Iq is None:
+                self.append_log("Attempting to connect to IQ Option...")
+                Iq = connect_iq(IQ_EMAIL, IQ_PASSWORD)
+                if Iq:
+                    self.append_log("IQ Option connection restored.")
+                else:
+                    self.append_log("Running without live IQ Option data.")
+            else:
+                try:
+                    connected = Iq.check_connect()
+                except Exception as error:
+                    connected = False
+                    self.append_log(f"Connection check failed: {error}")
+                if not connected:
+                    self.append_log("Connection lost. Reconnecting...")
+                    reconnected = connect_iq(IQ_EMAIL, IQ_PASSWORD)
+                    if reconnected:
+                        Iq = reconnected
+                        self.append_log("Reconnected to IQ Option.")
+                    else:
+                        self.append_log("Unable to reconnect. Running offline.")
+            mode_text = "Mode: Practice" if Iq else "Mode: Offline"
+            self.mode_label.setText(mode_text)
             self.worker = Worker(Iq, self)
             self.worker.start()
             self.status_label.setText("Status: Running")
@@ -633,14 +718,9 @@ class MainWindow(QMainWindow):
         event.accept()
 
 
-def main():
+if __name__ == "__main__":
+    print("🟢 Launching GUI...")
     app = QApplication(sys.argv)
     window = MainWindow()
     window.show()
-    print("✅ GUI initialized. Ready.")
     sys.exit(app.exec_())
-
-
-if __name__ == "__main__":
-    print("🟢 Starting botIQ Ultimate GUI...")
-    main()
