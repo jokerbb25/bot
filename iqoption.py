@@ -253,19 +253,19 @@ class SignalLogger:
 
 
 class Worker(threading.Thread):
-    def __init__(self, iq_api, signal_queue, logger, strategy_supplier):
+    def __init__(self, iq_api, gui):
         super().__init__(daemon=True)
         self.iq_api = iq_api
-        self.signal_queue = signal_queue
-        self.logger = logger
-        self.strategy_supplier = strategy_supplier
+        self.gui = gui
+        self.signal_queue = gui.signal_queue
+        self.logger = gui.logger
         self.stop_event = threading.Event()
         self.last_processed = {symbol: None for symbol in SYMBOLS}
 
     def run(self):
         while not self.stop_event.is_set():
             cycle_start = time.time()
-            strategies = self.strategy_supplier()
+            strategies = self.gui.get_active_strategies()
             for symbol in SYMBOLS:
                 if self.stop_event.is_set():
                     break
@@ -513,11 +513,11 @@ class MainWindow(QMainWindow):
 
         button_layout = QHBoxLayout()
         self.start_button = QPushButton("Start Analysis")
-        self.start_button.clicked.connect(self.start_analysis)
+        self.start_button.clicked.connect(lambda: self.toggle_start(True))
         button_layout.addWidget(self.start_button)
 
         self.stop_button = QPushButton("Stop")
-        self.stop_button.clicked.connect(self.stop_analysis)
+        self.stop_button.clicked.connect(lambda: self.toggle_start(False))
         self.stop_button.setEnabled(False)
         button_layout.addWidget(self.stop_button)
 
@@ -533,32 +533,32 @@ class MainWindow(QMainWindow):
         with self.strategy_lock:
             return dict(self.active_strategies)
 
-    def start_analysis(self):
-        if self.worker and self.worker.is_alive():
-            return
-        if not Iq.check_connect():
-            self.append_log("Connection lost. Reconnecting...")
-            Iq.connect()
-            Iq.change_balance("PRACTICE")
-            if not Iq.check_connect():
-                self.append_log("Unable to reconnect to IQ Option.")
+    def toggle_start(self, start):
+        if start:
+            if self.worker and self.worker.is_alive():
                 return
-        self.worker = Worker(Iq, self.signal_queue, self.logger, self.get_active_strategies)
-        self.worker.start()
-        self.status_label.setText("Status: Running")
-        self.start_button.setEnabled(False)
-        self.stop_button.setEnabled(True)
-        self.append_log("Analysis started.")
-
-    def stop_analysis(self):
-        if self.worker:
-            self.worker.stop()
-            self.worker.join()
-            self.worker = None
-        self.status_label.setText("Status: Idle")
-        self.start_button.setEnabled(True)
-        self.stop_button.setEnabled(False)
-        self.append_log("Analysis stopped.")
+            if not Iq.check_connect():
+                self.append_log("Connection lost. Reconnecting...")
+                Iq.connect()
+                Iq.change_balance("PRACTICE")
+                if not Iq.check_connect():
+                    self.append_log("Unable to reconnect to IQ Option.")
+                    return
+            self.worker = Worker(Iq, self)
+            self.worker.start()
+            self.status_label.setText("Status: Running")
+            self.start_button.setEnabled(False)
+            self.stop_button.setEnabled(True)
+            self.append_log("Analysis started.")
+        else:
+            if self.worker:
+                self.worker.stop()
+                self.worker.join()
+                self.worker = None
+            self.status_label.setText("Status: Idle")
+            self.start_button.setEnabled(True)
+            self.stop_button.setEnabled(False)
+            self.append_log("Analysis stopped.")
 
     def append_log(self, message):
         timestamp = dt.datetime.now().strftime("%H:%M:%S")
@@ -625,7 +625,7 @@ class MainWindow(QMainWindow):
             self.signal_table.setItem(row, col, item)
 
     def closeEvent(self, event):
-        self.stop_analysis()
+        self.toggle_start(False)
         event.accept()
 
 
@@ -633,6 +633,7 @@ def main():
     app = QApplication(sys.argv)
     window = MainWindow()
     window.show()
+    print("✅ Starting GUI...")
     sys.exit(app.exec_())
 
 
