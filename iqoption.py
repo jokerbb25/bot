@@ -4,7 +4,6 @@ import time
 import json
 import threading
 import datetime as dt
-from queue import Queue
 
 import pandas as pd
 import numpy as np
@@ -290,13 +289,13 @@ class Worker(threading.Thread):
         super().__init__(daemon=True)
         self.iq = iq_api
         self.gui = gui
-        self.signal_queue = gui.signal_queue
         self.logger = gui.logger
         self.running = True
-        self.last_from = {symbol: None for symbol in SYMBOLS}
+        self.last_ts = {symbol: None for symbol in SYMBOLS}
         self.offline_logged = False
 
     def run(self):
+        print("[INFO] Analysis loop started.")
         while self.running:
             try:
                 for symbol in SYMBOLS:
@@ -309,24 +308,14 @@ class Worker(threading.Thread):
                 time.sleep(5)
 
     def process_symbol(self, symbol):
-        global Iq, WIN_COUNT, LOSS_COUNT, open_positions
+        global Iq, open_positions, WIN_COUNT, LOSS_COUNT
         if not self.running:
             return
         if self.iq is None:
             if not self.offline_logged:
                 message = "IQ Option connection unavailable. Running offline."
                 print(message)
-                self.signal_queue.put(
-                    {
-                        "datetime": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        "symbol": "SYSTEM",
-                        "signal": "OFFLINE",
-                        "confidence": 0.0,
-                        "indicators": {},
-                        "votes": {},
-                        "log_only": message,
-                    }
-                )
+                QTimer.singleShot(0, lambda msg=message: self.gui.append_log(msg))
                 self.offline_logged = True
             return
 
@@ -353,87 +342,76 @@ class Worker(threading.Thread):
         except Exception as error:
             error_message = f"⚠️ {symbol} error: {error}"
             print(error_message)
-            self.signal_queue.put(
-                {
-                    "datetime": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                    "symbol": symbol,
-                    "signal": "ERROR",
-                    "confidence": 0.0,
-                    "indicators": {},
-                    "votes": {"Error": str(error)},
-                    "log_only": error_message,
-                }
-            )
+            QTimer.singleShot(0, lambda msg=error_message: self.gui.append_log(msg))
             return
 
         if not candles:
             return
 
-        last_from = int(candles[-1]["from"])
-        if self.last_from.get(symbol) == last_from:
+        frame = pd.DataFrame(candles)[["from", "open", "close", "min", "max"]]
+        frame["time"] = pd.to_datetime(frame["from"], unit="s")
+        frame.set_index("time", inplace=True)
+        frame.sort_index(inplace=True)
+
+        last_timestamp = frame.index[-1]
+        previous_timestamp = self.last_ts.get(symbol)
+        if previous_timestamp is not None and last_timestamp == previous_timestamp:
             return
+        self.last_ts[symbol] = last_timestamp
 
-        df = pd.DataFrame(candles)
-        df["time"] = pd.to_datetime(df["from"], unit="s")
-        df.set_index("time", inplace=True)
-        df.sort_index(inplace=True)
-        current_timestamp = df.index[-1]
+        frame["rsi"] = calculate_rsi(frame)
+        frame["ema_fast"] = calculate_ema(frame, 9)
+        frame["ema_slow"] = calculate_ema(frame, 21)
+        macd_line, signal_line = calculate_macd(frame)
+        frame["macd"] = macd_line
+        frame["signal_macd"] = signal_line
+        boll_upper, boll_mid, boll_lower = calculate_bollinger(frame)
+        frame["boll_upper"] = boll_upper
+        frame["boll_mid"] = boll_mid
+        frame["boll_lower"] = boll_lower
+        stoch_k, stoch_d = calculate_stochastic(frame)
+        frame["stoch_k"] = stoch_k
+        frame["stoch_d"] = stoch_d
+        frame["momentum"] = calculate_momentum(frame)
+        frame["volatility"] = calculate_volatility(frame)
 
-        trade_result = "PENDING"
-        if symbol in open_positions and current_timestamp != open_positions[symbol]["timestamp"]:
-            entry = open_positions.pop(symbol)
-            entry_price = entry["open_price"]
-            close_price = df["close"].iloc[-1]
-            signal_direction = entry["signal"]
-            if signal_direction == "CALL":
-                result = "WIN" if close_price > entry_price else "LOSS"
-            else:
-                result = "WIN" if close_price < entry_price else "LOSS"
-            if result == "WIN":
-                WIN_COUNT += 1
-            else:
-                LOSS_COUNT += 1
-            trade_result = result
-            QTimer.singleShot(
-                0,
-                lambda s=symbol, r=result, p1=entry_price, p2=close_price: self.gui.append_log(
-                    f"🎯 {s} closed {r} → {p1:.5f} → {p2:.5f}"
-                ),
-            )
-            QTimer.singleShot(0, lambda: self.gui.update_stats(WIN_COUNT, LOSS_COUNT))
-
-        df["rsi"] = calculate_rsi(df)
-        df["ema_fast"] = calculate_ema(df, 9)
-        df["ema_slow"] = calculate_ema(df, 21)
-        macd_line, signal_line = calculate_macd(df)
-        df["macd"] = macd_line
-        df["signal_macd"] = signal_line
-        boll_upper, boll_mid, boll_lower = calculate_bollinger(df)
-        df["boll_upper"] = boll_upper
-        df["boll_mid"] = boll_mid
-        df["boll_lower"] = boll_lower
-        stoch_k, stoch_d = calculate_stochastic(df)
-        df["stoch_k"] = stoch_k
-        df["stoch_d"] = stoch_d
-        df["momentum"] = calculate_momentum(df)
-        df["volatility"] = calculate_volatility(df)
-
-        analysis_df = df.dropna().copy()
+        analysis_df = frame.dropna().copy()
         if len(analysis_df) < 2:
-            self.last_from[symbol] = last_from
             return
 
         strategies = self.gui.get_active_strategies()
         signal, confidence, votes = get_signal(analysis_df, strategies)
         latest = analysis_df.iloc[-1]
-        timestamp = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        timestamp_str = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        display_time = dt.datetime.now().strftime("%H:%M:%S")
+        trade_result = "PENDING"
+
+        log_message = f"[{timestamp_str}] {symbol} → {signal} (Conf: {confidence:.2f})"
+        print(log_message)
+
+        QTimer.singleShot(
+            0,
+            lambda s=symbol,
+            sig=signal,
+            conf=confidence,
+            rsi=float(latest["rsi"]),
+            ema_fast=float(latest["ema_fast"]),
+            ema_slow=float(latest["ema_slow"]),
+            stamp=timestamp_str: self.gui.update_table(s, sig, conf, rsi, ema_fast, ema_slow, stamp),
+        )
+        QTimer.singleShot(
+            0,
+            lambda s=symbol, sig=signal, conf=confidence, t=display_time: self.gui.append_log(
+                f"[{t}] {s} → {sig} (Conf: {conf:.2f})"
+            ),
+        )
 
         if confidence >= 0.55 and signal != "NONE" and symbol not in open_positions:
             open_price = float(latest["close"])
             open_positions[symbol] = {
                 "signal": signal,
                 "open_price": open_price,
-                "timestamp": current_timestamp,
+                "timestamp": last_timestamp,
             }
             QTimer.singleShot(
                 0,
@@ -442,8 +420,31 @@ class Worker(threading.Thread):
                 ),
             )
 
-        entry = {
-            "datetime": timestamp,
+        if symbol in open_positions:
+            entry = open_positions[symbol]
+            if last_timestamp > entry["timestamp"]:
+                close_price = float(latest["close"])
+                direction = entry["signal"]
+                result = "WIN" if (
+                    (direction == "CALL" and close_price > entry["open_price"]) or
+                    (direction == "PUT" and close_price < entry["open_price"])
+                ) else "LOSS"
+                if result == "WIN":
+                    WIN_COUNT += 1
+                else:
+                    LOSS_COUNT += 1
+                trade_result = result
+                QTimer.singleShot(
+                    0,
+                    lambda s=symbol, r=result, o=entry["open_price"], c=close_price: self.gui.append_log(
+                        f"🎯 {s} {r} → {o:.5f} → {c:.5f}"
+                    ),
+                )
+                QTimer.singleShot(0, lambda: self.gui.update_stats(WIN_COUNT, LOSS_COUNT))
+                del open_positions[symbol]
+
+        entry_data = {
+            "datetime": timestamp_str,
             "symbol": symbol,
             "signal": signal,
             "confidence": confidence,
@@ -464,12 +465,7 @@ class Worker(threading.Thread):
             "votes": votes,
             "trade_result": trade_result,
         }
-
-        log_message = f"[{timestamp}] {symbol} → {signal} (Conf: {confidence:.2f})"
-        print(log_message)
-        self.logger.append(entry)
-        self.signal_queue.put(entry)
-        self.last_from[symbol] = last_from
+        self.logger.append(entry_data)
 
     def stop(self):
         self.running = False
@@ -539,7 +535,6 @@ class MainWindow(QMainWindow):
             """
         )
 
-        self.signal_queue = Queue()
         self.logger = SignalLogger(CSV_FILE, JSON_MEMORY)
         self.worker = None
         self.strategy_lock = threading.Lock()
@@ -573,11 +568,6 @@ class MainWindow(QMainWindow):
         self._build_strategies_tab()
         self._build_log_tab()
         self._build_settings_tab()
-
-        self.update_timer = QTimer()
-        self.update_timer.setInterval(500)
-        self.update_timer.timeout.connect(self.process_queue)
-        self.update_timer.start()
 
     def _build_dashboard_tab(self):
         layout = QVBoxLayout()
@@ -655,7 +645,7 @@ class MainWindow(QMainWindow):
             return dict(self.active_strategies)
 
     def toggle_start(self, start):
-        global Iq
+        global Iq, open_positions, WIN_COUNT, LOSS_COUNT
         if start:
             if self.worker and self.worker.is_alive():
                 return
@@ -679,7 +669,6 @@ class MainWindow(QMainWindow):
                         self.append_log("Reconnected to IQ Option.")
                     else:
                         self.append_log("Unable to reconnect. Running offline.")
-            global open_positions, WIN_COUNT, LOSS_COUNT
             open_positions = {}
             WIN_COUNT = 0
             LOSS_COUNT = 0
@@ -703,36 +692,16 @@ class MainWindow(QMainWindow):
 
     def append_log(self, message):
         timestamp = dt.datetime.now().strftime("%H:%M:%S")
-        formatted = f"[{timestamp}] {message}"
+        formatted = f"[{timestamp}] {message}" if not message.startswith("[") else message
         print(formatted)
         self.log_view.append(formatted)
         scrollbar = self.log_view.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
 
-    def process_queue(self):
-        while not self.signal_queue.empty():
-            entry = self.signal_queue.get()
-            if entry.get("log_only"):
-                self.append_log(entry["log_only"])
-                continue
-            self.update_table(entry)
-            votes_summary = ", ".join(f"{key}:{value}" for key, value in entry.get("votes", {}).items())
-            log_text = f"{entry['datetime']} | {entry['symbol']} | {entry['signal']} | Conf: {entry['confidence']:.2f}"
-            if votes_summary:
-                log_text += f" | {votes_summary}"
-            trade_result = entry.get("trade_result")
-            if trade_result and trade_result != "PENDING":
-                log_text += f" | Result: {trade_result}"
-            self.log_view.append(log_text)
-            scrollbar = self.log_view.verticalScrollBar()
-            scrollbar.setValue(scrollbar.maximum())
-
-    def update_table(self, entry):
-        symbol = entry["symbol"]
+    def update_table(self, symbol, signal, confidence, rsi, ema_fast, ema_slow, timestamp):
         if symbol not in SYMBOLS:
             return
         row = SYMBOLS.index(symbol)
-        indicators = entry.get("indicators", {})
 
         symbol_item = self.signal_table.item(row, 0)
         if symbol_item is None:
@@ -740,25 +709,23 @@ class MainWindow(QMainWindow):
             symbol_item.setTextAlignment(Qt.AlignCenter)
             self.signal_table.setItem(row, 0, symbol_item)
 
-        signal_item = QTableWidgetItem(entry["signal"])
+        signal_item = QTableWidgetItem(signal)
         signal_item.setTextAlignment(Qt.AlignCenter)
-        confidence_item = QTableWidgetItem(f"{entry['confidence']:.2f}")
+        confidence_item = QTableWidgetItem(f"{confidence:.2f}")
         confidence_item.setTextAlignment(Qt.AlignCenter)
-        rsi_item = QTableWidgetItem(f"{indicators.get('rsi', 0.0):.2f}")
+        rsi_item = QTableWidgetItem(f"{rsi:.2f}")
         rsi_item.setTextAlignment(Qt.AlignCenter)
-        ema_item = QTableWidgetItem(
-            f"{indicators.get('ema_fast', 0.0):.5f} / {indicators.get('ema_slow', 0.0):.5f}"
-        )
+        ema_item = QTableWidgetItem(f"{ema_fast:.5f} / {ema_slow:.5f}")
         ema_item.setTextAlignment(Qt.AlignCenter)
-        time_item = QTableWidgetItem(entry["datetime"])
+        time_item = QTableWidgetItem(timestamp)
         time_item.setTextAlignment(Qt.AlignCenter)
 
         neutral_color = QColor(14, 17, 22)
         call_color = QColor(34, 139, 34)
         put_color = QColor(178, 34, 34)
-        if entry["signal"] == "CALL":
+        if signal == "CALL":
             background = call_color
-        elif entry["signal"] == "PUT":
+        elif signal == "PUT":
             background = put_color
         else:
             background = neutral_color
