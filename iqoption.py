@@ -39,11 +39,14 @@ SYMBOLS = [
 ]
 INTERVAL = 60
 CANDLE_COUNT = 200
-SLEEP_TIME = 60
+SLEEP_TIME = 30
 CSV_FILE = "signals_iq.csv"
 JSON_MEMORY = "learning_memory.json"
 IQ_EMAIL = "fornerinoalejandro031@gmail.com"
 IQ_PASSWORD = "484572ale"
+open_positions = {}
+WIN_COUNT = 0
+LOSS_COUNT = 0
 
 
 def connect_iq_dual(email, password, retries=3):
@@ -234,7 +237,7 @@ class SignalLogger:
         if not os.path.exists(self.csv_path):
             with open(self.csv_path, "w", encoding="utf-8") as file:
                 file.write(
-                    "datetime,symbol,signal,confidence,rsi,ema_fast,ema_slow,macd,signal_macd,boll_upper,boll_lower,stoch_k,stoch_d,momentum,volatility\n"
+                    "datetime,symbol,signal,confidence,rsi,ema_fast,ema_slow,macd,signal_macd,boll_upper,boll_lower,stoch_k,stoch_d,momentum,volatility,result\n"
                 )
         if os.path.exists(self.json_path):
             with open(self.json_path, "r", encoding="utf-8") as file:
@@ -272,6 +275,7 @@ class SignalLogger:
                             f"{indicators.get('stoch_d', 0.0):.2f}",
                             f"{indicators.get('momentum', 0.0):.2f}",
                             f"{indicators.get('volatility', 0.0):.5f}",
+                            entry.get("trade_result", "PENDING"),
                         ]
                     )
                     + "\n"
@@ -288,153 +292,187 @@ class Worker(threading.Thread):
         self.gui = gui
         self.signal_queue = gui.signal_queue
         self.logger = gui.logger
-        self.stop_event = threading.Event()
-        self.last_processed = {symbol: None for symbol in SYMBOLS}
+        self.running = True
+        self.last_from = {symbol: None for symbol in SYMBOLS}
         self.offline_logged = False
 
     def run(self):
-        global Iq
-        while not self.stop_event.is_set():
-            if self.iq is None:
-                if not self.offline_logged:
-                    message = "IQ Option connection unavailable. Running offline."
-                    print(message)
-                    self.signal_queue.put(
-                        {
-                            "datetime": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                            "symbol": "SYSTEM",
-                            "signal": "OFFLINE",
-                            "confidence": 0.0,
-                            "indicators": {},
-                            "votes": {},
-                            "log_only": message,
-                        }
-                    )
-                    self.offline_logged = True
-                if self.stop_event.wait(SLEEP_TIME):
-                    break
-                continue
-
+        while self.running:
             try:
-                connected = hasattr(self.iq, "check_connect") and self.iq.check_connect()
-            except Exception as error:
-                print(f"⚠️ Connection check failed: {error}")
-                connected = False
-
-            if not connected:
-                print("🔁 Connection lost. Attempting reconnection...")
-                self.iq = connect_iq_dual(IQ_EMAIL, IQ_PASSWORD)
-                Iq = self.iq
-                if not self.iq:
-                    print("⚠️ Still offline; skipping this round.")
-                    if self.stop_event.wait(10):
+                for symbol in SYMBOLS:
+                    if not self.running:
                         break
-                    continue
-                print("✅ Reconnected successfully.")
-                continue
+                    self.process_symbol(symbol)
+                time.sleep(SLEEP_TIME)
+            except Exception as error:
+                print(f"⚠️ Worker error: {error}")
+                time.sleep(5)
 
-            self.offline_logged = False
-            cycle_start = time.time()
-            strategies = self.gui.get_active_strategies()
-            for symbol in SYMBOLS:
-                if self.stop_event.is_set():
-                    break
-                if not self.iq or not hasattr(self.iq, "check_connect") or not self.iq.check_connect():
-                    print(f"🔁 Lost connection at {symbol}. Trying reconnection...")
-                    self.iq = connect_iq_dual(IQ_EMAIL, IQ_PASSWORD)
-                    Iq = self.iq
-                    if not self.iq:
-                        print("⚠️ Still offline; skipping this round.")
-                        if self.stop_event.wait(10):
-                            break
-                        continue
-                    print("✅ Reconnected successfully.")
-                try:
-                    end_timestamp = time.time()
-                    candles = self.iq.get_candles(symbol, INTERVAL, CANDLE_COUNT, end_timestamp)
-                    if not candles:
-                        continue
-                    last_candle_time = int(candles[-1]["from"])
-                    if self.last_processed.get(symbol) == last_candle_time:
-                        continue
-                    df = pd.DataFrame(candles)
-                    df["time"] = pd.to_datetime(df["from"], unit="s")
-                    df.set_index("time", inplace=True)
-                    df.sort_index(inplace=True)
-
-                    df["rsi"] = calculate_rsi(df)
-                    df["ema_fast"] = calculate_ema(df, 9)
-                    df["ema_slow"] = calculate_ema(df, 21)
-                    macd_line, signal_line = calculate_macd(df)
-                    df["macd"] = macd_line
-                    df["signal_macd"] = signal_line
-                    boll_upper, boll_mid, boll_lower = calculate_bollinger(df)
-                    df["boll_upper"] = boll_upper
-                    df["boll_mid"] = boll_mid
-                    df["boll_lower"] = boll_lower
-                    stoch_k, stoch_d = calculate_stochastic(df)
-                    df["stoch_k"] = stoch_k
-                    df["stoch_d"] = stoch_d
-                    df["momentum"] = calculate_momentum(df)
-                    df["volatility"] = calculate_volatility(df)
-
-                    analysis_df = df.dropna().copy()
-                    if len(analysis_df) < 2:
-                        continue
-
-                    signal, confidence, votes = get_signal(analysis_df, strategies)
-                    latest = analysis_df.iloc[-1]
-                    timestamp = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-
-                    entry = {
-                        "datetime": timestamp,
-                        "symbol": symbol,
-                        "signal": signal,
-                        "confidence": confidence,
-                        "indicators": {
-                            "rsi": float(latest["rsi"]),
-                            "ema_fast": float(latest["ema_fast"]),
-                            "ema_slow": float(latest["ema_slow"]),
-                            "macd": float(latest["macd"]),
-                            "signal_macd": float(latest["signal_macd"]),
-                            "boll_upper": float(latest["boll_upper"]),
-                            "boll_lower": float(latest["boll_lower"]),
-                            "stoch_k": float(latest["stoch_k"]),
-                            "stoch_d": float(latest["stoch_d"]),
-                            "momentum": float(latest["momentum"]),
-                            "volatility": float(latest["volatility"]),
-                            "close": float(latest["close"]),
-                        },
-                        "votes": votes,
+    def process_symbol(self, symbol):
+        global Iq, WIN_COUNT, LOSS_COUNT, open_positions
+        if not self.running:
+            return
+        if self.iq is None:
+            if not self.offline_logged:
+                message = "IQ Option connection unavailable. Running offline."
+                print(message)
+                self.signal_queue.put(
+                    {
+                        "datetime": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        "symbol": "SYSTEM",
+                        "signal": "OFFLINE",
+                        "confidence": 0.0,
+                        "indicators": {},
+                        "votes": {},
+                        "log_only": message,
                     }
+                )
+                self.offline_logged = True
+            return
 
-                    log_message = f"[{timestamp}] {symbol} → {signal} (Conf: {confidence:.2f})"
-                    print(log_message)
-                    self.logger.append(entry)
-                    self.signal_queue.put(entry)
-                    self.last_processed[symbol] = last_candle_time
-                except Exception as exc:
-                    error_message = f"⚠️ {symbol} error: {exc}"
-                    print(error_message)
-                    self.signal_queue.put(
-                        {
-                            "datetime": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                            "symbol": symbol,
-                            "signal": "ERROR",
-                            "confidence": 0.0,
-                            "indicators": {},
-                            "votes": {"Error": str(exc)},
-                            "log_only": error_message,
-                        }
-                    )
-                    continue
-            elapsed = time.time() - cycle_start
-            remaining = max(0, SLEEP_TIME - elapsed)
-            if self.stop_event.wait(remaining):
-                break
+        try:
+            connected = hasattr(self.iq, "check_connect") and self.iq.check_connect()
+        except Exception as error:
+            print(f"⚠️ Connection check failed: {error}")
+            connected = False
+
+        if not connected:
+            print(f"🔁 Lost connection at {symbol}. Trying reconnection...")
+            self.iq = connect_iq_dual(IQ_EMAIL, IQ_PASSWORD)
+            Iq = self.iq
+            if not self.iq:
+                print("⚠️ Still offline; skipping this round.")
+                self.offline_logged = True
+                return
+            print("✅ Reconnected successfully.")
+
+        self.offline_logged = False
+
+        try:
+            candles = self.iq.get_candles(symbol, INTERVAL, CANDLE_COUNT, time.time())
+        except Exception as error:
+            error_message = f"⚠️ {symbol} error: {error}"
+            print(error_message)
+            self.signal_queue.put(
+                {
+                    "datetime": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    "symbol": symbol,
+                    "signal": "ERROR",
+                    "confidence": 0.0,
+                    "indicators": {},
+                    "votes": {"Error": str(error)},
+                    "log_only": error_message,
+                }
+            )
+            return
+
+        if not candles:
+            return
+
+        last_from = int(candles[-1]["from"])
+        if self.last_from.get(symbol) == last_from:
+            return
+
+        df = pd.DataFrame(candles)
+        df["time"] = pd.to_datetime(df["from"], unit="s")
+        df.set_index("time", inplace=True)
+        df.sort_index(inplace=True)
+        current_timestamp = df.index[-1]
+
+        trade_result = "PENDING"
+        if symbol in open_positions and current_timestamp != open_positions[symbol]["timestamp"]:
+            entry = open_positions.pop(symbol)
+            entry_price = entry["open_price"]
+            close_price = df["close"].iloc[-1]
+            signal_direction = entry["signal"]
+            if signal_direction == "CALL":
+                result = "WIN" if close_price > entry_price else "LOSS"
+            else:
+                result = "WIN" if close_price < entry_price else "LOSS"
+            if result == "WIN":
+                WIN_COUNT += 1
+            else:
+                LOSS_COUNT += 1
+            trade_result = result
+            QTimer.singleShot(
+                0,
+                lambda s=symbol, r=result, p1=entry_price, p2=close_price: self.gui.append_log(
+                    f"🎯 {s} closed {r} → {p1:.5f} → {p2:.5f}"
+                ),
+            )
+            QTimer.singleShot(0, lambda: self.gui.update_stats(WIN_COUNT, LOSS_COUNT))
+
+        df["rsi"] = calculate_rsi(df)
+        df["ema_fast"] = calculate_ema(df, 9)
+        df["ema_slow"] = calculate_ema(df, 21)
+        macd_line, signal_line = calculate_macd(df)
+        df["macd"] = macd_line
+        df["signal_macd"] = signal_line
+        boll_upper, boll_mid, boll_lower = calculate_bollinger(df)
+        df["boll_upper"] = boll_upper
+        df["boll_mid"] = boll_mid
+        df["boll_lower"] = boll_lower
+        stoch_k, stoch_d = calculate_stochastic(df)
+        df["stoch_k"] = stoch_k
+        df["stoch_d"] = stoch_d
+        df["momentum"] = calculate_momentum(df)
+        df["volatility"] = calculate_volatility(df)
+
+        analysis_df = df.dropna().copy()
+        if len(analysis_df) < 2:
+            self.last_from[symbol] = last_from
+            return
+
+        strategies = self.gui.get_active_strategies()
+        signal, confidence, votes = get_signal(analysis_df, strategies)
+        latest = analysis_df.iloc[-1]
+        timestamp = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+
+        if confidence >= 0.55 and signal != "NONE" and symbol not in open_positions:
+            open_price = float(latest["close"])
+            open_positions[symbol] = {
+                "signal": signal,
+                "open_price": open_price,
+                "timestamp": current_timestamp,
+            }
+            QTimer.singleShot(
+                0,
+                lambda s=symbol, sig=signal, price=open_price: self.gui.append_log(
+                    f"🚀 {s} opened {sig} @ {price:.5f}"
+                ),
+            )
+
+        entry = {
+            "datetime": timestamp,
+            "symbol": symbol,
+            "signal": signal,
+            "confidence": confidence,
+            "indicators": {
+                "rsi": float(latest["rsi"]),
+                "ema_fast": float(latest["ema_fast"]),
+                "ema_slow": float(latest["ema_slow"]),
+                "macd": float(latest["macd"]),
+                "signal_macd": float(latest["signal_macd"]),
+                "boll_upper": float(latest["boll_upper"]),
+                "boll_lower": float(latest["boll_lower"]),
+                "stoch_k": float(latest["stoch_k"]),
+                "stoch_d": float(latest["stoch_d"]),
+                "momentum": float(latest["momentum"]),
+                "volatility": float(latest["volatility"]),
+                "close": float(latest["close"]),
+            },
+            "votes": votes,
+            "trade_result": trade_result,
+        }
+
+        log_message = f"[{timestamp}] {symbol} → {signal} (Conf: {confidence:.2f})"
+        print(log_message)
+        self.logger.append(entry)
+        self.signal_queue.put(entry)
+        self.last_from[symbol] = last_from
 
     def stop(self):
-        self.stop_event.set()
+        self.running = False
 
 
 class MainWindow(QMainWindow):
@@ -543,6 +581,8 @@ class MainWindow(QMainWindow):
 
     def _build_dashboard_tab(self):
         layout = QVBoxLayout()
+        self.stats_label = QLabel("Wins: 0 | Losses: 0")
+        layout.addWidget(self.stats_label)
         self.signal_table = QTableWidget(len(SYMBOLS), 6)
         self.signal_table.setHorizontalHeaderLabels(
             ["Symbol", "Signal", "Confidence", "RSI", "EMA (9/21)", "Last Update"]
@@ -639,6 +679,11 @@ class MainWindow(QMainWindow):
                         self.append_log("Reconnected to IQ Option.")
                     else:
                         self.append_log("Unable to reconnect. Running offline.")
+            global open_positions, WIN_COUNT, LOSS_COUNT
+            open_positions = {}
+            WIN_COUNT = 0
+            LOSS_COUNT = 0
+            self.update_stats(WIN_COUNT, LOSS_COUNT)
             self.mode_label.setText("Mode: Practice" if Iq else "Mode: Offline")
             self.worker = Worker(Iq, self)
             self.worker.start()
@@ -675,6 +720,9 @@ class MainWindow(QMainWindow):
             log_text = f"{entry['datetime']} | {entry['symbol']} | {entry['signal']} | Conf: {entry['confidence']:.2f}"
             if votes_summary:
                 log_text += f" | {votes_summary}"
+            trade_result = entry.get("trade_result")
+            if trade_result and trade_result != "PENDING":
+                log_text += f" | Result: {trade_result}"
             self.log_view.append(log_text)
             scrollbar = self.log_view.verticalScrollBar()
             scrollbar.setValue(scrollbar.maximum())
@@ -723,6 +771,9 @@ class MainWindow(QMainWindow):
             self.signal_table.setItem(row, col, item)
         symbol_item.setBackground(background)
         self.signal_table.resizeColumnsToContents()
+
+    def update_stats(self, wins, losses):
+        self.stats_label.setText(f"Wins: {wins} | Losses: {losses}")
 
     def closeEvent(self, event):
         self.toggle_start(False)
