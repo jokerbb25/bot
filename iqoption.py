@@ -23,7 +23,6 @@ from PyQt5.QtWidgets import (
     QHeaderView,
 )
 from PyQt5.QtCore import QThread, QTimer, Qt, pyqtSignal
-from PyQt5.QtGui import QColor
 
 
 SYMBOLS = [
@@ -310,6 +309,7 @@ class Worker(QThread):
                 ema_value = float(dataframe["ema_fast"].iloc[-1])
                 last_close = float(dataframe["close"].iloc[-1])
                 self.table_signal.emit(symbol, signal, confidence, rsi_value, ema_value, now_text)
+                self.log_signal.emit(f"[{now_text}] {symbol} → {signal} ({confidence:.2f})")
                 if confidence >= MIN_CONFIDENCE and signal in {"CALL", "PUT"} and symbol not in self.open_trades:
                     self.open_trades[symbol] = {
                         "direction": signal,
@@ -486,25 +486,32 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout()
         self.stats_label = QLabel("Wins: 0 | Losses: 0")
         layout.addWidget(self.stats_label)
-        self.signal_table = QTableWidget(len(SYMBOLS), 6)
-        self.signal_table.setHorizontalHeaderLabels(
-            ["Symbol", "Signal", "Confidence", "RSI", "EMA (9/21)", "Last Update"]
-        )
-        self.signal_table.verticalHeader().setVisible(False)
-        self.signal_table.setEditTriggers(QTableWidget.NoEditTriggers)
-        self.signal_table.setAlternatingRowColors(True)
-        header = self.signal_table.horizontalHeader()
+        self.table = QTableWidget()
+        self.table.setEditTriggers(QTableWidget.NoEditTriggers)
+        self.table.setAlternatingRowColors(True)
+        header = self.table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.Stretch)
-        for index, symbol in enumerate(SYMBOLS):
-            symbol_item = QTableWidgetItem(symbol)
-            symbol_item.setTextAlignment(Qt.AlignCenter)
-            self.signal_table.setItem(index, 0, symbol_item)
-            for column in range(1, 6):
-                placeholder = QTableWidgetItem("--")
-                placeholder.setTextAlignment(Qt.AlignCenter)
-                self.signal_table.setItem(index, column, placeholder)
-        layout.addWidget(self.signal_table)
+        self.setup_table()
+        layout.addWidget(self.table)
         self.dashboard_tab.setLayout(layout)
+
+    def setup_table(self):
+        self.table.setColumnCount(6)
+        self.table.setHorizontalHeaderLabels(["Symbol", "Signal", "Conf.", "RSI", "EMA", "Time"])
+        self.table.setRowCount(len(SYMBOLS))
+        for index, symbol in enumerate(SYMBOLS):
+            self.table.setItem(index, 0, QTableWidgetItem(symbol))
+            self.table.setItem(index, 1, QTableWidgetItem("-"))
+            self.table.setItem(index, 2, QTableWidgetItem("-"))
+            self.table.setItem(index, 3, QTableWidgetItem("-"))
+            self.table.setItem(index, 4, QTableWidgetItem("-"))
+            self.table.setItem(index, 5, QTableWidgetItem("-"))
+            for column in range(6):
+                item = self.table.item(index, column)
+                if item:
+                    item.setTextAlignment(Qt.AlignCenter)
+        self.table.resizeColumnsToContents()
+        self.table.horizontalHeader().setStretchLastSection(True)
 
     def _build_strategies_tab(self):
         layout = QVBoxLayout()
@@ -520,9 +527,9 @@ class MainWindow(QMainWindow):
 
     def _build_log_tab(self):
         layout = QVBoxLayout()
-        self.log_view = QTextEdit()
-        self.log_view.setReadOnly(True)
-        layout.addWidget(self.log_view)
+        self.log_box = QTextEdit()
+        self.log_box.setReadOnly(True)
+        layout.addWidget(self.log_box)
         self.log_tab.setLayout(layout)
 
     def _build_settings_tab(self):
@@ -612,44 +619,38 @@ class MainWindow(QMainWindow):
         timestamp = dt.datetime.now().strftime("%H:%M:%S")
         formatted = message if message.startswith("[") else f"[{timestamp}] {message}"
         print(formatted)
-        self.log_view.append(formatted)
-        scrollbar = self.log_view.verticalScrollBar()
+        self.log_box.append(formatted)
+        scrollbar = self.log_box.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
 
     def update_table(self, symbol, signal, confidence, rsi, ema, timestamp):
-        for row in range(self.signal_table.rowCount()):
-            cell = self.signal_table.item(row, 0)
+        for row in range(self.table.rowCount()):
+            cell = self.table.item(row, 0)
             if cell and cell.text() == symbol:
-                signal_item = self.signal_table.item(row, 1)
-                confidence_item = self.signal_table.item(row, 2)
-                rsi_item = self.signal_table.item(row, 3)
-                ema_item = self.signal_table.item(row, 4)
-                time_item = self.signal_table.item(row, 5)
+                signal_item = self.table.item(row, 1)
+                confidence_item = self.table.item(row, 2)
+                rsi_item = self.table.item(row, 3)
+                ema_item = self.table.item(row, 4)
+                time_item = self.table.item(row, 5)
                 if signal_item:
                     signal_item.setText(signal)
-                    signal_item.setBackground(self._signal_color(signal))
                 if confidence_item:
                     confidence_item.setText(f"{confidence:.2f}")
-                    confidence_item.setBackground(self._signal_color(signal))
                 if rsi_item:
                     rsi_item.setText(f"{rsi:.2f}")
-                    rsi_item.setBackground(self._signal_color(signal))
                 if ema_item:
                     ema_item.setText(f"{ema:.5f}")
-                    ema_item.setBackground(self._signal_color(signal))
                 if time_item:
                     time_item.setText(timestamp)
-                    time_item.setBackground(self._signal_color(signal))
                 break
 
     def update_result(self, symbol, result):
-        for row in range(self.signal_table.rowCount()):
-            cell = self.signal_table.item(row, 0)
+        for row in range(self.table.rowCount()):
+            cell = self.table.item(row, 0)
             if cell and cell.text() == symbol:
-                result_item = self.signal_table.item(row, 2)
+                result_item = self.table.item(row, 2)
                 if result_item:
                     result_item.setText(result)
-                    result_item.setBackground(self._result_color(result))
                     result_item.setForeground(Qt.green if result == "WIN" else Qt.red)
                 break
 
@@ -665,20 +666,6 @@ class MainWindow(QMainWindow):
             QTimer.singleShot(60000, ping)
 
         ping()
-
-    def _signal_color(self, signal):
-        if signal == "CALL":
-            return QColor(34, 139, 34)
-        if signal == "PUT":
-            return QColor(178, 34, 34)
-        return QColor(14, 17, 22)
-
-    def _result_color(self, result):
-        if result == "WIN":
-            return QColor(34, 139, 34)
-        if result == "LOSS":
-            return QColor(178, 34, 34)
-        return QColor(14, 17, 22)
 
     def closeEvent(self, event):
         self.toggle_start(False)
