@@ -8,7 +8,6 @@ from queue import Queue
 
 import pandas as pd
 import numpy as np
-from iqoptionapi.stable_api import IQ_Option
 from PyQt5.QtWidgets import (
     QApplication,
     QMainWindow,
@@ -26,10 +25,7 @@ from PyQt5.QtWidgets import (
 )
 from PyQt5.QtCore import QTimer, Qt
 from PyQt5.QtGui import QColor
-from dotenv import load_dotenv
 
-
-load_dotenv()
 
 SYMBOLS = [
     "EURUSD",
@@ -46,38 +42,52 @@ CANDLE_COUNT = 200
 SLEEP_TIME = 60
 CSV_FILE = "signals_iq.csv"
 JSON_MEMORY = "learning_memory.json"
-IQ_EMAIL = os.environ.get("IQ_EMAIL", "YOUR_EMAIL")
-IQ_PASSWORD = os.environ.get("IQ_PASSWORD", "YOUR_PASSWORD")
+IQ_EMAIL = "fornerinoalejandro031@gmail.com"
+IQ_PASSWORD = "484572ale"
 
 
-def connect_iq(email, password, retries=3):
-    from iqoptionapi.stable_api import IQ_Option as IQClient
-
-    for attempt in range(retries):
-        try:
-            print(f"🔌 Attempt {attempt + 1}: Connecting to IQ Option...")
-            iq_instance = IQClient(email, password)
-            iq_instance.connect()
-            time.sleep(2)
-            if iq_instance.check_connect():
-                iq_instance.change_balance("PRACTICE")
-                print("✅ Connected successfully.")
-                return iq_instance
+def connect_iq_dual(email, password, retries=3):
+    """
+    Attempt to connect via iqoptionapi first.
+    If it fails, automatically fallback to api-iqoption-faria.
+    Returns a valid IQ_Option instance or None.
+    """
+    try:
+        from iqoptionapi.stable_api import IQ_Option
+        for attempt in range(1, retries + 1):
+            print(f"🔌 Attempt {attempt}: Connecting via iqoptionapi...")
+            iq = IQ_Option(email, password)
+            iq.connect()
+            time.sleep(3)
+            if iq.check_connect():
+                iq.change_balance("PRACTICE")
+                print("✅ Connected successfully using iqoptionapi.")
+                return iq
             print("⚠️ Connection failed, retrying...")
-        except Exception as error:
-            print(f"❌ Error: {error}")
-        time.sleep(3)
-    print("🚫 Could not connect after retries.")
+        print("❌ iqoptionapi connection failed.")
+    except Exception as error:
+        print(f"❌ iqoptionapi error: {error}")
+
+    print("🔁 Attempting fallback connection via api-iqoption-faria...")
+    try:
+        from api_iqoption_faria.client import IQ_Option as IQFaria
+        iq = IQFaria(email, password)
+        if iq.check_connect():
+            print("✅ Connected successfully using api-iqoption-faria.")
+            return iq
+        print("⚠️ api-iqoption-faria connection failed.")
+    except Exception as error:
+        print(f"❌ api-iqoption-faria error: {error}")
+
+    print("🚫 Could not connect with any available API.")
     return None
 
 
-Iq = connect_iq(IQ_EMAIL, IQ_PASSWORD)
+Iq = connect_iq_dual(IQ_EMAIL, IQ_PASSWORD)
 if not Iq:
-    print("❌ IQ Option not responding. GUI will still open in offline mode.")
-    print("⚠️ Running in offline/demo mode (no data).")
+    print("⚠️ Running in offline/demo mode (mock candles).")
 else:
-    print("✅ IQ Option connected (Practice).")
-    print("📡 Connection verified, fetching candles.")
+    print("📡 Connected to IQ Option (Practice Mode).")
 
 
 def calculate_rsi(df, period=14):
@@ -274,7 +284,7 @@ class SignalLogger:
 class Worker(threading.Thread):
     def __init__(self, iq_api, gui):
         super().__init__(daemon=True)
-        self.iq_api = iq_api
+        self.iq = iq_api
         self.gui = gui
         self.signal_queue = gui.signal_queue
         self.logger = gui.logger
@@ -283,8 +293,9 @@ class Worker(threading.Thread):
         self.offline_logged = False
 
     def run(self):
+        global Iq
         while not self.stop_event.is_set():
-            if self.iq_api is None:
+            if self.iq is None:
                 if not self.offline_logged:
                     message = "IQ Option connection unavailable. Running offline."
                     print(message)
@@ -305,29 +316,21 @@ class Worker(threading.Thread):
                 continue
 
             try:
-                connected = self.iq_api.check_connect()
+                connected = hasattr(self.iq, "check_connect") and self.iq.check_connect()
             except Exception as error:
                 print(f"⚠️ Connection check failed: {error}")
                 connected = False
 
             if not connected:
-                if not self.offline_logged:
-                    warning = "IQ Option connection lost. Waiting to reconnect..."
-                    print(warning)
-                    self.signal_queue.put(
-                        {
-                            "datetime": dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                            "symbol": "SYSTEM",
-                            "signal": "DISCONNECTED",
-                            "confidence": 0.0,
-                            "indicators": {},
-                            "votes": {},
-                            "log_only": warning,
-                        }
-                    )
-                    self.offline_logged = True
-                if self.stop_event.wait(5):
-                    break
+                print("🔁 Connection lost. Attempting reconnection...")
+                self.iq = connect_iq_dual(IQ_EMAIL, IQ_PASSWORD)
+                Iq = self.iq
+                if not self.iq:
+                    print("⚠️ Still offline; skipping this round.")
+                    if self.stop_event.wait(10):
+                        break
+                    continue
+                print("✅ Reconnected successfully.")
                 continue
 
             self.offline_logged = False
@@ -336,9 +339,19 @@ class Worker(threading.Thread):
             for symbol in SYMBOLS:
                 if self.stop_event.is_set():
                     break
+                if not self.iq or not hasattr(self.iq, "check_connect") or not self.iq.check_connect():
+                    print(f"🔁 Lost connection at {symbol}. Trying reconnection...")
+                    self.iq = connect_iq_dual(IQ_EMAIL, IQ_PASSWORD)
+                    Iq = self.iq
+                    if not self.iq:
+                        print("⚠️ Still offline; skipping this round.")
+                        if self.stop_event.wait(10):
+                            break
+                        continue
+                    print("✅ Reconnected successfully.")
                 try:
                     end_timestamp = time.time()
-                    candles = self.iq_api.get_candles(symbol, INTERVAL, CANDLE_COUNT, end_timestamp)
+                    candles = self.iq.get_candles(symbol, INTERVAL, CANDLE_COUNT, end_timestamp)
                     if not candles:
                         continue
                     last_candle_time = int(candles[-1]["from"])
@@ -573,7 +586,7 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout()
         status_layout = QHBoxLayout()
         self.status_label = QLabel("Status: Idle")
-        self.mode_label = QLabel("Mode: Practice")
+        self.mode_label = QLabel("Mode: Practice" if Iq else "Mode: Offline")
         status_layout.addWidget(self.status_label)
         status_layout.addStretch(1)
         status_layout.addWidget(self.mode_label)
@@ -608,27 +621,25 @@ class MainWindow(QMainWindow):
                 return
             if Iq is None:
                 self.append_log("Attempting to connect to IQ Option...")
-                Iq = connect_iq(IQ_EMAIL, IQ_PASSWORD)
+                Iq = connect_iq_dual(IQ_EMAIL, IQ_PASSWORD)
                 if Iq:
-                    self.append_log("IQ Option connection restored.")
+                    self.append_log("IQ Option connection established.")
                 else:
                     self.append_log("Running without live IQ Option data.")
             else:
                 try:
-                    connected = Iq.check_connect()
+                    connected = hasattr(Iq, "check_connect") and Iq.check_connect()
                 except Exception as error:
                     connected = False
                     self.append_log(f"Connection check failed: {error}")
                 if not connected:
                     self.append_log("Connection lost. Reconnecting...")
-                    reconnected = connect_iq(IQ_EMAIL, IQ_PASSWORD)
-                    if reconnected:
-                        Iq = reconnected
+                    Iq = connect_iq_dual(IQ_EMAIL, IQ_PASSWORD)
+                    if Iq:
                         self.append_log("Reconnected to IQ Option.")
                     else:
                         self.append_log("Unable to reconnect. Running offline.")
-            mode_text = "Mode: Practice" if Iq else "Mode: Offline"
-            self.mode_label.setText(mode_text)
+            self.mode_label.setText("Mode: Practice" if Iq else "Mode: Offline")
             self.worker = Worker(Iq, self)
             self.worker.start()
             self.status_label.setText("Status: Running")
