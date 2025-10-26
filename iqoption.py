@@ -1,7 +1,7 @@
 import sys
-import os
 import time
 import json
+import os
 import threading
 import datetime as dt
 
@@ -38,7 +38,7 @@ SYMBOLS = [
 ]
 INTERVAL = 60
 CANDLE_COUNT = 200
-SLEEP_TIME = 30
+SLEEP_TIME = 60
 CSV_FILE = "signals_iq.csv"
 JSON_MEMORY = "learning_memory.json"
 IQ_EMAIL = "fornerinoalejandro031@gmail.com"
@@ -291,11 +291,13 @@ class Worker(threading.Thread):
         self.gui = gui
         self.logger = gui.logger
         self.running = True
-        self.last_ts = {symbol: None for symbol in SYMBOLS}
         self.offline_logged = False
 
     def run(self):
-        print("[INFO] Analysis loop started.")
+        print("[INFO] Continuous analysis loop started.")
+        self.last_candle_time = {symbol: None for symbol in SYMBOLS}
+        global open_positions, WIN_COUNT, LOSS_COUNT
+
         while self.running:
             try:
                 for symbol in SYMBOLS:
@@ -311,6 +313,7 @@ class Worker(threading.Thread):
         global Iq, open_positions, WIN_COUNT, LOSS_COUNT
         if not self.running:
             return
+
         if self.iq is None:
             if not self.offline_logged:
                 message = "IQ Option connection unavailable. Running offline."
@@ -338,11 +341,12 @@ class Worker(threading.Thread):
         self.offline_logged = False
 
         try:
-            candles = self.iq.get_candles(symbol, INTERVAL, CANDLE_COUNT, time.time())
+            end_time = time.time()
+            candles = self.iq.get_candles(symbol, INTERVAL, CANDLE_COUNT, end_time)
         except Exception as error:
-            error_message = f"⚠️ {symbol} error: {error}"
-            print(error_message)
-            QTimer.singleShot(0, lambda msg=error_message: self.gui.append_log(msg))
+            message = f"⚠️ Error in {symbol}: {error}"
+            print(message)
+            QTimer.singleShot(0, lambda msg=message: self.gui.append_log(msg))
             return
 
         if not candles:
@@ -354,10 +358,10 @@ class Worker(threading.Thread):
         frame.sort_index(inplace=True)
 
         last_timestamp = frame.index[-1]
-        previous_timestamp = self.last_ts.get(symbol)
+        previous_timestamp = self.last_candle_time.get(symbol)
         if previous_timestamp is not None and last_timestamp == previous_timestamp:
             return
-        self.last_ts[symbol] = last_timestamp
+        self.last_candle_time[symbol] = last_timestamp
 
         frame["rsi"] = calculate_rsi(frame)
         frame["ema_fast"] = calculate_ema(frame, 9)
@@ -382,11 +386,11 @@ class Worker(threading.Thread):
         strategies = self.gui.get_active_strategies()
         signal, confidence, votes = get_signal(analysis_df, strategies)
         latest = analysis_df.iloc[-1]
-        timestamp_str = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        display_time = dt.datetime.now().strftime("%H:%M:%S")
+        timestamp_full = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        timestamp_display = dt.datetime.now().strftime("%H:%M:%S")
         trade_result = "PENDING"
 
-        log_message = f"[{timestamp_str}] {symbol} → {signal} (Conf: {confidence:.2f})"
+        log_message = f"[{timestamp_full}] {symbol} → {signal} (Conf: {confidence:.2f})"
         print(log_message)
 
         QTimer.singleShot(
@@ -397,14 +401,11 @@ class Worker(threading.Thread):
             rsi=float(latest["rsi"]),
             ema_fast=float(latest["ema_fast"]),
             ema_slow=float(latest["ema_slow"]),
-            stamp=timestamp_str: self.gui.update_table(s, sig, conf, rsi, ema_fast, ema_slow, stamp),
+            stamp=timestamp_full: self.gui.update_table(s, sig, conf, rsi, ema_fast, ema_slow, stamp),
         )
-        QTimer.singleShot(
-            0,
-            lambda s=symbol, sig=signal, conf=confidence, t=display_time: self.gui.append_log(
-                f"[{t}] {s} → {sig} (Conf: {conf:.2f})"
-            ),
-        )
+
+        display_message = f"[{timestamp_display}] {symbol} → {signal} (Conf: {confidence:.2f})"
+        QTimer.singleShot(0, lambda msg=display_message: self.gui.append_log(msg))
 
         if confidence >= 0.55 and signal != "NONE" and symbol not in open_positions:
             open_price = float(latest["close"])
@@ -434,9 +435,10 @@ class Worker(threading.Thread):
                 else:
                     LOSS_COUNT += 1
                 trade_result = result
+                open_price = entry["open_price"]
                 QTimer.singleShot(
                     0,
-                    lambda s=symbol, r=result, o=entry["open_price"], c=close_price: self.gui.append_log(
+                    lambda s=symbol, r=result, o=open_price, c=close_price: self.gui.append_log(
                         f"🎯 {s} {r} → {o:.5f} → {c:.5f}"
                     ),
                 )
@@ -444,7 +446,7 @@ class Worker(threading.Thread):
                 del open_positions[symbol]
 
         entry_data = {
-            "datetime": timestamp_str,
+            "datetime": timestamp_full,
             "symbol": symbol,
             "signal": signal,
             "confidence": confidence,
