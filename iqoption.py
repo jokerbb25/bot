@@ -39,7 +39,7 @@ INTERVAL = 60
 CANDLE_COUNT = 200
 SLEEP_TIME = 60
 TRADE_DURATION = 60
-MIN_CONFIDENCE = 0.65
+MIN_CONFIDENCE = 0.55
 CSV_FILE = "signals_iq.csv"
 IQ_EMAIL = "fornerinoalejandro031@gmail.com"
 IQ_PASSWORD = "484572ale"
@@ -150,6 +150,7 @@ def compute_volatility(series, period=20):
 
 
 def get_signal(df):
+    """Return aggregated signal and weighted confidence based on strategy confluence."""
     try:
         df["ema_fast"] = df["close"].ewm(span=9, adjust=False).mean()
         df["ema_slow"] = df["close"].ewm(span=21, adjust=False).mean()
@@ -159,59 +160,61 @@ def get_signal(df):
         df["momentum"] = compute_momentum(df["close"])
         df["volatility"] = compute_volatility(df["close"])
 
-        signals = []
+        votes = []
+        weights = {
+            "RSI": 1.0,
+            "EMA": 1.0,
+            "MACD": 1.0,
+            "BOLL": 0.8,
+            "MOM": 0.8,
+            "VOL": 0.6,
+        }
 
-        rsi_value = df["rsi"].iloc[-1]
-        if rsi_value > 70:
-            signals.append("PUT")
-        elif rsi_value < 30:
-            signals.append("CALL")
+        if df["rsi"].iloc[-1] < 30:
+            votes.append(("CALL", weights["RSI"]))
+        elif df["rsi"].iloc[-1] > 70:
+            votes.append(("PUT", weights["RSI"]))
 
-        ema_fast_value = df["ema_fast"].iloc[-1]
-        ema_slow_value = df["ema_slow"].iloc[-1]
-        if ema_fast_value > ema_slow_value:
-            signals.append("CALL")
-        elif ema_fast_value < ema_slow_value:
-            signals.append("PUT")
+        if df["ema_fast"].iloc[-1] > df["ema_slow"].iloc[-1]:
+            votes.append(("CALL", weights["EMA"]))
+        elif df["ema_fast"].iloc[-1] < df["ema_slow"].iloc[-1]:
+            votes.append(("PUT", weights["EMA"]))
 
-        macd_value = df["macd"].iloc[-1]
-        macd_signal_value = df["macd_signal"].iloc[-1]
-        if macd_value > macd_signal_value:
-            signals.append("CALL")
-        elif macd_value < macd_signal_value:
-            signals.append("PUT")
+        if df["macd"].iloc[-1] > df["macd_signal"].iloc[-1]:
+            votes.append(("CALL", weights["MACD"]))
+        elif df["macd"].iloc[-1] < df["macd_signal"].iloc[-1]:
+            votes.append(("PUT", weights["MACD"]))
 
-        price = df["close"].iloc[-1]
-        upper_band = df["upper"].iloc[-1]
-        lower_band = df["lower"].iloc[-1]
-        if price >= upper_band:
-            signals.append("PUT")
-        elif price <= lower_band:
-            signals.append("CALL")
+        if df["close"].iloc[-1] <= df["lower"].iloc[-1]:
+            votes.append(("CALL", weights["BOLL"]))
+        elif df["close"].iloc[-1] >= df["upper"].iloc[-1]:
+            votes.append(("PUT", weights["BOLL"]))
 
-        momentum_value = df["momentum"].iloc[-1]
-        if momentum_value > 0:
-            signals.append("CALL")
-        elif momentum_value < 0:
-            signals.append("PUT")
+        if df["momentum"].iloc[-1] > 0:
+            votes.append(("CALL", weights["MOM"]))
+        elif df["momentum"].iloc[-1] < 0:
+            votes.append(("PUT", weights["MOM"]))
 
-        volatility_value = df["volatility"].iloc[-1]
-        if volatility_value < 0.0003:
+        vol = df["volatility"].iloc[-1]
+        if vol < 0.0002:
             return "NONE", 0.0
 
-        if not signals:
+        if not votes:
             return "NONE", 0.0
 
-        call_votes = signals.count("CALL")
-        put_votes = signals.count("PUT")
-        total_votes = len(signals)
+        call_strength = sum(weight for side, weight in votes if side == "CALL")
+        put_strength = sum(weight for side, weight in votes if side == "PUT")
+        total_strength = call_strength + put_strength
 
-        if call_votes > put_votes:
+        if len(votes) < 2:
+            return "NONE", 0.0
+
+        if call_strength > put_strength:
             direction = "CALL"
-            confidence = call_votes / total_votes
-        elif put_votes > call_votes:
+            confidence = call_strength / total_strength if total_strength else 0.0
+        elif put_strength > call_strength:
             direction = "PUT"
-            confidence = put_votes / total_votes
+            confidence = put_strength / total_strength if total_strength else 0.0
         else:
             direction = "NONE"
             confidence = 0.0
