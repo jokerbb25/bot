@@ -98,7 +98,7 @@ def calculate_rsi(df, period=14):
     avg_loss = loss.rolling(period, min_periods=period).mean()
     rs = avg_gain / avg_loss.replace(0, np.nan)
     rsi = 100 - (100 / (1 + rs))
-    return rsi.fillna(method="bfill").fillna(method="ffill")
+    return rsi.bfill().ffill()
 
 
 def calculate_ema(df, period):
@@ -128,17 +128,17 @@ def calculate_stochastic(df, k_period=14, d_period=3):
     stoch_k = 100 * (df["close"] - low_min) / range_span.replace(0, np.nan)
     stoch_k = stoch_k.replace([np.inf, -np.inf], np.nan)
     stoch_d = stoch_k.rolling(d_period, min_periods=d_period).mean()
-    return stoch_k.fillna(method="bfill").fillna(method="ffill"), stoch_d.fillna(method="bfill").fillna(method="ffill")
+    return stoch_k.bfill().ffill(), stoch_d.bfill().ffill()
 
 
 def calculate_momentum(df, period=10):
     momentum = (df["close"] / df["close"].shift(period)) * 100
-    return momentum.fillna(method="bfill").fillna(method="ffill")
+    return momentum.bfill().ffill()
 
 
 def calculate_volatility(df, period=10):
     volatility = df["close"].pct_change().rolling(period, min_periods=period).std()
-    return volatility.fillna(method="bfill").fillna(method="ffill")
+    return volatility.bfill().ffill()
 
 
 def get_signal(df, active_strategies):
