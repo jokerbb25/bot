@@ -22,7 +22,7 @@ from PyQt5.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
 )
-from PyQt5.QtCore import QThread, QTimer, Qt
+from PyQt5.QtCore import QThread, QTimer, Qt, pyqtSignal
 from PyQt5.QtGui import QColor
 
 
@@ -224,6 +224,11 @@ def get_signal(df):
 
 
 class Worker(QThread):
+    log_signal = pyqtSignal(str)
+    table_signal = pyqtSignal(str, str, float, float, float, str)
+    result_signal = pyqtSignal(str, str)
+    stats_signal = pyqtSignal(int, int)
+
     def __init__(self, gui, iq_client=None):
         super().__init__()
         self.gui = gui
@@ -247,7 +252,7 @@ class Worker(QThread):
                         print("🔁 Reconnecting broker...")
                         self.iq = connect_iq_dual(IQ_EMAIL, IQ_PASSWORD)
                         if not self.iq:
-                            QTimer.singleShot(0, lambda: self.gui.append_log("⚠️ Offline. Retrying in 10s"))
+                            self.log_signal.emit("⚠️ Offline. Retrying in 10s")
                             time.sleep(10)
                             continue
                 self.analyze_all_symbols()
@@ -288,7 +293,7 @@ class Worker(QThread):
     def analyze_all_symbols(self):
         now_text = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         print(f"[{now_text}] Analysis started.")
-        self.gui.append_log(f"[{now_text}] Analysis started.")
+        self.log_signal.emit(f"[{now_text}] Analysis started.")
         for symbol in SYMBOLS:
             try:
                 dataframe = self._mock_df() if MOCK_MODE else self._fetch_closed_candles(symbol)
@@ -304,7 +309,7 @@ class Worker(QThread):
                 rsi_value = float(dataframe["rsi"].iloc[-1])
                 ema_value = float(dataframe["ema_fast"].iloc[-1])
                 last_close = float(dataframe["close"].iloc[-1])
-                self.gui.update_table(symbol, signal, confidence, rsi_value, ema_value, now_text)
+                self.table_signal.emit(symbol, signal, confidence, rsi_value, ema_value, now_text)
                 if confidence >= MIN_CONFIDENCE and signal in {"CALL", "PUT"} and symbol not in self.open_trades:
                     self.open_trades[symbol] = {
                         "direction": signal,
@@ -313,7 +318,7 @@ class Worker(QThread):
                     }
                     self.log_trade(symbol, signal, confidence, "OPEN", last_close, now_text)
             except Exception as error:
-                self.gui.append_log(f"⚠️ {symbol} error: {error}")
+                self.log_signal.emit(f"⚠️ {symbol} error: {error}")
 
     def resolve_trades(self):
         global WIN_COUNT, LOSS_COUNT
@@ -335,8 +340,8 @@ class Worker(QThread):
             else:
                 LOSS_COUNT += 1
             now_text = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-            self.gui.update_result(symbol, result)
-            self.gui.update_stats(WIN_COUNT, LOSS_COUNT)
+            self.result_signal.emit(symbol, result)
+            self.stats_signal.emit(WIN_COUNT, LOSS_COUNT)
             self.log_trade(symbol, trade["direction"], 1.0 if won else 0.0, result, last_close, now_text)
             symbols_to_clear.append(symbol)
         for symbol in symbols_to_clear:
@@ -347,7 +352,7 @@ class Worker(QThread):
         with open(CSV_FILE, "a", newline="") as file:
             writer = csv.writer(file)
             writer.writerow(row)
-        self.gui.append_log(f"{timestamp} | {symbol} | {signal} | {status} | {price:.5f}")
+        self.log_signal.emit(f"{timestamp} | {symbol} | {signal} | {status} | {price:.5f}")
 
     def _fetch_closed_candles(self, symbol):
         if MOCK_MODE or not self.iq:
@@ -583,6 +588,10 @@ class MainWindow(QMainWindow):
             mode_text = "Mode: Mock" if MOCK_MODE else ("Mode: Practice" if Iq else "Mode: Offline")
             self.mode_label.setText(mode_text)
             self.worker = Worker(self, Iq)
+            self.worker.log_signal.connect(self.append_log)
+            self.worker.table_signal.connect(self.update_table)
+            self.worker.result_signal.connect(self.update_result)
+            self.worker.stats_signal.connect(self.update_stats)
             self.worker.running = True
             self.worker.start()
             self.status_label.setText("Status: Running")
