@@ -25,7 +25,7 @@ from PyQt5.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
 )
-from PyQt5.QtCore import QThread, QTimer, Qt, pyqtSignal
+from PyQt5.QtCore import QThread, QTimer, Qt, pyqtSignal, QMetaObject, Q_ARG
 
 
 SYMBOLS = [
@@ -607,6 +607,7 @@ class MainWindow(QMainWindow):
             """
         )
         self.worker = None
+        self._last_log = None
         self.strategy_lock = threading.Lock()
         self.active_strategies = {
             "RSI": True,
@@ -785,13 +786,27 @@ class MainWindow(QMainWindow):
             self.stop_button.setEnabled(False)
             self.append_log("Analysis stopped.")
 
+    def safe_log_emit(self, message):
+        QMetaObject.invokeMethod(
+            self,
+            "_append_log_message",
+            Qt.QueuedConnection,
+            Q_ARG(str, message)
+        )
+
+    def _append_log_message(self, message):
+        self.log_box.append(message)
+        scrollbar = self.log_box.verticalScrollBar()
+        scrollbar.setValue(scrollbar.maximum())
+
     def append_log(self, message):
         timestamp = dt.datetime.now().strftime("%H:%M:%S")
         formatted = message if message.startswith("[") or "|" in message else f"[{timestamp}] {message}"
         formatted = formatted.replace("\n", "")
-        self.log_box.append(formatted)
-        scrollbar = self.log_box.verticalScrollBar()
-        scrollbar.setValue(scrollbar.maximum())
+        if self._last_log == formatted:
+            return
+        self._last_log = formatted
+        self.safe_log_emit(formatted)
 
     def update_table(self, payload):
         symbol = payload.get("symbol")
