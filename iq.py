@@ -5,6 +5,7 @@ import os
 import datetime as dt
 import json
 import csv
+import re
 from queue import Queue
 from threading import Lock
 
@@ -25,7 +26,7 @@ from PyQt5.QtWidgets import (
     QHBoxLayout,
     QHeaderView,
 )
-from PyQt5.QtCore import QThread, QTimer, Qt, pyqtSignal, QMetaObject, Q_ARG
+from PyQt5.QtCore import QThread, QTimer, Qt, pyqtSignal, QMetaObject, Q_ARG, pyqtSlot
 
 
 SYMBOLS = [
@@ -415,13 +416,11 @@ class Worker(QThread):
                 "info": info,
             }
             conf = confidence
-            print(
-                summary := (
-                    f"{now_text} | {symbol} | {signal} | Conf: {conf:.2f} | "
-                    f"RSI:{info['RSI']}, EMA:{info['EMA']}, "
-                    f"MACD:{info['MACD']}, Bollinger:{info['BOLL']}, "
-                    f"Stochastic:{info['STOCH']}, Momentum:{info['MOM']}, Volatility:{info['VOL']}"
-                )
+            summary = (
+                f"{now_text} | {symbol} | {signal} | Conf: {conf:.2f} | "
+                f"RSI:{info['RSI']}, EMA:{info['EMA']}, "
+                f"MACD:{info['MACD']}, Bollinger:{info['BOLL']}, "
+                f"Stochastic:{info['STOCH']}, Momentum:{info['MOM']}, Volatility:{info['VOL']}"
             )
             self.log_signal.emit(summary)
             self.table_signal.emit(payload)
@@ -776,7 +775,6 @@ class MainWindow(QMainWindow):
             self.status_label.setText("Status: Running")
             self.start_button.setEnabled(False)
             self.stop_button.setEnabled(True)
-            self.append_log("Analysis started.")
         else:
             if self.worker:
                 self.worker.stop()
@@ -811,6 +809,7 @@ class MainWindow(QMainWindow):
         except Exception as error:
             print(f"[LOG ERROR] {error}")
 
+    @pyqtSlot()
     def _scroll_log_to_bottom(self):
         """
         Smoothly scrolls the log_output widget to the bottom after each new message.
@@ -825,22 +824,17 @@ class MainWindow(QMainWindow):
 
     def append_log(self, message):
         """
-        Appends a message to both console and GUI log safely,
-        preventing duplicated entries from simultaneous signal emissions.
+        Appends a message to console and GUI once, avoiding duplicate timestamps and entries.
         """
-        timestamp = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        formatted = f"[{timestamp}] {message}"
-
-        if not hasattr(self, "_last_log_message"):
-            self._last_log_message = None
-
-        if formatted == self._last_log_message:
+        has_ts = bool(re.match(r"^(\[\d{4}-\d{2}-\d{2}|\d{4}-\d{2}-\d{2})", message))
+        raw = message
+        if not hasattr(self, "_last_log_raw"):
+            self._last_log_raw = None
+        if raw == self._last_log_raw:
             return
-
-        self._last_log_message = formatted
-
+        self._last_log_raw = raw
+        formatted = raw if has_ts else f"[{dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {raw}"
         print(formatted)
-
         try:
             self.safe_log_emit(formatted)
         except Exception as error:
