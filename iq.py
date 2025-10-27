@@ -812,8 +812,16 @@ class MainWindow(QMainWindow):
             print(f"[LOG ERROR] {error}")
 
     def _scroll_log_to_bottom(self):
-        scrollbar = self.log_box.verticalScrollBar()
-        scrollbar.setValue(scrollbar.maximum())
+        """
+        Smoothly scrolls the log_output widget to the bottom after each new message.
+        This prevents the QMetaObject::invokeMethod error if the method was missing.
+        """
+        try:
+            if hasattr(self, "log_output") and self.log_output:
+                scrollbar = self.log_output.verticalScrollBar()
+                scrollbar.setValue(scrollbar.maximum())
+        except Exception as error:
+            print(f"[LOG SCROLL ERROR] {error}")
 
     def append_log(self, message):
         timestamp = dt.datetime.now().strftime("%H:%M:%S")
