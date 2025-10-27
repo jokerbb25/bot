@@ -693,6 +693,7 @@ class MainWindow(QMainWindow):
         layout = QVBoxLayout()
         self.log_box = QTextEdit()
         self.log_box.setReadOnly(True)
+        self.log_output = self.log_box
         layout.addWidget(self.log_box)
         self.log_tab.setLayout(layout)
 
@@ -787,15 +788,22 @@ class MainWindow(QMainWindow):
             self.append_log("Analysis stopped.")
 
     def safe_log_emit(self, message):
-        QMetaObject.invokeMethod(
-            self,
-            "_append_log_message",
-            Qt.QueuedConnection,
-            Q_ARG(str, message)
-        )
+        try:
+            QMetaObject.invokeMethod(
+                self.log_output,
+                "appendPlainText",
+                Qt.QueuedConnection,
+                Q_ARG(str, message)
+            )
+            QMetaObject.invokeMethod(
+                self,
+                "_scroll_log_to_bottom",
+                Qt.QueuedConnection
+            )
+        except Exception as error:
+            print(f"[LOG ERROR] {error}")
 
-    def _append_log_message(self, message):
-        self.log_box.append(message)
+    def _scroll_log_to_bottom(self):
         scrollbar = self.log_box.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
 
