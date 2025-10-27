@@ -758,10 +758,17 @@ class MainWindow(QMainWindow):
             mode_text = "Mode: Mock" if MOCK_MODE else ("Mode: Practice" if Iq else "Mode: Offline")
             self.mode_label.setText(mode_text)
             self.worker = Worker(self, Iq)
-            self.worker.log_signal.connect(self.append_log)
-            self.worker.table_signal.connect(self.update_table)
-            self.worker.result_signal.connect(self.update_result)
-            self.worker.stats_signal.connect(self.update_stats)
+            for signal, slot in [
+                (self.worker.log_signal, self.append_log),
+                (self.worker.table_signal, self.update_table),
+                (self.worker.result_signal, self.update_result),
+                (self.worker.stats_signal, self.update_stats),
+            ]:
+                try:
+                    signal.disconnect(slot)
+                except Exception:
+                    pass
+                signal.connect(slot)
             self.worker.running = True
             self.worker.start()
             self.status_label.setText("Status: Running")
