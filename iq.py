@@ -789,9 +789,17 @@ class MainWindow(QMainWindow):
 
     def safe_log_emit(self, message):
         try:
+            if hasattr(self.log_output, "appendPlainText"):
+                method_name = "appendPlainText"
+            elif hasattr(self.log_output, "append"):
+                method_name = "append"
+            else:
+                print("[LOG WARNING] log_output has no valid append method.")
+                return
+
             QMetaObject.invokeMethod(
                 self.log_output,
-                "appendPlainText",
+                method_name,
                 Qt.QueuedConnection,
                 Q_ARG(str, message)
             )
