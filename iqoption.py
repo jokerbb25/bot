@@ -5,7 +5,6 @@ import os
 import datetime as dt
 import json
 import csv
-from statistics import mean
 
 import numpy as np
 import pandas as pd
@@ -263,97 +262,10 @@ def get_signal(df):
             mom_sig = "PUT"
             votes.append(("PUT", weights["MOM"]))
 
-        avg_weight = mean([weight for _, weight in votes]) if votes else 0.0
         vol_sig = "LOW" if volatility < 0.00005 else "OK"
-        if volatility < 0.0002:
-            return "NONE", 0.0, {
-                "RSI": rsi_sig,
-                "EMA": ema_sig,
-                "MACD": macd_sig,
-                "BOLL": boll_sig,
-                "STOCH": stoch_sig,
-                "MOM": mom_sig,
-                "VOL": vol_sig,
-                "rsi_val": rsi,
-                "ema9": ema9,
-                "ema21": ema21,
-                "macd_val": macd,
-                "macd_signal_val": macd_signal,
-                "boll_upper": upper,
-                "boll_lower": lower,
-                "stoch_k_val": stoch_k,
-                "stoch_d_val": stoch_d,
-                "momentum_val": momentum,
-                "volatility_val": volatility,
-                "close": close,
-                "avg_weight": avg_weight,
-            }
-
-        if not votes:
-            return "NONE", 0.0, {
-                "RSI": rsi_sig,
-                "EMA": ema_sig,
-                "MACD": macd_sig,
-                "BOLL": boll_sig,
-                "STOCH": stoch_sig,
-                "MOM": mom_sig,
-                "VOL": vol_sig,
-                "rsi_val": rsi,
-                "ema9": ema9,
-                "ema21": ema21,
-                "macd_val": macd,
-                "macd_signal_val": macd_signal,
-                "boll_upper": upper,
-                "boll_lower": lower,
-                "stoch_k_val": stoch_k,
-                "stoch_d_val": stoch_d,
-                "momentum_val": momentum,
-                "volatility_val": volatility,
-                "close": close,
-                "avg_weight": avg_weight,
-            }
-
-        call_strength = sum(weight for side, weight in votes if side == "CALL")
-        put_strength = sum(weight for side, weight in votes if side == "PUT")
-        total_strength = call_strength + put_strength
-
-        if len(votes) < 2:
-            return "NONE", 0.0, {
-                "RSI": rsi_sig,
-                "EMA": ema_sig,
-                "MACD": macd_sig,
-                "BOLL": boll_sig,
-                "STOCH": stoch_sig,
-                "MOM": mom_sig,
-                "VOL": vol_sig,
-                "rsi_val": rsi,
-                "ema9": ema9,
-                "ema21": ema21,
-                "macd_val": macd,
-                "macd_signal_val": macd_signal,
-                "boll_upper": upper,
-                "boll_lower": lower,
-                "stoch_k_val": stoch_k,
-                "stoch_d_val": stoch_d,
-                "momentum_val": momentum,
-                "volatility_val": volatility,
-                "close": close,
-                "avg_weight": avg_weight,
-            }
-
-        if call_strength > put_strength:
-            direction = "CALL"
-            confidence = call_strength / total_strength if total_strength else 0.0
-        elif put_strength > call_strength:
-            direction = "PUT"
-            confidence = put_strength / total_strength if total_strength else 0.0
-        else:
-            direction = "NONE"
-            confidence = 0.0
-
-        return direction, round(confidence, 2), {
-            "RSI": rsi_sig,
-            "EMA": ema_sig,
+        info = {
+            "RSI": f"{rsi_sig} ({fmt(rsi)})",
+            "EMA": f"{ema_sig} (9:{fmt(ema9)} / 21:{fmt(ema21)})",
             "MACD": macd_sig,
             "BOLL": boll_sig,
             "STOCH": stoch_sig,
@@ -371,8 +283,37 @@ def get_signal(df):
             "momentum_val": momentum,
             "volatility_val": volatility,
             "close": close,
-            "avg_weight": avg_weight,
         }
+
+        if volatility < 0.0002:
+            return "NONE", 0.0, info
+
+        # === Decision ===
+        if not votes:
+            return "NONE", 0.0, info
+
+        call_strength = sum(w for s, w in votes if s == "CALL")
+        put_strength = sum(w for s, w in votes if s == "PUT")
+        total_strength = call_strength + put_strength
+
+        if total_strength > 0:
+            if call_strength > put_strength:
+                direction = "CALL"
+                confidence = call_strength / total_strength
+            elif put_strength > call_strength:
+                direction = "PUT"
+                confidence = put_strength / total_strength
+            else:
+                direction = "NONE"
+                confidence = 0.0
+        else:
+            direction = "NONE"
+            confidence = 0.0
+
+        if confidence < 0.55:
+            direction = "NONE"
+
+        return direction, round(confidence, 2), info
     except Exception as error:
         print(f"Error in get_signal: {error}")
         return "NONE", 0.0, {}
@@ -468,32 +409,24 @@ class Worker(QThread):
                     "timestamp": now_text,
                     "info": info,
                 }
-                summary = (
-                    f"{now_text} | {symbol} | {signal} | Conf: {confidence:.2f} | "
-                    f"RSI:{info['RSI']}, EMA:{info['EMA']}, MACD:{info['MACD']}, "
-                    f"Bollinger:{info['BOLL']}, Stochastic:{info['STOCH']}, "
-                    f"Momentum:{info['MOM']}, Volatility:{info['VOL']}"
+                print(
+                    summary := (
+                        f"{now_text} | {symbol} | {signal} | Conf: {confidence:.2f} | "
+                        f"RSI:{info['RSI']}, EMA:{info['EMA']}, "
+                        f"MACD:{info['MACD']}, Bollinger:{info['BOLL']}, "
+                        f"Stochastic:{info['STOCH']}, Momentum:{info['MOM']}, Volatility:{info['VOL']}"
+                    )
                 )
-                print(summary)
                 self.log_signal.emit(summary)
                 self.table_signal.emit(payload)
                 with open(CSV_FILE, "a", newline="") as file:
                     writer = csv.writer(file)
                     writer.writerow([
-                        now_text,
-                        symbol,
-                        signal,
-                        confidence,
-                        fmt(info.get("rsi_val")),
-                        fmt(info.get("ema9")),
-                        fmt(info.get("ema21")),
-                        info.get("RSI", "NONE"),
-                        info.get("EMA", "NONE"),
-                        info.get("MACD", "NONE"),
-                        info.get("BOLL", "NONE"),
-                        info.get("STOCH", "NONE"),
-                        info.get("MOM", "NONE"),
-                        info.get("VOL", "NONE"),
+                        dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                        symbol, signal, confidence,
+                        fmt(info["rsi_val"]), fmt(info["ema9"]), fmt(info["ema21"]),
+                        info["RSI"], info["EMA"], info["MACD"],
+                        info["BOLL"], info["STOCH"], info["MOM"], info["VOL"]
                     ])
                 if confidence >= MIN_CONFIDENCE and signal in {"CALL", "PUT"} and symbol not in self.open_trades:
                     self.open_trades[symbol] = {
@@ -822,8 +755,8 @@ class MainWindow(QMainWindow):
                 updates = [
                     payload.get("signal", "-"),
                     f"{payload.get('confidence', 0.0):.2f}",
-                    f"{fmt(info.get('rsi_val'))} ({info.get('RSI', 'NONE')})",
-                    f"{fmt(info.get('ema9'))}/{fmt(info.get('ema21'))} ({info.get('EMA', 'NONE')})",
+                    info.get("RSI", "NONE"),
+                    info.get("EMA", "NONE"),
                     f"{fmt(info.get('macd_val'))}/{fmt(info.get('macd_signal_val'))} ({info.get('MACD', 'NONE')})",
                     info.get("BOLL", "NONE"),
                     f"{fmt(info.get('stoch_k_val'))}/{fmt(info.get('stoch_d_val'))} ({info.get('STOCH', 'NONE')})",
