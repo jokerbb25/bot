@@ -288,8 +288,9 @@ def get_signal(df):
             "close": close,
         }
 
-        if volatility < 0.0002:
-            return "NONE", 0.0, info
+        # --- FIX: Too strict volatility filter caused 0.00 confidence ---
+        if volatility < 0.00001:
+            pass  # allow processing even if volatility is low
 
         # === Decision ===
         if not votes:
@@ -306,10 +307,11 @@ def get_signal(df):
             direction = "NONE"
             confidence = 0.0
 
-        if confidence < 0.55:
+        # --- FIX: Allow slightly lower-confidence signals for testing ---
+        if confidence < 0.45:
             direction = "NONE"
 
-        print(f"[DEBUG] {votes=} | CALL={call_strength:.2f} | PUT={put_strength:.2f} | CONF={confidence:.2f}")
+        print(f"[DEBUG] Votes={votes} | CALL={call_strength:.2f} | PUT={put_strength:.2f} | CONF={confidence:.2f}")
 
         return direction, round(confidence, 2), info
     except Exception as error:
@@ -386,8 +388,11 @@ class Worker(QThread):
 
     def analyze_all_symbols(self):
         now_text = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
-        print(f"[{now_text}] Analysis started.")
-        self.log_signal.emit(f"[{now_text}] Analysis started.")
+        # --- FIX: Avoid duplicate "Analysis started" logs ---
+        if threading.current_thread().name == "MainThread":
+            print(f"[{now_text}] Analysis started.")
+        else:
+            self.log_signal.emit(f"[{now_text}] Analysis started.")
         for symbol in SYMBOLS:
             self.analyze_symbol(symbol, now_text)
 
@@ -779,7 +784,8 @@ class MainWindow(QMainWindow):
     def append_log(self, message):
         timestamp = dt.datetime.now().strftime("%H:%M:%S")
         formatted = message if message.startswith("[") or "|" in message else f"[{timestamp}] {message}"
-        print(formatted)
+        # --- FIX: Prevent duplicated console print ---
+        formatted = formatted.replace("\n", "")
         self.log_box.append(formatted)
         scrollbar = self.log_box.verticalScrollBar()
         scrollbar.setValue(scrollbar.maximum())
