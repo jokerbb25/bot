@@ -48,6 +48,7 @@ open_positions = {}
 WIN_COUNT = 0
 LOSS_COUNT = 0
 MOCK_MODE = False
+results_memory = []
 
 
 def fmt(value):
@@ -296,22 +297,25 @@ def get_signal(df):
         put_strength = sum(w for s, w in votes if s == "PUT")
         total_strength = call_strength + put_strength
 
-        if total_strength > 0:
-            if call_strength > put_strength:
-                direction = "CALL"
-                confidence = call_strength / total_strength
-            elif put_strength > call_strength:
-                direction = "PUT"
-                confidence = put_strength / total_strength
-            else:
-                direction = "NONE"
-                confidence = 0.0
+        if total_strength == 0:
+            return "NONE", 0.0, info
+
+        if call_strength > put_strength:
+            direction = "CALL"
+            confidence = call_strength / total_strength
+        elif put_strength > call_strength:
+            direction = "PUT"
+            confidence = put_strength / total_strength
         else:
             direction = "NONE"
             confidence = 0.0
 
         if confidence < 0.55:
             direction = "NONE"
+
+        print(
+            f"[DEBUG] votes={votes} | CALL={call_strength:.2f} | PUT={put_strength:.2f} | CONF={confidence:.2f}"
+        )
 
         return direction, round(confidence, 2), info
     except Exception as error:
@@ -391,52 +395,82 @@ class Worker(QThread):
         print(f"[{now_text}] Analysis started.")
         self.log_signal.emit(f"[{now_text}] Analysis started.")
         for symbol in SYMBOLS:
-            try:
-                dataframe = self._mock_df() if MOCK_MODE else self._fetch_closed_candles(symbol)
-                if dataframe is None or dataframe.empty:
-                    continue
-                last_timestamp = dataframe.index[-1]
-                if self.last_candle_time[symbol] == last_timestamp:
-                    continue
-                self.last_candle_time[symbol] = last_timestamp
-                signal, confidence, info = get_signal(dataframe)
-                if not info:
-                    continue
-                payload = {
-                    "symbol": symbol,
-                    "signal": signal,
-                    "confidence": confidence,
-                    "timestamp": now_text,
-                    "info": info,
-                }
-                print(
-                    summary := (
-                        f"{now_text} | {symbol} | {signal} | Conf: {confidence:.2f} | "
-                        f"RSI:{info['RSI']}, EMA:{info['EMA']}, "
-                        f"MACD:{info['MACD']}, Bollinger:{info['BOLL']}, "
-                        f"Stochastic:{info['STOCH']}, Momentum:{info['MOM']}, Volatility:{info['VOL']}"
-                    )
+            self.analyze_symbol(symbol, now_text)
+
+    def analyze_symbol(self, symbol, now_text):
+        try:
+            global results_memory
+            df = self._mock_df() if MOCK_MODE else self._fetch_closed_candles(symbol)
+            if df is None or df.empty:
+                return
+            last_timestamp = df.index[-1]
+            if self.last_candle_time[symbol] == last_timestamp:
+                return
+            self.last_candle_time[symbol] = last_timestamp
+            signal, confidence, info = get_signal(df)
+            if not info:
+                return
+            payload = {
+                "symbol": symbol,
+                "signal": signal,
+                "confidence": confidence,
+                "timestamp": now_text,
+                "info": info,
+            }
+            print(
+                summary := (
+                    f"{now_text} | {symbol} | {signal} | Conf: {confidence:.2f} | "
+                    f"RSI:{info['RSI']}, EMA:{info['EMA']}, "
+                    f"MACD:{info['MACD']}, Bollinger:{info['BOLL']}, "
+                    f"Stochastic:{info['STOCH']}, Momentum:{info['MOM']}, Volatility:{info['VOL']}"
                 )
-                self.log_signal.emit(summary)
-                self.table_signal.emit(payload)
-                with open(CSV_FILE, "a", newline="") as file:
-                    writer = csv.writer(file)
-                    writer.writerow([
-                        dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
-                        symbol, signal, confidence,
-                        fmt(info["rsi_val"]), fmt(info["ema9"]), fmt(info["ema21"]),
-                        info["RSI"], info["EMA"], info["MACD"],
-                        info["BOLL"], info["STOCH"], info["MOM"], info["VOL"]
-                    ])
-                if confidence >= MIN_CONFIDENCE and signal in {"CALL", "PUT"} and symbol not in self.open_trades:
-                    self.open_trades[symbol] = {
-                        "direction": signal,
-                        "entry": info.get("close", dataframe["close"].iloc[-1]),
-                        "time": dt.datetime.now(),
-                    }
-                    self.log_trade(symbol, signal, confidence, "OPEN", info.get("close", 0.0), now_text)
-            except Exception as error:
-                self.log_signal.emit(f"⚠️ {symbol} error: {error}")
+            )
+            self.log_signal.emit(summary)
+            self.table_signal.emit(payload)
+            with open(CSV_FILE, "a", newline="") as file:
+                writer = csv.writer(file)
+                writer.writerow([
+                    dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S"),
+                    symbol, signal, confidence,
+                    fmt(info["rsi_val"]), fmt(info["ema9"]), fmt(info["ema21"]),
+                    info["RSI"], info["EMA"], info["MACD"],
+                    info["BOLL"], info["STOCH"], info["MOM"], info["VOL"]
+                ])
+
+            # === Simulated WIN/LOSS evaluation ===
+            if len(df) >= 3:
+                last_candle = df.iloc[-2]
+                prev_candle = df.iloc[-3]
+
+                if signal == "CALL" and last_candle["close"] > prev_candle["close"]:
+                    result = "WIN"
+                elif signal == "PUT" and last_candle["close"] < prev_candle["close"]:
+                    result = "WIN"
+                elif signal == "NONE":
+                    result = "-"
+                else:
+                    result = "LOSS"
+
+                results_memory.append(result)
+                if len(results_memory) > 50:
+                    results_memory.pop(0)
+
+                wins = results_memory.count("WIN")
+                losses = results_memory.count("LOSS")
+                total = wins + losses
+                precision = (wins / total * 100) if total > 0 else 0.0
+
+                print(f"📊 Precision: {precision:.2f}% | Wins: {wins} | Losses: {losses}")
+
+            if confidence >= MIN_CONFIDENCE and signal in {"CALL", "PUT"} and symbol not in self.open_trades:
+                self.open_trades[symbol] = {
+                    "direction": signal,
+                    "entry": info.get("close", df["close"].iloc[-1]),
+                    "time": dt.datetime.now(),
+                }
+                self.log_trade(symbol, signal, confidence, "OPEN", info.get("close", 0.0), now_text)
+        except Exception as error:
+            self.log_signal.emit(f"⚠️ {symbol} error: {error}")
 
     def resolve_trades(self):
         global WIN_COUNT, LOSS_COUNT
