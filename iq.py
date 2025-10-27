@@ -607,7 +607,7 @@ class MainWindow(QMainWindow):
             """
         )
         self.worker = None
-        self._last_log = None
+        self._last_log_message = None
         self.strategy_lock = threading.Lock()
         self.active_strategies = {
             "RSI": True,
@@ -824,13 +824,27 @@ class MainWindow(QMainWindow):
             print(f"[LOG SCROLL ERROR] {error}")
 
     def append_log(self, message):
-        timestamp = dt.datetime.now().strftime("%H:%M:%S")
-        formatted = message if message.startswith("[") or "|" in message else f"[{timestamp}] {message}"
-        formatted = formatted.replace("\n", "")
-        if self._last_log == formatted:
+        """
+        Appends a message to both console and GUI log safely,
+        preventing duplicated entries from simultaneous signal emissions.
+        """
+        timestamp = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+        formatted = f"[{timestamp}] {message}"
+
+        if not hasattr(self, "_last_log_message"):
+            self._last_log_message = None
+
+        if formatted == self._last_log_message:
             return
-        self._last_log = formatted
-        self.safe_log_emit(formatted)
+
+        self._last_log_message = formatted
+
+        print(formatted)
+
+        try:
+            self.safe_log_emit(formatted)
+        except Exception as error:
+            print(f"[LOG ERROR] {error}")
 
     def update_table(self, payload):
         symbol = payload.get("symbol")
