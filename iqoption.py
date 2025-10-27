@@ -5,6 +5,7 @@ import os
 import datetime as dt
 import json
 import csv
+from queue import Queue
 
 import numpy as np
 import pandas as pd
@@ -49,6 +50,7 @@ WIN_COUNT = 0
 LOSS_COUNT = 0
 MOCK_MODE = False
 results_memory = []
+visual_queue = Queue()
 
 
 def fmt(value):
@@ -297,15 +299,9 @@ def get_signal(df):
         put_strength = sum(w for s, w in votes if s == "PUT")
         total_strength = call_strength + put_strength
 
-        if total_strength == 0:
-            return "NONE", 0.0, info
-
-        if call_strength > put_strength:
-            direction = "CALL"
-            confidence = call_strength / total_strength
-        elif put_strength > call_strength:
-            direction = "PUT"
-            confidence = put_strength / total_strength
+        if total_strength > 0:
+            confidence = max(call_strength, put_strength) / total_strength
+            direction = "CALL" if call_strength > put_strength else "PUT"
         else:
             direction = "NONE"
             confidence = 0.0
@@ -313,9 +309,7 @@ def get_signal(df):
         if confidence < 0.55:
             direction = "NONE"
 
-        print(
-            f"[DEBUG] votes={votes} | CALL={call_strength:.2f} | PUT={put_strength:.2f} | CONF={confidence:.2f}"
-        )
+        print(f"[DEBUG] {votes=} | CALL={call_strength:.2f} | PUT={put_strength:.2f} | CONF={confidence:.2f}")
 
         return direction, round(confidence, 2), info
     except Exception as error:
@@ -417,9 +411,10 @@ class Worker(QThread):
                 "timestamp": now_text,
                 "info": info,
             }
+            conf = confidence
             print(
                 summary := (
-                    f"{now_text} | {symbol} | {signal} | Conf: {confidence:.2f} | "
+                    f"{now_text} | {symbol} | {signal} | Conf: {conf:.2f} | "
                     f"RSI:{info['RSI']}, EMA:{info['EMA']}, "
                     f"MACD:{info['MACD']}, Bollinger:{info['BOLL']}, "
                     f"Stochastic:{info['STOCH']}, Momentum:{info['MOM']}, Volatility:{info['VOL']}"
@@ -427,6 +422,15 @@ class Worker(QThread):
             )
             self.log_signal.emit(summary)
             self.table_signal.emit(payload)
+            visual_queue.put({
+                "symbol": symbol,
+                "signal": signal,
+                "confidence": conf,
+                "timestamp": now_text,
+                "rsi": info["rsi_val"],
+                "ema9": info["ema9"],
+                "ema21": info["ema21"],
+            })
             with open(CSV_FILE, "a", newline="") as file:
                 writer = csv.writer(file)
                 writer.writerow([
