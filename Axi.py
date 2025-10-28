@@ -61,6 +61,22 @@ LOT_SIZE = 0.01  # configurable, equivalent to $1 per pip depending on broker le
 ATR_MULT_SL = 2.0
 ATR_MULT_TP = 3.0
 
+# === ATR(pips) ACCEPTANCE WINDOWS ===
+ATR_WINDOWS = {
+    "EURUSD": (2, 35),
+    "GBPUSD": (3, 40),
+    "USDJPY": (2, 45),
+    "USDCAD": (2, 40),
+    "XAUUSD": (30, 350),
+}
+DEFAULT_ATR_WINDOW = (2, 40)
+MIN_CONFLUENCE = 3
+
+WEIGHT_BOOST = {
+    "XAUUSD": {"trend": 0.03, "range": -0.02},
+    "USDJPY": {"trend": 0.01, "range": -0.01},
+}
+
 # === STRICT MODE PARAMETERS ===
 CONFIDENCE_MIN = 0.80
 LOW_VOL_THRESHOLD = 0.0006
@@ -791,8 +807,71 @@ def bollinger_bands(series: pd.Series, period: int = 20, num_dev: float = 2.0) -
     return bb.bollinger_lband(), bb.bollinger_hband()
 
 
+# === PIP & ATR HELPERS (Forex) ===
+PIP_SIZE = {
+    "EURUSD": 0.0001,
+    "GBPUSD": 0.0001,
+    "USDCAD": 0.0001,
+    "USDJPY": 0.01,
+    "XAUUSD": 0.10,
+}
+
+
+def pip_size(symbol: str) -> float:
+    symbol_upper = (symbol or "").upper()
+    return float(PIP_SIZE.get(symbol_upper, 0.0001))
+
+
+def atr_in_pips(
+    symbol: str,
+    closes: Iterable[float],
+    highs: Iterable[float],
+    lows: Iterable[float],
+    period: int = 14,
+) -> float:
+    closes_list = [float(value) for value in closes]
+    highs_list = [float(value) for value in highs]
+    lows_list = [float(value) for value in lows]
+    length = min(len(closes_list), len(highs_list), len(lows_list))
+    if length <= 1:
+        return 0.0
+    start_index = max(0, length - (period + 1))
+    prev_close = closes_list[start_index]
+    true_ranges: List[float] = []
+    for idx in range(start_index, length):
+        high_value = highs_list[idx]
+        low_value = lows_list[idx]
+        close_value = closes_list[idx]
+        tr = max(high_value - low_value, abs(high_value - prev_close), abs(low_value - prev_close))
+        true_ranges.append(tr)
+        prev_close = close_value
+    if not true_ranges:
+        return 0.0
+    effective_period = min(period, len(true_ranges))
+    atr_value = sum(true_ranges[-effective_period:]) / float(effective_period)
+    pip = pip_size(symbol)
+    if pip == 0:
+        return 0.0
+    return atr_value / pip
+
+
 def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     return AverageTrueRange(high=df["high"], low=df["low"], close=df["close"], window=period, fillna=False).average_true_range()
+
+
+def detect_regime(adx_value: float, bb_width: float) -> str:
+    adx_val = float(adx_value)
+    bb_val = float(bb_width)
+    if adx_val >= 25.0 or bb_val >= 0.015:
+        return "TREND"
+    return "RANGE"
+
+
+def min_confidence_for(symbol: str, regime: str) -> float:
+    normalized_regime = (regime or "RANGE").upper()
+    if normalized_regime == "TREND":
+        return 0.65
+    return 0.75
 
 
 def compute_atr_for_symbol(symbol: str, period: int = 14, count: int = CANDLE_COUNT) -> float:
@@ -3693,6 +3772,7 @@ class TradingEngine:
                 'latest_rsi': 0.0,
                 'ema_spread': 0.0,
                 'boll_width': 0.0,
+                'bb_width': 0.0,
                 'volatility': 0.0,
                 'atr': atr_latest_value,
                 'signal_source': 'COMBINED',
@@ -3700,6 +3780,9 @@ class TradingEngine:
                 'indicator_confidence': 0.0,
                 'adx': 0.0,
                 'macd': 0.0,
+                'recent_closes': [],
+                'recent_highs': [],
+                'recent_lows': [],
                 'predicted_probability': 0.5,
                 'confluence_direction': 'NONE',
                 'confluence_confirmed': False,
@@ -3833,6 +3916,7 @@ class TradingEngine:
                     'latest_rsi': latest_rsi,
                     'ema_spread': ema_spread,
                     'boll_width': boll_width,
+                    'bb_width': boll_ratio,
                     'volatility': smoothed_volatility,
                     'indicator_confidence': indicator_conf,
                     'adx': adx_value,
@@ -3860,6 +3944,9 @@ class TradingEngine:
                     'ema50_current': ema50_current,
                     'ema50_previous': ema50_previous,
                     'ema50_slope': ema50_current - ema50_previous,
+                    'recent_closes': df['close'].tail(120).tolist(),
+                    'recent_highs': df['high'].tail(120).tolist(),
+                    'recent_lows': df['low'].tail(120).tolist(),
                 }
             )
             evaluation['current_context'] = self._build_context_snapshot(
@@ -4586,58 +4673,16 @@ class TradingEngine:
         if volatility_value is not None:
             self.current_volatility = volatility_value
 
-        def _normalize_symbol(sym: str) -> str:
-            candidate = (sym or "").upper()
-            for base in ("R_25", "R_50", "R_75", "R_100"):
-                if candidate.startswith(base):
-                    return base
-            return candidate
-
-        base_symbol = _normalize_symbol(symbol)
         symbol_upper = str(symbol).upper()
-        # === ADAPTIVE VOLATILITY THRESHOLDS BY SYMBOL ===
-        low_vol, high_vol = 0.0003, 0.0025
-        if "R_25" in symbol_upper:
-            low_vol, high_vol = 0.00015, 0.0012
-        elif "R_50" in symbol_upper:
-            low_vol, high_vol = 0.00025, 0.0015
-        elif "R_75" in symbol_upper:
-            low_vol, high_vol = 0.0003, 0.0018
-        elif "R_100" in symbol_upper:
-            low_vol, high_vol = 0.00035, 0.002
         evaluated_volatility = float(getattr(self, "current_volatility", 0.0) or 0.0)
-        if evaluated_volatility > 0.05:
-            evaluated_volatility = evaluated_volatility / 100.0
-        epsilon = 1e-6
-        volatility_ok = True
-        if evaluated_volatility > (high_vol + epsilon):
+        recent_closes = evaluation.get('recent_closes') or []
+        recent_highs = evaluation.get('recent_highs') or []
+        recent_lows = evaluation.get('recent_lows') or []
+        atr_pips_value = atr_in_pips(symbol_upper, recent_closes, recent_highs, recent_lows)
+        min_pips, max_pips = ATR_WINDOWS.get(symbol_upper, DEFAULT_ATR_WINDOW)
+        if not (min_pips <= atr_pips_value <= max_pips):
             logging.info(
-                f"🌪️ High volatility ({evaluated_volatility:.6f}) > {high_vol:.6f} for {base_symbol} → trade skipped."
-            )
-            volatility_ok = False
-        elif evaluated_volatility < (low_vol - epsilon):
-            logging.info(
-                f"💤 Low volatility ({evaluated_volatility:.6f}) < {low_vol:.6f} for {base_symbol} → trade skipped."
-            )
-            volatility_ok = False
-        else:
-            logging.info(
-                f"✅ Volatility OK for {base_symbol}: {evaluated_volatility:.6f} within [{low_vol:.6f}, {high_vol:.6f}]"
-            )
-        if not volatility_ok:
-            context = 'high' if evaluated_volatility > high_vol else 'low'
-            msg = f"⚠️ {base_symbol} skipped due to {context} volatility ({evaluated_volatility:.6f})"
-            logging.info(f"🚫 {msg}")
-            try:
-                send_telegram_message(msg)
-            except Exception:
-                pass
-            return False
-        mid_low = low_vol + (high_vol - low_vol) * 0.2
-        mid_high = high_vol - (high_vol - low_vol) * 0.2
-        if not (mid_low - epsilon <= evaluated_volatility <= mid_high + epsilon):
-            logging.info(
-                f"⚠️ Volatility {evaluated_volatility:.6f} outside safe zone [{mid_low:.6f}, {mid_high:.6f}], skipping."
+                f"[{symbol_upper}] ❎ Skip: ATR {atr_pips_value:.1f} pips outside window {min_pips}-{max_pips} pips"
             )
             return False
         confidence_value = float(combined_confidence) if combined_confidence is not None else 0.0
@@ -4675,9 +4720,21 @@ class TradingEngine:
             and rsi_signal_eval != ema_signal_eval
         ):
             logging.info(
-                f"🚫 Skipping trade on {symbol} due to RSI/EMA conflict → RSI={rsi_signal_eval}, EMA={ema_signal_eval}"
+                f"⚠️ RSI/EMA conflict detected for {symbol} → penalizing confidence."
             )
-            return False
+            confidence_value *= 0.80
+            combined_confidence = confidence_value
+            evaluation['final_confidence'] = confidence_value
+        bb_width_value = float(evaluation.get('bb_width', evaluation.get('boll_width', 0.0)) or 0.0)
+        regime_value = evaluation.get('regime') or detect_regime(float(evaluation.get('adx', 0.0) or 0.0), bb_width_value)
+        boost_settings = WEIGHT_BOOST.get(symbol_upper, {})
+        if regime_value == 'TREND':
+            confidence_value += boost_settings.get('trend', 0.0)
+        else:
+            confidence_value += boost_settings.get('range', 0.0)
+        confidence_value = float(np.clip(confidence_value, 0.0, 1.0))
+        combined_confidence = confidence_value
+        evaluation['final_confidence'] = confidence_value
         context_key = f"{symbol}|{final_action}|RSI:{round(latest_rsi_value, 1)}|EMA:{round(ema_spread_value, 1)}"
         if final_action in {'CALL', 'PUT'}:
             current_rsi_rounded = round(latest_rsi_value, 1)
@@ -4866,9 +4923,14 @@ class TradingEngine:
         if not self._is_macro_trend_aligned(evaluation, final_action):
             return False
         self.last_volatility = current_vol_reference
-        min_confidence = CONFIDENCE_MIN
+        min_confidence = max(CONFIDENCE_MIN, min_confidence_for(symbol_upper, regime_value))
+        if confidence_value < min_confidence:
+            logging.info(
+                f"[{symbol_upper}] ❎ Skip: confidence {confidence_value:.2f} < {min_confidence:.2f} @ {regime_value}"
+            )
+            return False
         # === GLOBAL CONFLUENCE RULE ===
-        min_confluence = MIN_ALIGNED_STRATEGIES  # fixed at 3 for all symbols
+        min_confluence = MIN_CONFLUENCE
         confluence_value = aligned_strategies
         if confluence_value < min_confluence:
             logging.info(f"🚫 Trade skipped due to low confluence ({confluence_value}/{min_confluence})")
@@ -4923,7 +4985,7 @@ class TradingEngine:
                 atr_value = fallback_atr
             else:
                 atr_value = 1.0
-        execution_threshold = max(0.80, min_confidence)
+        execution_threshold = min_confidence
         order_result = None
         try:
             if confidence_value >= execution_threshold:
