@@ -427,16 +427,16 @@ class Worker(QThread):
                 f"Stochastic:{info['STOCH']}, Momentum:{info['MOM']}, Volatility:{info['VOL']}"
             )
             self.log_signal.emit(summary)
-            if hasattr(self.gui, "overlay") and self.gui.overlay:
+            overlay = getattr(self.gui, "overlay", None)
+            if overlay:
                 try:
                     if signal in {"CALL", "PUT"}:
                         window = gw.getWindowsWithTitle("IQ Option")[0]
                         x = int(window.width * 0.85)
                         y = int(window.height * (0.4 if signal == "CALL" else 0.6))
-                        self.gui.overlay.clear()
-                        self.gui.overlay.draw_arrow(x, y, signal)
+                        overlay.draw_arrow(x, y, signal)
                     else:
-                        self.gui.overlay.clear()
+                        overlay.clear()
                 except Exception as overlay_error:
                     print(f"[OVERLAY ERROR] {overlay_error}")
             self.table_signal.emit(payload)
@@ -651,7 +651,9 @@ class MainWindow(QMainWindow):
         self._build_strategies_tab()
         self._build_log_tab()
         self._build_settings_tab()
-        self.overlay = OverlayWindow()
+        self.overlay = None
+        self.overlay_timer = None
+        self._init_overlay()
         self.start_heartbeat()
 
     def _build_dashboard_tab(self):
@@ -734,6 +736,34 @@ class MainWindow(QMainWindow):
         layout.addLayout(button_layout)
         layout.addStretch(1)
         self.settings_tab.setLayout(layout)
+    def _init_overlay(self):
+        try:
+            self.overlay = OverlayWindow()
+            self.overlay_timer = QTimer(self)
+            self.overlay_timer.setInterval(100)
+            self.overlay_timer.timeout.connect(self._service_overlay)
+            self.overlay_timer.start()
+        except Exception as overlay_error:
+            self.overlay = None
+            self.overlay_timer = None
+            print(f"[OVERLAY INIT ERROR] {overlay_error}")
+
+    def _service_overlay(self):
+        if not self.overlay:
+            return
+        try:
+            self.overlay.pump()
+            if self.overlay_timer and not self.overlay.running:
+                self.overlay_timer.stop()
+                self.overlay = None
+                self.overlay_timer = None
+        except Exception as overlay_error:
+            print(f"[OVERLAY ERROR] {overlay_error}")
+            if self.overlay_timer:
+                self.overlay_timer.stop()
+            self.overlay = None
+            self.overlay_timer = None
+
 
     def toggle_strategy(self, name, state):
         with self.strategy_lock:
@@ -800,6 +830,8 @@ class MainWindow(QMainWindow):
             self.status_label.setText("Status: Idle")
             self.start_button.setEnabled(True)
             self.stop_button.setEnabled(False)
+            if self.overlay:
+                self.overlay.clear()
             self.append_log("Analysis stopped.")
 
     def safe_log_emit(self, message):
@@ -903,6 +935,12 @@ class MainWindow(QMainWindow):
 
     def closeEvent(self, event):
         self.toggle_start(False)
+        if hasattr(self, "overlay_timer") and self.overlay_timer:
+            self.overlay_timer.stop()
+            self.overlay_timer = None
+        if self.overlay:
+            self.overlay.close()
+            self.overlay = None
         event.accept()
 
 
