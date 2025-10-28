@@ -394,7 +394,9 @@ class Worker(QThread):
         now_text = dt.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
         print(f"[{now_text}] Analysis started.")
         self.log_signal.emit(f"[{now_text}] Analysis started.")
-        for symbol in SYMBOLS:
+        for symbol, enabled in self.gui.active_symbols.items():
+            if not enabled:
+                continue
             self.analyze_symbol(symbol, now_text)
 
     def analyze_symbol(self, symbol, now_text):
@@ -631,13 +633,16 @@ class MainWindow(QMainWindow):
             "Momentum": True,
             "Volatility": True,
         }
+        self.active_symbols = {symbol: True for symbol in SYMBOLS}
         self.tabs = QTabWidget()
         self.dashboard_tab = QWidget()
         self.strategies_tab = QWidget()
+        self.symbols_tab = QWidget()
         self.log_tab = QWidget()
         self.settings_tab = QWidget()
         self.tabs.addTab(self.dashboard_tab, "Dashboard")
         self.tabs.addTab(self.strategies_tab, "Strategies")
+        self.tabs.addTab(self.symbols_tab, "Symbols")
         self.tabs.addTab(self.log_tab, "Log")
         self.tabs.addTab(self.settings_tab, "Settings")
         container = QWidget()
@@ -647,6 +652,7 @@ class MainWindow(QMainWindow):
         self.setCentralWidget(container)
         self._build_dashboard_tab()
         self._build_strategies_tab()
+        self._build_symbols_tab()
         self._build_log_tab()
         self._build_settings_tab()
         self.overlay = None
@@ -704,6 +710,20 @@ class MainWindow(QMainWindow):
             layout.addWidget(checkbox)
         layout.addStretch(1)
         self.strategies_tab.setLayout(layout)
+
+    def _build_symbols_tab(self):
+        layout = QVBoxLayout()
+        layout.setContentsMargins(10, 10, 10, 10)
+        layout.setSpacing(6)
+        info_label = QLabel("Enable or disable specific symbols for analysis:")
+        layout.addWidget(info_label)
+        for symbol in SYMBOLS:
+            checkbox = QCheckBox(symbol)
+            checkbox.setChecked(True)
+            checkbox.stateChanged.connect(lambda state, sym=symbol: self.toggle_symbol(sym, state == Qt.Checked))
+            layout.addWidget(checkbox)
+        layout.addStretch(1)
+        self.symbols_tab.setLayout(layout)
 
     def _build_log_tab(self):
         layout = QVBoxLayout()
@@ -766,6 +786,10 @@ class MainWindow(QMainWindow):
     def toggle_strategy(self, name, state):
         with self.strategy_lock:
             self.active_strategies[name] = state == Qt.Checked
+
+    def toggle_symbol(self, symbol, state):
+        self.active_symbols[symbol] = state
+        print(f"[⚙️] Symbol {symbol} set to {'ON' if state else 'OFF'}")
 
     def get_active_strategies(self):
         with self.strategy_lock:
