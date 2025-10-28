@@ -9,8 +9,6 @@ import re
 from queue import Queue
 from threading import Lock
 
-import pygetwindow as gw
-
 import numpy as np
 import pandas as pd
 from PyQt5.QtWidgets import (
@@ -431,10 +429,10 @@ class Worker(QThread):
             if overlay:
                 try:
                     if signal in {"CALL", "PUT"}:
-                        window = gw.getWindowsWithTitle("IQ Option")[0]
-                        x = int(window.width * 0.85)
-                        y = int(window.height * (0.4 if signal == "CALL" else 0.6))
-                        overlay.draw_arrow(x, y, signal)
+                        rel_x = 0.95
+                        rel_y = 0.3 if signal == "CALL" else 0.7
+                        cache_key = f"{symbol}-{now_text}-{signal}"
+                        overlay.draw_arrow(rel_x, rel_y, signal, cache_key=cache_key)
                     else:
                         overlay.clear()
                 except Exception as overlay_error:
