@@ -19,6 +19,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 import numpy as np
 import pandas as pd
 import requests
+import MetaTrader5 as mt5
 from ta.momentum import RSIIndicator
 from ta.trend import EMAIndicator, SMAIndicator, ADXIndicator, MACD
 from ta.volatility import BollingerBands, AverageTrueRange
@@ -39,17 +40,10 @@ from PyQt5.QtCore import QThread, pyqtSignal
 from aprendizaje import Aprendizaje
 from telegram_bot import BOT_ACTIVE, telegram_listener
 
-try:
-    import websocket  # type: ignore
-except ImportError:  # pragma: no cover
-    websocket = None
-
 # ===============================================================
 # CONFIG & CONSTANTS
 # ===============================================================
-APP_ID = "1089"
-API_TOKEN = "dK57Ark9QreDexO"
-SYMBOLS = ["R_25", "R_50", "R_75", "R_100"]
+SYMBOLS = ["EURUSD", "GBPUSD", "USDJPY", "XAUUSD", "USDCAD"]
 GRANULARITY = 60
 CANDLE_COUNT = 200
 STAKE = 1.0
@@ -98,6 +92,54 @@ ADVISORY_INTERVAL_SEC = 180
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 warnings.filterwarnings("ignore", category=RuntimeWarning, message="overflow encountered in exp")
+
+print("🧠 Axi module active — running strategies with MT5 market feed.")
+
+
+def connect_axi(account_id: int, password: str, server: str) -> None:
+    if not mt5.initialize(login=account_id, password=password, server=server):
+        raise Exception(f"❌ Axi connection failed → {mt5.last_error()}")
+    print("✅ Connected to Axi MT5")
+
+
+def get_candles(symbol: str, timeframe: int = mt5.TIMEFRAME_M1, count: int = 100) -> List[Dict[str, Any]]:
+    rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, count)
+    if rates is None or len(rates) == 0:
+        print(f"[WARN] No candles for {symbol}")
+        return []
+    return [
+        {
+            "time": rate["time"],
+            "open": rate["open"],
+            "high": rate["high"],
+            "low": rate["low"],
+            "close": rate["close"],
+        }
+        for rate in rates
+    ]
+
+
+def send_order(symbol: str, direction: str, volume: float = 0.1):
+    order_type = mt5.ORDER_TYPE_BUY if direction == "CALL" else mt5.ORDER_TYPE_SELL
+    tick = mt5.symbol_info_tick(symbol)
+    if tick is None:
+        raise RuntimeError(f"No tick data for {symbol}")
+    price = tick.ask if direction == "CALL" else tick.bid
+    request = {
+        "action": mt5.TRADE_ACTION_DEAL,
+        "symbol": symbol,
+        "volume": float(volume),
+        "type": order_type,
+        "price": price,
+        "deviation": 20,
+        "magic": 123456,
+        "comment": "botAxi",
+        "type_time": mt5.ORDER_TIME_GTC,
+        "type_filling": mt5.ORDER_FILLING_IOC,
+    }
+    result = mt5.order_send(request)
+    print(f"[AXI] Order result → {result}")
+    return result
 
 operation_active = False
 TRADE_DURATION_SECONDS = 60
@@ -570,9 +612,9 @@ def telegram_bot() -> None:
                 elif "info" in command:
                     engine_ref = global_engine
                     if engine_ref is not None:
-                        _send_text(f"📄 Último contrato: {engine_ref.get_last_contract_info()}")
+                        _send_text(f"📄 Último ticket: {engine_ref.get_last_contract_info()}")
                     else:
-                        _send_text("ℹ️ No hay información de contratos disponible.")
+                        _send_text("ℹ️ No hay información de tickets disponible.")
         except Exception as exc:
             logging.error(f"❌ Telegram bot error: {exc}")
             time.sleep(5)
@@ -693,7 +735,7 @@ def log_trade(record: TradeRecord) -> None:
     logged_contracts = CSV_LOGGED_CONTRACTS
     if contract_id is not None:
         if contract_id in logged_contracts:
-            logging.debug(f"Duplicate contract {contract_id} ignored.")
+            logging.debug(f"Duplicate ticket {contract_id} ignored.")
             return
         logged_contracts.add(contract_id)
     try:
@@ -2842,137 +2884,20 @@ def build_feature_vector(df: pd.DataFrame, reasons: List[str], results: List[Tup
     return features
 
 
-# ===============================================================
-# DERIV CONNECTION
-# ===============================================================
-class DerivWebSocket:
-    def __init__(self) -> None:
-        if websocket is None:
-            raise RuntimeError("websocket-client not available")
-        self.socket: Optional[websocket.WebSocket] = None
-        self.lock = threading.Lock()
-        self.req_id = 1
-
-    def connect(self) -> None:
-        while True:
-            try:
-                self.socket = websocket.create_connection(
-                    f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}", timeout=30
-                )
-                self._send({"authorize": API_TOKEN})
-                self._recv()
-                logging.info("Deriv conectado")
-                return
-            except Exception as exc:
-                logging.warning(f"Error de conexión con Deriv: {exc}")
-                time.sleep(2)
-
-    def _send(self, payload: Dict[str, Any]) -> int:
-        if self.socket is None:
-            raise RuntimeError("Socket closed")
-        with self.lock:
-            payload["req_id"] = self.req_id
-            self.req_id += 1
-            self.socket.send(json.dumps(payload))
-            return payload["req_id"]
-
-    def _recv(self) -> Dict[str, Any]:
-        if self.socket is None:
-            raise RuntimeError("Socket closed")
-        return json.loads(self.socket.recv())
-
-    def fetch_candles(self, symbol: str) -> List[Candle]:
-        req_id = self._send(
-            {
-                "ticks_history": symbol,
-                "granularity": GRANULARITY,
-                "count": CANDLE_COUNT,
-                "end": "latest",
-                "style": "candles",
-            }
+def fetch_axi_candles(symbol: str, count: int = CANDLE_COUNT, timeframe: int = mt5.TIMEFRAME_M1) -> List[Candle]:
+    raw_candles = get_candles(symbol, timeframe=timeframe, count=count)
+    candles: List[Candle] = []
+    for item in raw_candles:
+        candles.append(
+            Candle(
+                epoch=int(item["time"]),
+                open=float(item["open"]),
+                high=float(item["high"]),
+                low=float(item["low"]),
+                close=float(item["close"]),
+            )
         )
-        while True:
-            msg = self._recv()
-            if msg.get("req_id") == req_id:
-                candles = []
-                for item in msg.get("candles", []):
-                    candles.append(
-                        Candle(
-                            epoch=int(item["epoch"]),
-                            open=float(item["open"]),
-                            high=float(item["high"]),
-                            low=float(item["low"]),
-                            close=float(item["close"]),
-                        )
-                    )
-                return candles
-
-    def buy(self, symbol: str, direction: str, amount: float) -> Tuple[Optional[int], int]:
-        req_id = self._send(
-            {
-                "proposal": 1,
-                "amount": amount,
-                "basis": "stake",
-                "contract_type": direction,
-                "currency": "USD",
-                "duration": 1,
-                "duration_unit": "m",
-                "symbol": symbol,
-            }
-        )
-        proposal = None
-        while True:
-            msg = self._recv()
-            if msg.get("req_id") == req_id:
-                if "error" in msg:
-                    logging.warning(f"Error al generar propuesta: {msg['error']}")
-                    return None, 0.0
-                proposal = msg["proposal"]
-                break
-        buy_id = self._send({"buy": proposal["id"], "price": proposal["ask_price"]})
-        while True:
-            msg = self._recv()
-            if msg.get("req_id") == buy_id:
-                if "error" in msg:
-                    logging.warning(f"Error al comprar contrato: {msg['error']}")
-                    return None, 0
-                duration_val = int(proposal.get("duration", 1))
-                unit = str(proposal.get("duration_unit", "m")).lower()
-                if unit == "s":
-                    duration_seconds = duration_val
-                elif unit == "h":
-                    duration_seconds = duration_val * 3600
-                elif unit == "d":
-                    duration_seconds = duration_val * 86400
-                else:
-                    duration_seconds = duration_val * 60
-                return msg["buy"]["contract_id"], duration_seconds
-
-    def check_trade_result(self, contract_id: int, retries: int = 6, delay: float = 3.0) -> str:
-        for attempt in range(retries):
-            try:
-                req_id = self._send({"proposal_open_contract": 1, "contract_id": contract_id})
-                while True:
-                    msg = self._recv()
-                    if msg.get("req_id") == req_id:
-                        if "error" in msg:
-                            raise RuntimeError(msg["error"].get("message", "Error desconocido"))
-                        data = msg.get("proposal_open_contract", {})
-                        status = str(data.get("status", "")).lower()
-                        if status in {"won", "lost"}:
-                            return status
-                        if data.get("is_sold"):
-                            profit_raw = data.get("profit")
-                            try:
-                                profit_val = float(profit_raw)
-                            except (TypeError, ValueError):
-                                profit_val = 0.0
-                            return "won" if profit_val > 0 else "lost"
-                        break
-            except Exception as exc:
-                logging.warning(f"[{contract_id}] Error al consultar resultado: {exc}")
-            time.sleep(delay)
-        return "unknown"
+    return candles
 
 
 # ===============================================================
@@ -2980,7 +2905,6 @@ class DerivWebSocket:
 # ===============================================================
 class TradingEngine:
     def __init__(self) -> None:
-        self.api = DerivWebSocket()
         self.risk = RiskManager()
         self.ai = AdaptiveAIManager()
         self.trade_history: List[TradeRecord] = []
@@ -3066,7 +2990,7 @@ class TradingEngine:
             reference_ops,
         )
         startup_message = (
-            f"🤖 Bot iniciado correctamente y conectado a Deriv\n"
+            f"🤖 Bot iniciado correctamente y conectado a Axi MT5\n"
             f"🧠 Memoria cargada con {wins_loaded} ganadoras y {losses_loaded} perdedoras"
         )
         try:
@@ -3076,7 +3000,6 @@ class TradingEngine:
         self._telegram_thread: Optional[threading.Thread] = None
         self.telegram_bot = telegram_bot
         self.last_volatility: float = 0.0
-        self._keepalive_thread: Optional[threading.Thread] = None
         self.failed_candle_count = 0
 
     def add_trade_listener(self, callback: Callable[[TradeRecord, Dict[str, float]], None]) -> None:
@@ -3299,25 +3222,6 @@ class TradingEngine:
         except Exception as exc:
             logging.error(f"❌ Error starting background services: {exc}")
 
-    def _silent_keepalive_ping(self) -> None:
-        """Silently keep the Deriv WebSocket alive."""
-        import json
-        import time
-
-        while True:
-            try:
-                socket = getattr(self.api, "socket", None)
-                if socket is not None and getattr(socket, "connected", False):
-                    socket.send(json.dumps({"ping": 1}))
-                else:
-                    self.api.connect()
-            except Exception:
-                try:
-                    self.api.connect()
-                except Exception:
-                    pass
-            time.sleep(90)
-
     def save_learning_data(self) -> None:
         try:
             self.aprendizaje.save_data()
@@ -3337,15 +3241,11 @@ class TradingEngine:
         self.running.set()
         self._notify_status("connecting")
         try:
-            self.api.connect()
-            if self._keepalive_thread is None or not self._keepalive_thread.is_alive():
-                self._keepalive_thread = threading.Thread(
-                    target=self._silent_keepalive_ping,
-                    daemon=True,
-                )
-                self._keepalive_thread.start()
+            if not mt5.initialize():
+                error_info = mt5.last_error()
+                raise RuntimeError(f"No se pudo inicializar MetaTrader5: {error_info}")
             try:
-                send_telegram_message("🤖 Bot iniciado correctamente y conectado a Deriv")
+                send_telegram_message("🤖 Bot iniciado correctamente y conectado a Axi MT5")
             except Exception:
                 logging.debug("No se pudo enviar mensaje de inicio a Telegram")
         except Exception:
@@ -3542,38 +3442,21 @@ class TradingEngine:
         self.stop()
 
 
-    def _wait_for_contract_result(self, contract_id: int, duration_seconds: int) -> str:
-        end_time = datetime.now(timezone.utc) + timedelta(seconds=duration_seconds)
-        logging.info(f"⏳ Esperando resultado real del contrato #{contract_id}...")
-        while True:
-            now = datetime.now(timezone.utc)
-            remaining = int((end_time - now).total_seconds())
-            if remaining <= 0:
-                break
-            logging.info(f"⌛ Contrato #{contract_id} — {remaining}s restantes...")
-            time.sleep(min(RESULT_POLL_INTERVAL, max(1, remaining)))
-        status = self.api.check_trade_result(contract_id)
-        if status == "won":
-            logging.info(f"✅ Contrato #{contract_id} GANADO")
-        elif status == "lost":
-            logging.info(f"❌ Contrato #{contract_id} PERDIDO")
-        else:
-            logging.info(f"⚠️ Contrato #{contract_id} sin resultado confirmado, reintentando...")
-            status = self.api.check_trade_result(contract_id, retries=3, delay=5.0)
-            if status == "won":
-                logging.info(f"✅ Contrato #{contract_id} GANADO")
-            elif status == "lost":
-                logging.info(f"❌ Contrato #{contract_id} PERDIDO")
-            else:
-                logging.info(f"⚠️ Contrato #{contract_id} continúa sin resultado tras múltiples intentos")
-        return status
-
-    def _resolve_trade_result(self, status: str, stake: float) -> Tuple[str, float]:
-        if status == "won":
+    def _resolve_trade_result(self, order_result: Any, stake: float, signal: str) -> Tuple[str, float]:
+        if order_result is None:
+            return "UNKNOWN", 0.0
+        profit_value = float(getattr(order_result, "profit", 0.0) or 0.0)
+        if profit_value > 0:
+            return "WIN", profit_value
+        if profit_value < 0:
+            return "LOSS", profit_value
+        retcode = getattr(order_result, "retcode", None)
+        if retcode == mt5.TRADE_RETCODE_DONE:
+            direction = signal.upper()
+            logging.info(f"✅ Orden {direction} ejecutada correctamente en MT5")
             return "WIN", float(stake) * PAYOUT
-        if status == "lost":
-            return "LOSS", -float(stake)
-        return "UNKNOWN", 0.0
+        logging.info("❌ Orden MT5 no ejecutada correctamente")
+        return "LOSS", -float(stake)
 
     def _register_processed_contract(self, contract_id: int) -> bool:
         with self._processed_lock:
@@ -3644,7 +3527,7 @@ class TradingEngine:
         stake = 0.0
         try:
             try:
-                candles = self.api.fetch_candles(symbol)
+                candles = fetch_axi_candles(symbol)
             except Exception as exc:
                 logging.warning(f"Error al obtener velas de {symbol}: {exc}")
                 candles = []
@@ -4564,7 +4447,7 @@ class TradingEngine:
 
     def _fetch_exit_price(self, symbol: str, fallback: float) -> float:
         try:
-            candles = self.api.fetch_candles(symbol)
+            candles = fetch_axi_candles(symbol)
             if candles:
                 return float(candles[-1].close)
         except Exception as exc:
@@ -4937,23 +4820,32 @@ class TradingEngine:
         logging.info(
             f"🚀 Executing trade on {symbol} | Confidence={confidence_value:.2f} | Confluence={confluence_value}/{min_confluence} | Volatility={evaluated_volatility:.6f}"
         )
-        contract_id, duration_seconds = self.api.buy(symbol, signal, stake_amount)
-        if contract_id is None:
-            logging.warning('No se pudo abrir la operación, se reanuda el análisis.')
+        try:
+            order_result = send_order(symbol, signal, volume=stake_amount)
+        except Exception as exc:
+            logging.warning(f"No se pudo enviar la orden MT5: {exc}")
             self._notify_trade_state("ready")
             return False
+        if order_result is None:
+            logging.warning('No se obtuvo respuesta de la orden, se reanuda el análisis.')
+            self._notify_trade_state("ready")
+            return False
+        retcode = getattr(order_result, "retcode", None)
+        if retcode != mt5.TRADE_RETCODE_DONE:
+            logging.warning(f"Orden rechazada por MT5 (retcode={retcode})")
+            self._notify_trade_state("ready")
+            return False
+        contract_id = order_result.order or order_result.deal or int(time.time())
         operation_active = True
         self.active_trade_symbol = symbol
         self._notify_trade_state('active')
-        dur_seconds = duration_seconds if duration_seconds > 0 else TRADE_DURATION_SECONDS
-        logging.info(f"🟢 Operación abierta — Contrato #{contract_id} | Duración: {dur_seconds}s")
+        logging.info(f"🟢 Operación abierta — Ticket #{contract_id} | Volumen: {stake_amount}")
         self._trade_timestamps.append(time.time())
         trade_initiated = True
         try:
-            result_status = self._wait_for_contract_result(contract_id, dur_seconds)
-            trade_result, pnl = self._resolve_trade_result(result_status, stake_amount)
+            trade_result, pnl = self._resolve_trade_result(order_result, stake_amount, signal)
             if contract_id is not None and not self._register_processed_contract(contract_id):
-                logging.debug(f"Contrato #{contract_id} ya procesado, omitiendo duplicado de resultados")
+                logging.debug(f"Ticket #{contract_id} ya procesado, omitiendo duplicado de resultados")
                 return trade_initiated
             self.risk.register_trade(pnl)
             if features is not None:
@@ -5097,7 +4989,7 @@ class TradingEngine:
                 )
             should_notify = True
             if contract_id is not None and not self._register_contract_closure(contract_id):
-                logging.debug(f"Contract {contract_id} already closed. Skipping duplicate log.")
+                logging.debug(f"Ticket {contract_id} already closed. Skipping duplicate log.")
                 should_notify = False
             if should_notify:
                 emoji = "✅" if win_flag else "❌"
@@ -5171,7 +5063,7 @@ class TradingEngine:
             ):
                 self._handle_auto_shutdown()
         except Exception as exc:
-            logging.warning(f"Error al gestionar la operación #{contract_id}: {exc}")
+            logging.warning(f"Error al gestionar el ticket #{contract_id}: {exc}")
         finally:
             operation_active = False
             self.active_trade_symbol = None
@@ -5202,11 +5094,9 @@ class TradingEngine:
         self._notify_trade_state("ready")
         self.ai.shutdown()
         try:
-            if self.api.socket is not None:
-                self.api.socket.close()
+            mt5.shutdown()
         except Exception:
             pass
-        self.api.socket = None
         with self._processed_lock:
             self._processed_contracts.clear()
         with self._closed_lock:
@@ -5271,16 +5161,16 @@ class BotThread(QThread):
             self.logged_contracts = getattr(self, "logged_contracts", set())
             logged_contracts = self.logged_contracts
             if contract_id in logged_contracts:
-                logging.debug(f"Duplicate contract {contract_id} ignored.")
+                logging.debug(f"Duplicate ticket {contract_id} ignored.")
                 return
             logged_contracts.add(contract_id)
             self._closed_contracts.add(contract_id)
         ticket = data.get("ticket")
         resultado = data.get("resultado", "-")
         if ticket is not None:
-            mensaje = f"✅ Contrato #{ticket} {resultado}"
+            mensaje = f"✅ Ticket #{ticket} {resultado}"
         else:
-            mensaje = f"✅ Contrato {resultado}"
+            mensaje = f"✅ Ticket {resultado}"
         self.log_signal.emit(mensaje)
         self.result_signal.emit(dict(data))
 
@@ -5326,7 +5216,7 @@ class BotThread(QThread):
 class BotWindow(QtWidgets.QWidget):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Bot Deriv Pro Trader")
+        self.setWindowTitle("Bot Axi Pro Trader")
         self.resize(1320, 780)
         self.setStyleSheet(
             """
@@ -5897,7 +5787,7 @@ class BotWindow(QtWidgets.QWidget):
             self.logged_contracts = getattr(self, "logged_contracts", set())
             logged_contracts = self.logged_contracts
             if contract_id in logged_contracts:
-                logging.debug(f"Duplicate contract {contract_id} ignored.")
+                logging.debug(f"Duplicate ticket {contract_id} ignored.")
                 return
             logged_contracts.add(contract_id)
         target_row = self._find_contract_row(contract_id)
