@@ -19,7 +19,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 import numpy as np
 import pandas as pd
 import requests
-import MetaTrader5 as mt5
+import metatrader5 as mt5
 from ta.momentum import RSIIndicator
 from ta.trend import EMAIndicator, SMAIndicator, ADXIndicator, MACD
 from ta.volatility import BollingerBands, AverageTrueRange
