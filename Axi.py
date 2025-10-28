@@ -57,6 +57,9 @@ MAX_DRAWDOWN = -150.0
 MIN_TRADE_CONFIDENCE = 0.45
 MIN_CONFIDENCE = 0.75
 MIN_VOLATILITY = 0.0005
+LOT_SIZE = 0.01  # configurable, equivalent to $1 per pip depending on broker leverage
+ATR_MULT_SL = 2.0
+ATR_MULT_TP = 3.0
 
 # === STRICT MODE PARAMETERS ===
 CONFIDENCE_MIN = 0.80
@@ -95,11 +98,81 @@ warnings.filterwarnings("ignore", category=RuntimeWarning, message="overflow enc
 
 print("🧠 Axi module active — running strategies with MT5 market feed.")
 
+logger = logging.getLogger(__name__)
+
 
 def connect_axi(account_id: int, password: str, server: str) -> None:
     if not mt5.initialize(login=account_id, password=password, server=server):
         raise Exception(f"❌ Axi connection failed → {mt5.last_error()}")
     print("✅ Connected to Axi MT5")
+
+
+def execute_market_order(symbol: str, action: str, atr_value: float, lot_size: float = LOT_SIZE):
+    """
+    Executes a market order on MT5 (instant order).
+    SL/TP are dynamic based on ATR.
+    """
+
+    symbol_info = mt5.symbol_info(symbol)
+    if symbol_info is None:
+        raise RuntimeError(f"Symbol {symbol} is not available in MT5")
+    point = float(getattr(symbol_info, "point", 0.0) or 0.0)
+    if point == 0.0:
+        raise RuntimeError(f"Invalid point size for {symbol}")
+
+    sl_distance = float(max(atr_value, 0.0)) * ATR_MULT_SL
+    tp_distance = float(max(atr_value, 0.0)) * ATR_MULT_TP
+
+    tick = mt5.symbol_info_tick(symbol)
+    if tick is None:
+        raise RuntimeError(f"No tick data for {symbol}")
+
+    order_type = mt5.ORDER_TYPE_BUY if action == "CALL" else mt5.ORDER_TYPE_SELL
+    price = tick.ask if action == "CALL" else tick.bid
+
+    sl = price - sl_distance * point if action == "CALL" else price + sl_distance * point
+    tp = price + tp_distance * point if action == "CALL" else price - tp_distance * point
+
+    order_request = {
+        "action": mt5.TRADE_ACTION_DEAL,
+        "symbol": symbol,
+        "volume": float(lot_size),
+        "type": order_type,
+        "price": price,
+        "sl": sl,
+        "tp": tp,
+        "magic": 202503,
+        "comment": "AXI AUTO TRADE",
+        "type_filling": mt5.ORDER_FILLING_IOC,
+        "type_time": mt5.ORDER_TIME_GTC,
+    }
+
+    result = mt5.order_send(order_request)
+
+    if result is None:
+        logger.error("❌ Order failed: No response from MT5")
+        if BOT_ACTIVE:
+            telegram_send(
+                f"❌ ORDER FAILED\n{symbol}\nReason: No response from MT5"
+            )
+        return None
+
+    if result.retcode != mt5.TRADE_RETCODE_DONE:
+        logger.error(f"❌ Order failed: {getattr(result, 'comment', 'Unknown error')}")
+        if BOT_ACTIVE:
+            telegram_send(
+                "❌ ORDER FAILED\n"
+                f"{symbol}\nReason: {getattr(result, 'comment', 'Unknown error')}"
+            )
+    else:
+        logger.info(f"✅ Order placed! #{getattr(result, 'order', 0)} {symbol} → {action}")
+        if BOT_ACTIVE:
+            telegram_send(
+                "✅ MARKET ORDER EXECUTED\n"
+                f"{symbol}\nAction: {action}\nLot: {lot_size}\nSL/TP based on ATR"
+            )
+
+    return result
 
 
 def get_candles(symbol: str, timeframe: int = mt5.TIMEFRAME_M1, count: int = 100) -> List[Dict[str, Any]]:
@@ -161,6 +234,10 @@ def send_telegram_message(text: str) -> None:
         requests.post(url, json=payload, timeout=5)
     except Exception as exc:
         logging.warning(f"⚠️ Telegram message failed: {exc}")
+
+
+def telegram_send(text: str) -> None:
+    send_telegram_message(text)
 
 
 
@@ -716,6 +793,24 @@ def bollinger_bands(series: pd.Series, period: int = 20, num_dev: float = 2.0) -
 
 def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     return AverageTrueRange(high=df["high"], low=df["low"], close=df["close"], window=period, fillna=False).average_true_range()
+
+
+def compute_atr_for_symbol(symbol: str, period: int = 14, count: int = CANDLE_COUNT) -> float:
+    try:
+        candles = fetch_axi_candles(symbol, count=max(count, period + 2))
+        if not candles:
+            return 0.0
+        df = to_dataframe(candles)
+        atr_series = atr(df, period)
+        if atr_series.empty:
+            return 0.0
+        value = float(atr_series.iloc[-1])
+        if math.isnan(value):
+            return 0.0
+        return value
+    except Exception as exc:
+        logger.debug(f"Failed to compute ATR for {symbol}: {exc}")
+        return 0.0
 
 
 def donchian_channels(df: pd.DataFrame, period: int = 20) -> Tuple[pd.Series, pd.Series]:
@@ -3554,6 +3649,8 @@ class TradingEngine:
                 logging.warning(f"Sin velas disponibles para {symbol}, se omite del ciclo")
                 return None
             df = to_dataframe(candles)
+            atr_series_calc = atr(df, 14) if not df.empty else pd.Series(dtype=float)
+            atr_latest_value = float(atr_series_calc.iloc[-1]) if not atr_series_calc.empty else 0.0
             results, consensus = self._evaluate_strategies(df)
             self._notify_summary(symbol, consensus)
             signal = consensus['signal']
@@ -3597,6 +3694,7 @@ class TradingEngine:
                 'ema_spread': 0.0,
                 'boll_width': 0.0,
                 'volatility': 0.0,
+                'atr': atr_latest_value,
                 'signal_source': 'COMBINED',
                 'ema_diff': float(df['close'].iloc[-1] - df['close'].iloc[-2]) if len(df) > 1 else 0.0,
                 'indicator_confidence': 0.0,
@@ -4474,7 +4572,8 @@ class TradingEngine:
         }
         if 'stake' not in evaluation:
             evaluation['stake'] = self._calculate_kelly_stake(evaluation.get('predicted_probability', 0.5))
-        stake_amount = float(max(0.1, evaluation.get('stake', self.trade_amount)))
+        stake_amount = float(LOT_SIZE)
+        evaluation['stake'] = stake_amount
         ml_probability = float(evaluation.get('predicted_probability', 0.5))
         trade_initiated = False
         volatility_raw = evaluation.get('volatility')
@@ -4771,9 +4870,6 @@ class TradingEngine:
         # === GLOBAL CONFLUENCE RULE ===
         min_confluence = MIN_ALIGNED_STRATEGIES  # fixed at 3 for all symbols
         confluence_value = aligned_strategies
-        if confidence_value < min_confidence:
-            logging.info(f"🚫 Trade skipped due to low confidence ({confidence_value:.2f} < {min_confidence:.2f})")
-            return False
         if confluence_value < min_confluence:
             logging.info(f"🚫 Trade skipped due to low confluence ({confluence_value}/{min_confluence})")
             return False
@@ -4820,8 +4916,27 @@ class TradingEngine:
         logging.info(
             f"🚀 Executing trade on {symbol} | Confidence={confidence_value:.2f} | Confluence={confluence_value}/{min_confluence} | Volatility={evaluated_volatility:.6f}"
         )
+        atr_value = float(evaluation.get('atr', 0.0) or 0.0)
+        if atr_value <= 0.0:
+            fallback_atr = compute_atr_for_symbol(symbol)
+            if fallback_atr > 0.0:
+                atr_value = fallback_atr
+            else:
+                atr_value = 1.0
+        execution_threshold = max(0.80, min_confidence)
+        order_result = None
         try:
-            order_result = send_order(symbol, signal, volume=stake_amount)
+            if confidence_value >= execution_threshold:
+                order_result = execute_market_order(symbol, final_action, atr_value, LOT_SIZE)
+                logger.info(
+                    f"🚀 EXECUTED MARKET ORDER {symbol} → {final_action} | Confidence={confidence_value:.2f}"
+                )
+            else:
+                logger.info(
+                    f"🚫 Skipped trade due to low confidence ({confidence_value:.2f})"
+                )
+                self._notify_trade_state("ready")
+                return False
         except Exception as exc:
             logging.warning(f"No se pudo enviar la orden MT5: {exc}")
             self._notify_trade_state("ready")
