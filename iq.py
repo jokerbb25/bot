@@ -9,7 +9,7 @@ import re
 from queue import Queue
 from threading import Lock
 
-import pyautogui
+import pygetwindow as gw
 
 import numpy as np
 import pandas as pd
@@ -429,11 +429,10 @@ class Worker(QThread):
             self.log_signal.emit(summary)
             if hasattr(self.gui, "overlay") and self.gui.overlay:
                 try:
-                    self.gui.overlay.update_position()
-                    if signal in {"CALL", "PUT"}:
-                        x, y = pyautogui.position()
-                        self.gui.overlay.draw_arrow(x, y, signal)
-                    self.gui.overlay.refresh()
+                    win = gw.getWindowsWithTitle("IQ Option")[0]
+                    x = int(win.width * 0.85)
+                    y = int(win.height * (0.4 if signal == "CALL" else 0.6))
+                    self.gui.overlay.draw_arrow(x, y, signal)
                 except Exception as overlay_error:
                     print(f"[OVERLAY ERROR] {overlay_error}")
             self.table_signal.emit(payload)
@@ -619,7 +618,7 @@ class MainWindow(QMainWindow):
             """
         )
         self.worker = None
-        self._last_log_raw = None
+        self._last_log_message = None
         self.strategy_lock = threading.Lock()
         self.active_strategies = {
             "RSI": True,
@@ -837,17 +836,11 @@ class MainWindow(QMainWindow):
             print(f"[LOG SCROLL ERROR] {error}")
 
     def append_log(self, message):
-        """
-        Appends a message to console and GUI once, avoiding duplicate timestamps and entries.
-        """
-        has_ts = bool(re.match(r"^(\[\d{4}-\d{2}-\d{2}|\d{4}-\d{2}-\d{2})", message))
-        raw = message
-        if not hasattr(self, "_last_log_raw"):
-            self._last_log_raw = None
-        if raw == self._last_log_raw:
+        if message == getattr(self, "_last_log_message", None):
             return
-        self._last_log_raw = raw
-        formatted = raw if has_ts else f"[{dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {raw}"
+        self._last_log_message = message
+        has_ts = bool(re.match(r"^(\[\d{4}-\d{2}-\d{2}|\d{4}-\d{2}-\d{2})", message))
+        formatted = message if has_ts else f"[{dt.datetime.now().strftime('%Y-%m-%d %H:%M:%S')}] {message}"
         print(formatted)
         try:
             self.safe_log_emit(formatted)
