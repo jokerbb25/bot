@@ -429,10 +429,14 @@ class Worker(QThread):
             self.log_signal.emit(summary)
             if hasattr(self.gui, "overlay") and self.gui.overlay:
                 try:
-                    win = gw.getWindowsWithTitle("IQ Option")[0]
-                    x = int(win.width * 0.85)
-                    y = int(win.height * (0.4 if signal == "CALL" else 0.6))
-                    self.gui.overlay.draw_arrow(x, y, signal)
+                    if signal in {"CALL", "PUT"}:
+                        window = gw.getWindowsWithTitle("IQ Option")[0]
+                        x = int(window.width * 0.85)
+                        y = int(window.height * (0.4 if signal == "CALL" else 0.6))
+                        self.gui.overlay.clear()
+                        self.gui.overlay.draw_arrow(x, y, signal)
+                    else:
+                        self.gui.overlay.clear()
                 except Exception as overlay_error:
                     print(f"[OVERLAY ERROR] {overlay_error}")
             self.table_signal.emit(payload)
