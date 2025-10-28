@@ -9,6 +9,8 @@ import re
 from queue import Queue
 from threading import Lock
 
+import pyautogui
+
 import numpy as np
 import pandas as pd
 from PyQt5.QtWidgets import (
@@ -27,6 +29,8 @@ from PyQt5.QtWidgets import (
     QHeaderView,
 )
 from PyQt5.QtCore import QThread, QTimer, Qt, pyqtSignal, QMetaObject, Q_ARG, pyqtSlot
+
+from visual_overlay import OverlayWindow
 
 
 SYMBOLS = [
@@ -423,6 +427,15 @@ class Worker(QThread):
                 f"Stochastic:{info['STOCH']}, Momentum:{info['MOM']}, Volatility:{info['VOL']}"
             )
             self.log_signal.emit(summary)
+            if hasattr(self.gui, "overlay") and self.gui.overlay:
+                try:
+                    self.gui.overlay.update_position()
+                    if signal in {"CALL", "PUT"}:
+                        x, y = pyautogui.position()
+                        self.gui.overlay.draw_arrow(x, y, signal)
+                    self.gui.overlay.refresh()
+                except Exception as overlay_error:
+                    print(f"[OVERLAY ERROR] {overlay_error}")
             self.table_signal.emit(payload)
             visual_queue.put({
                 "symbol": symbol,
@@ -606,7 +619,7 @@ class MainWindow(QMainWindow):
             """
         )
         self.worker = None
-        self._last_log_message = None
+        self._last_log_raw = None
         self.strategy_lock = threading.Lock()
         self.active_strategies = {
             "RSI": True,
@@ -635,6 +648,7 @@ class MainWindow(QMainWindow):
         self._build_strategies_tab()
         self._build_log_tab()
         self._build_settings_tab()
+        self.overlay = OverlayWindow()
         self.start_heartbeat()
 
     def _build_dashboard_tab(self):
