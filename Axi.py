@@ -58,7 +58,6 @@ MIN_TRADE_CONFIDENCE = 0.45
 MIN_CONFIDENCE = 0.0
 MIN_VOLATILITY = 0.0
 LOT_SIZE = 0.01  # configurable, equivalent to $1 per pip depending on broker leverage
-MIN_CONFLUENCE = 2
 
 WEIGHT_BOOST = {
     "XAUUSD": {"trend": 0.03, "range": -0.02},
@@ -4860,8 +4859,6 @@ class TradingEngine:
         if not self._is_macro_trend_aligned(evaluation, final_action):
             return False
         self.last_volatility = current_vol_reference
-        confluence_value = aligned_strategies
-        required_confluence = MIN_CONFLUENCE
         regime_value = detect_regime(adx_value, bb_width_value)
         evaluation['regime'] = regime_value
         boost_settings = WEIGHT_BOOST.get(symbol_upper, {})
@@ -4872,13 +4869,32 @@ class TradingEngine:
         confidence_value = float(np.clip(confidence_value, 0.0, 1.0))
         combined_confidence = confidence_value
         evaluation['final_confidence'] = confidence_value
-        # ==========================================================
-        # LOG ALWAYS — BEFORE APPLYING FILTERS
-        # ==========================================================
-        logger.info(
-            f"[{symbol}] Strategies aligned = {aligned_strategies} | "
-            f"Confidence = {confidence_value:.2f}"
+
+        strategy_outputs = [
+            str(res.signal or 'NONE').upper()
+            for _, res in results
+        ]
+        total_strategies = len(strategy_outputs)
+        aligned_count = (
+            strategy_outputs.count(final_action)
+            if final_action in {'CALL', 'PUT'}
+            else 0
         )
+        evaluation['aligned_count'] = aligned_count
+        evaluation['total_strategies'] = total_strategies
+
+        logger.info(
+            f"[{symbol}] ✅ Confluence: {aligned_count}/{total_strategies} strategies aligned "
+            f"| Confidence={confidence_value:.2f} | Action={final_action}"
+        )
+
+        if aligned_count < 2:
+            logger.info(f"[{symbol}] ❌ Skip: not enough aligned strategies (<2)")
+            return False
+
+        if confidence_value < 0.65:
+            logger.info(f"❌ Skip: confidence {confidence_value:.2f} < 0.65 required")
+            return False
 
         atr_value = float(evaluation.get('atr', 0.0) or 0.0)
         if atr_value <= 0.0:
@@ -4893,25 +4909,17 @@ class TradingEngine:
         atr_pips_value = atr_value / point_value if point_value else 0.0
         decision_snapshot = (
             f"[{symbol_upper}] 🧮 Conf={confidence_value:.2f} Regime={regime_value} "
-            f"ATRp={atr_pips_value:.1f}p Confluence={confluence_value} Dir={final_action}"
+            f"ATRp={atr_pips_value:.1f}p Confluence={aligned_count}/{total_strategies} Dir={final_action}"
         )
-        if aligned_strategies < 2:
-            logger.info(decision_snapshot)
-            logger.info(f"❌ Skip: only {aligned_strategies}/2 strategies aligned")
-            return False
-        required_confidence = 0.65
-        if confidence_value < required_confidence:
-            logger.info(decision_snapshot)
-            logger.info(f"❌ Skip: confidence {confidence_value:.2f} < 0.65 required")
-            return False
         ATR_LIMITS = {
-            "XAUUSD": (30, 350),
+            'XAUUSD': (30, 350),
         }
         min_atr, max_atr = ATR_LIMITS.get(symbol_upper, (2, 40))
         if not (min_atr <= atr_pips_value <= max_atr):
             logger.info(decision_snapshot)
             logger.info(f"❌ Skip {symbol} - ATR {atr_pips_value:.1f} pips not in [{min_atr}-{max_atr}]")
             return False
+
         logger.info(decision_snapshot)
 
         if STRICT_MODE_ENABLED:
@@ -4955,7 +4963,7 @@ class TradingEngine:
             stake_amount,
         )
         logging.info(
-            f"🚀 Executing trade on {symbol} | Confidence={confidence_value:.2f} | Confluence={confluence_value}/{required_confluence} | Volatility={evaluated_volatility:.6f}"
+            f"🚀 Executing trade on {symbol} | Confidence={confidence_value:.2f} | Confluence={aligned_count}/{total_strategies} | Volatility={evaluated_volatility:.6f}"
         )
         if atr_value <= 0.0:
             atr_value = 1.0
