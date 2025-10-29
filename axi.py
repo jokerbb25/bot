@@ -39,6 +39,11 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 from PyQt5.QtCore import QThread, pyqtSignal
 from aprendizaje import Aprendizaje
 from telegram_bot import BOT_ACTIVE, telegram_listener
+import gui
+from engine.close import on_order_closed
+from engine.execute import maybe_execute, price_to_pips
+from engine.state import BotState, position_lock, trade_state
+from utils.logwrap import skip
 
 # ===============================================================
 # CONFIG & CONSTANTS
@@ -110,8 +115,8 @@ def connect_axi(account_id: int, password: str, server: str) -> None:
     print("✅ Connected to Axi MT5")
 
 
-def execute_market_order(symbol: str, action: str, atr_value: float, lot_size: float = LOT_SIZE) -> Tuple[Any, Optional[float]]:
-    """Execute a market order on MT5 using ATR-based dynamic stops."""
+def execute_market_order(symbol: str, action: str, atr_value: float, lot_size: float = LOT_SIZE, confidence: Optional[float] = None) -> Tuple[Any, Optional[float]]:
+    """Execute a market order on MT5 using ATR-based dynamic stops and SLP."""
 
     symbol_info = mt5.symbol_info(symbol)
     if symbol_info is None:
@@ -122,7 +127,7 @@ def execute_market_order(symbol: str, action: str, atr_value: float, lot_size: f
         raise RuntimeError(f"No tick data for {symbol}")
 
     direction = str(action or "CALL").upper()
-    order_type = mt5.ORDER_TYPE_BUY if direction == "CALL" else mt5.ORDER_TYPE_SELL
+    trade_direction = "BUY" if direction == "CALL" else "SELL"
     price = tick.ask if direction == "CALL" else tick.bid
     point = float(getattr(symbol_info, "point", 0.0) or 0.0)
     if point <= 0.0:
@@ -130,49 +135,29 @@ def execute_market_order(symbol: str, action: str, atr_value: float, lot_size: f
 
     lot = float(lot_size)
     atr = float(max(atr_value, 0.0))
-    atr_pips = atr / point if point else 0.0
-    stop_level = int(getattr(symbol_info, "trade_stops_level", 0) or 0)
-    sl_points = max(stop_level, int(max(1.0, atr_pips * 1.2)))
-    tp_points = max(stop_level, int(max(1.0, atr_pips * 2.5)))
+    atr_pips = price_to_pips(symbol, atr)
+    if atr_pips == 0.0 and point:
+        atr_pips = atr / point
 
-    request = {
-        "action": mt5.TRADE_ACTION_DEAL,
-        "symbol": symbol,
-        "volume": lot,
-        "type": order_type,
-        "price": price,
-        "sl": price - sl_points * point if direction == "CALL" else price + sl_points * point,
-        "tp": price + tp_points * point if direction == "CALL" else price - tp_points * point,
-        "magic": 1001,
-        "comment": "axi-bot",
-        "type_time": mt5.ORDER_TIME_GTC,
-        "type_filling": mt5.ORDER_FILLING_IOC,
-    }
-
-    result = mt5.order_send(request)
-
-    if result is None or getattr(result, "retcode", None) != mt5.TRADE_RETCODE_DONE:
-        logger.error(
-            f"[{symbol}] ❌ Order failed: retcode={getattr(result, 'retcode', None)}"
-        )
-        if BOT_ACTIVE:
-            reason = getattr(result, "comment", "No response from MT5" if result is None else "Unknown error")
+    result, ticket = maybe_execute(symbol, trade_direction, lot, atr_pips, price, confidence)
+    if result is None or ticket is None:
+        if BOT_ACTIVE and result is not None:
+            reason = getattr(result, "comment", "Unknown error")
             telegram_send(
-                "❌ ORDER FAILED\n"
+                "❌ ORDER FAILED\n",
                 f"{symbol}\nReason: {reason}"
             )
         return result, None
 
     logger.info(
-        f"[{symbol}] ✅ Order placed #{getattr(result, 'order', 0)} {direction} @ {price:.5f}"
+        f"[{symbol}] ✅ Order placed #{ticket} {direction} @ {price:.5f}"
     )
     if BOT_ACTIVE:
         telegram_send(
-            "✅ MARKET ORDER EXECUTED\n"
+            "✅ MARKET ORDER EXECUTED\n",
             f"{symbol}\nAction: {direction}\nLot: {lot}"
         )
 
-    ticket = getattr(result, "order", 0) or getattr(result, "deal", 0) or 0
     profit: Optional[float] = None
     if ticket:
         try:
@@ -181,9 +166,7 @@ def execute_market_order(symbol: str, action: str, atr_value: float, lot_size: f
         except Exception:
             pass
         time.sleep(0.5)
-        deals = mt5.history_deals_get(position=ticket)
-        if not deals:
-            deals = mt5.history_deals_get(ticket=ticket)
+        deals = mt5.history_deals_get(position=ticket) or mt5.history_deals_get(ticket=ticket)
         if deals:
             last_deal = deals[-1]
             profit = float(getattr(last_deal, "profit", 0.0))
@@ -193,13 +176,16 @@ def execute_market_order(symbol: str, action: str, atr_value: float, lot_size: f
         logger.info(f"[{symbol}] 📊 MT5 result → Profit={profit:.2f} → {status}")
         if BOT_ACTIVE:
             telegram_send(
-                "📊 MT5 RESULT\n"
+                "📊 MT5 RESULT\n",
                 f"{symbol}\nProfit: {profit:.2f}\nEstado: {status}"
             )
     else:
         logger.warning(f"[{symbol}] ⚠️ Could not fetch MT5 deal to compute real PnL")
 
     return result, profit
+
+
+
 
 
 def get_candles(symbol: str, timeframe: int = mt5.TIMEFRAME_M1, count: int = 100) -> List[Dict[str, Any]]:
@@ -3366,6 +3352,15 @@ class TradingEngine:
         if self.running.is_set():
             return
         self.running.set()
+        with position_lock:
+            trade_state.update({
+                "state": BotState.IDLE,
+                "ticket": None,
+                "symbol": None,
+                "direction": None,
+                "entry_price": None,
+                "open_time": None,
+            })
         self._notify_status("connecting")
         try:
             if not mt5.initialize():
@@ -3388,6 +3383,7 @@ class TradingEngine:
             self._closed_contracts.clear()
         CSV_LOGGED_CONTRACTS.clear()
 
+        
     def is_running(self) -> bool:
         return self.running.is_set()
 
@@ -4153,22 +4149,13 @@ class TradingEngine:
             MIN_STRATEGIES = 2
 
             if final_action not in {'CALL', 'PUT'}:
-                logger.info(
-                    f"[{symbol}] 🚫 Skipped — no actionable direction detected"
-                )
-                return None
+                return skip('NO_SIGNAL', f'symbol={symbol}')
 
             if strategies_aligned < MIN_STRATEGIES:
-                logger.info(
-                    f"[{symbol}] 🚫 Skipped — insufficient confluence ({strategies_aligned}/{MIN_STRATEGIES})"
-                )
-                return None
+                return skip('NO_CONFLUENCE', f'aligned={strategies_aligned}/{MIN_STRATEGIES}')
 
             if confidence < MIN_CONFIDENCE:
-                logger.info(
-                    f"[{symbol}] 🚫 Skipped — confidence {confidence:.2f} < {MIN_CONFIDENCE}"
-                )
-                return None
+                return skip('LOW_CONF', f'conf={confidence:.2f}')
 
             return evaluation
         except Exception as exc:
@@ -4861,7 +4848,7 @@ class TradingEngine:
         trade_profit: Optional[float] = None
         try:
             order_result, trade_profit = execute_market_order(
-                symbol, final_action, atr_value, LOT_SIZE
+                symbol, final_action, atr_value, LOT_SIZE, confidence_value
             )
             logger.info(
                 f"🚀 EXECUTED MARKET ORDER {symbol} → {final_action} | Confidence={confidence_value:.2f}"
@@ -4897,6 +4884,8 @@ class TradingEngine:
                 logging.debug(f"Ticket #{contract_id} ya procesado, omitiendo duplicado de resultados")
                 return trade_initiated
             self.risk.register_trade(pnl)
+            if contract_id is not None:
+                on_order_closed(contract_id, trade_result, pnl)
             if features is not None:
                 self.ai.log_trade(features, 1 if trade_result == 'WIN' else 0)
             strategy_details = {
@@ -5162,6 +5151,16 @@ class TradingEngine:
             self._closed_contracts.clear()
         CSV_LOGGED_CONTRACTS.clear()
 
+        with position_lock:
+            trade_state.update({
+                "state": BotState.IDLE,
+                "ticket": None,
+                "symbol": None,
+                "direction": None,
+                "entry_price": None,
+                "open_time": None,
+            })
+
 
 # ===============================================================
 # GUI LAYER
@@ -5322,6 +5321,9 @@ class BotWindow(QtWidgets.QWidget):
         self.engine.add_status_listener(lambda status: self.bridge.status.emit(status))
         self.engine.add_summary_listener(lambda symbol, data: self.bridge.summary.emit(symbol, data))
         self.engine.add_trade_state_listener(lambda state: self.bridge.trade_state.emit(state))
+        gui.register_status_callback(self._dispatch_gui_status)
+        gui.register_open_callback(self._dispatch_gui_open)
+        gui.register_close_callback(self._dispatch_gui_close)
         self.strategy_initial_state = self._load_strategy_config()
         for name, enabled in self.strategy_initial_state.items():
             self.engine.set_strategy_state(name, enabled)
@@ -5985,6 +5987,37 @@ class BotWindow(QtWidgets.QWidget):
             self.stop_button.setEnabled(False)
             self.status_label.setText("Estado: Detenido")
         self._on_trade_state("ready")
+
+    def _dispatch_gui_status(self, message: str) -> None:
+        QtCore.QTimer.singleShot(0, lambda m=message: self._append_log(f"[STATUS] {m}"))
+
+    def _dispatch_gui_open(self, payload: Dict[str, Any]) -> None:
+        def handler(data=dict(payload)):
+            symbol = str(data.get('symbol', '-'))
+            direction = str(data.get('direction', '-'))
+            confidence = data.get('confidence')
+            entry = data.get('entry')
+            sl_pips = data.get('sl_pips')
+            parts = [f"[TRADE] OPEN {symbol} {direction}"]
+            if isinstance(confidence, (int, float)):
+                parts.append(f"conf={float(confidence):.2f}")
+            if isinstance(entry, (int, float)):
+                parts.append(f"entry={float(entry):.5f}")
+            if isinstance(sl_pips, (int, float)):
+                parts.append(f"SL={int(sl_pips)}p")
+            self._append_log(" | ".join(parts))
+        QtCore.QTimer.singleShot(0, handler)
+
+    def _dispatch_gui_close(self, payload: Dict[str, Any]) -> None:
+        def handler(data=dict(payload)):
+            ticket = data.get('ticket', '-')
+            result = data.get('result', '-')
+            pnl = data.get('pnl')
+            parts = [f"[TRADE] CLOSE ticket={ticket} result={result}"]
+            if isinstance(pnl, (int, float)):
+                parts.append(f"pnl={float(pnl):.2f}")
+            self._append_log(" | ".join(parts))
+        QtCore.QTimer.singleShot(0, handler)
 
     def _append_log(self, message: str) -> None:
         try:
