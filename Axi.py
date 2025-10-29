@@ -4112,6 +4112,64 @@ class TradingEngine:
                     'base_confidence': combined_confidence,
                 }
             )
+
+            final_action = signal if signal in {'CALL', 'PUT'} else 'NONE'
+            strategy_results: List[str] = [
+                rsi_signal,
+                ema_signal,
+                macd_signal,
+                adx_signal,
+                bollinger_signal,
+                candle_signal,
+                range_break_signal,
+                divergence_signal,
+                pullback_signal,
+            ]
+            aligned_count = (
+                strategy_results.count(final_action)
+                if final_action in {'CALL', 'PUT'}
+                else 0
+            )
+            total_strategies = len(strategy_results)
+
+            evaluation['signal'] = final_action
+            evaluation['strategy_results'] = strategy_results
+            evaluation['aligned_count'] = aligned_count
+            evaluation['total_strategies'] = total_strategies
+
+            confidence_value = float(
+                evaluation.get('final_confidence', final_confidence)
+            )
+
+            strategies_aligned = aligned_count
+            confidence = confidence_value
+
+            logger.info(
+                f"[{symbol}] ✅ Confluence: {aligned_count}/{total_strategies} | "
+                f"Confidence={confidence_value:.2f} | Action={final_action}"
+            )
+
+            MIN_CONFIDENCE = 0.65
+            MIN_STRATEGIES = 2
+
+            if final_action not in {'CALL', 'PUT'}:
+                logger.info(
+                    f"[{symbol}] 🚫 Skipped — no actionable direction detected"
+                )
+                return None
+
+            if strategies_aligned < MIN_STRATEGIES:
+                logger.info(
+                    f"[{symbol}] 🚫 Skipped — insufficient confluence ({strategies_aligned}/{MIN_STRATEGIES})"
+                )
+                return None
+
+            if confidence < MIN_CONFIDENCE:
+                logger.info(
+                    f"[{symbol}] 🚫 Skipped — confidence {confidence:.2f} < {MIN_CONFIDENCE}"
+                )
+                return None
+
             return evaluation
         except Exception as exc:
             logging.warning(f"Error en ciclo para {symbol}: {exc}")
@@ -4350,22 +4408,6 @@ class TradingEngine:
             return True
         slope = ema_current - ema_previous
         evaluation['ema50_slope'] = slope
-        if direction == 'CALL' and slope <= 0:
-            symbol = evaluation.get('symbol', 'UNKNOWN')
-            logging.info(
-                "🚫 Trade skipped for %s: EMA50 slope %.6f opposes CALL direction.",
-                symbol,
-                slope,
-            )
-            return False
-        if direction == 'PUT' and slope >= 0:
-            symbol = evaluation.get('symbol', 'UNKNOWN')
-            logging.info(
-                "🚫 Trade skipped for %s: EMA50 slope %.6f opposes PUT direction.",
-                symbol,
-                slope,
-            )
-            return False
         return True
 
     def scan_market(self) -> None:
@@ -4426,47 +4468,12 @@ class TradingEngine:
                 f"📊 Final confidence {symbol}: {confidence_value:.2f} | Volatility: {volatility_display} | Action: {signal}"
             )
 
-            aligned_total = int(
-                evaluation.get('aligned', evaluation.get('consensus', {}).get('aligned', 0))
-            )
-            min_confidence = CONFIDENCE_MIN
-            # === GLOBAL CONFLUENCE RULE ===
-            min_confluence = MIN_ALIGNED_STRATEGIES  # actualizado a 2 para forex
-
-            if confidence_value < min_confidence:
-                logging.info(
-                    f"🚫 Trade skipped due to low confidence ({confidence_value:.2f} < {min_confidence:.2f})"
-                )
-                continue
-            if aligned_total < min_confluence:
-                logging.info(
-                    f"🚫 Trade skipped due to low confluence ({aligned_total}/{min_confluence})"
-                )
-                continue
-            if volatility_value is not None and volatility_value < MIN_VOLATILITY:
-                logging.info(
-                    f"🚫 Skipping trade on {symbol} due to low volatility ({volatility_value:.4f})"
-                )
-                continue
-
-            rsi_signal = str(evaluation.get('rsi_signal', 'NONE')).upper()
-            ema_signal = str(evaluation.get('ema_signal', 'NONE')).upper()
-            if (rsi_signal != 'NONE' and ema_signal != 'NONE' and rsi_signal != ema_signal):
-                logging.info(
-                    f"🚫 Skipping trade on {symbol} due to RSI/EMA conflict → RSI={rsi_signal}, EMA={ema_signal}"
-                )
-                continue
-
-            if not self._passes_confluence_validation(evaluation):
-                continue
-
-            volatility_output = f"{volatility_value:.6f}" if volatility_value is not None else "N/A"
             logging.info(
-                f"🚀 Executing trade on {symbol} | Confidence={confidence_value:.2f} | Confluence={aligned_total}/{min_confluence} | Volatility={volatility_output}"
+                f"🚀 Executing trade on {symbol} | Confidence={confidence_value:.2f}"
             )
-            self._execute_selected_trade(evaluation)
-            trade_executed = True
-            break
+            if self._execute_selected_trade(evaluation):
+                trade_executed = True
+                break
 
         if not self.running.is_set():
             _cycle_pause()
@@ -4484,103 +4491,8 @@ class TradingEngine:
         direction = evaluation.get('confluence_direction')
         if direction not in {'CALL', 'PUT'}:
             return False
-        symbol = evaluation.get('symbol', 'UNKNOWN')
-        logging.info(f"✅ Confluence confirmed for {symbol}: {direction}")
-        skip_trade = False
-        try:
-            confidence_raw = evaluation.get('final_confidence')
-            if confidence_raw is None:
-                confidence_raw = evaluation.get('confidence')
-            confidence_value: Optional[float] = None
-            if confidence_raw is not None:
-                try:
-                    confidence_value = float(confidence_raw)
-                except (TypeError, ValueError):
-                    confidence_value = None
-            volatility_raw = evaluation.get('volatility')
-            volatility_value: Optional[float] = None
-            if volatility_raw is not None:
-                try:
-                    volatility_value = float(volatility_raw)
-                except (TypeError, ValueError):
-                    volatility_value = None
-            aprendizaje_ref = getattr(self, 'aprendizaje', None)
-            dynamic_min_conf = max(0.70, MIN_CONFIDENCE)
-            latest_rsi_value = 0.0
-            ema_value_for_threshold = 0.0
-            try:
-                latest_rsi_value = float(evaluation.get('latest_rsi', 0.0))
-            except (TypeError, ValueError):
-                latest_rsi_value = 0.0
-            try:
-                ema_value_for_threshold = float(evaluation.get('ema_spread', 0.0))
-            except (TypeError, ValueError):
-                ema_value_for_threshold = 0.0
-            if aprendizaje_ref is not None:
-                try:
-                    dynamic_min_conf = max(
-                        dynamic_min_conf,
-                        aprendizaje_ref.get_dynamic_threshold(
-                            latest_rsi_value,
-                            ema_value_for_threshold,
-                        ),
-                    )
-                except Exception as exc:
-                    logging.debug(f"No se pudo obtener umbral dinámico: {exc}")
-            confidence_for_log = confidence_value if confidence_value is not None else 0.0
-            volatility_display = f"{volatility_value:.4f}" if volatility_value is not None else "N/A"
-            logging.info(
-                f"📊 Final confidence {symbol}: {confidence_for_log:.2f} | Volatility: {volatility_display} | Action: {direction}"
-            )
-            if confidence_value is None or confidence_value < dynamic_min_conf:
-                logging.info(
-                    f"🚫 Skipping trade on {symbol} due to low confidence ({confidence_for_log:.2f})"
-                )
-                skip_trade = True
-                pass
-            elif volatility_value is None or volatility_value < MIN_VOLATILITY:
-                volatility_for_log = volatility_value if volatility_value is not None else 0.0
-                logging.info(
-                    f"🚫 Skipping trade on {symbol} due to low volatility ({volatility_for_log:.4f})"
-                )
-                skip_trade = True
-                pass
-            if not skip_trade:
-                if not self._passes_high_confidence_checks(evaluation, direction):
-                    skip_trade = True
-                elif not self._is_macro_trend_aligned(evaluation, direction):
-                    skip_trade = True
-        except Exception as exc:
-            logging.error(f"⚠️ Error in pre-trade validation for {symbol}: {exc}")
-            skip_trade = True
-            pass
-        if skip_trade:
-            return False
-        if not self._passes_confluence_validation(evaluation):
-            return False
         enriched = dict(evaluation)
         enriched['signal'] = direction
-        reasons = list(enriched.get('reasons', []))
-        reasons.append('Multi-indicator confirmation')
-        enriched['reasons'] = reasons
-        consensus_snapshot = dict(enriched.get('consensus', {}))
-        final_snapshot = confidence_value if confidence_value is not None else dynamic_min_conf
-        perfect_alignment = bool(enriched.get('perfect_alignment'))
-        if perfect_alignment:
-            final_snapshot = 1.0
-        else:
-            final_snapshot = float(np.clip(final_snapshot, 0.0, 0.95))
-        consensus_snapshot['confidence_label'] = 'Alta' if final_snapshot >= MIN_CONFIDENCE else 'Media'
-        consensus_snapshot['confidence'] = final_snapshot
-        consensus_snapshot['main_reason'] = 'multi-confirmation'
-        consensus_snapshot['override'] = True
-        consensus_snapshot['override_reason'] = 'multi-confirmation'
-        enriched['consensus'] = consensus_snapshot
-        enriched['ai_confidence'] = max(float(enriched.get('ai_confidence', 0.0)), final_snapshot)
-        enriched['final_confidence'] = final_snapshot
-        enriched['eligible'] = True
-        probability = float(enriched.get('predicted_probability', 0.6))
-        enriched['stake'] = self._calculate_kelly_stake(probability)
         return self._execute_selected_trade(enriched)
 
     def _fetch_exit_price(self, symbol: str, fallback: float) -> float:
@@ -4860,10 +4772,6 @@ class TradingEngine:
                         )
             else:
                 logging.info("❌ LOSS pattern ignored.")
-        if not self._passes_high_confidence_checks(evaluation, final_action):
-            return False
-        if not self._is_macro_trend_aligned(evaluation, final_action):
-            return False
         self.last_volatility = current_vol_reference
         regime_value = detect_regime(adx_value, bb_width_value)
         evaluation['regime'] = regime_value
@@ -4876,31 +4784,8 @@ class TradingEngine:
         combined_confidence = confidence_value
         evaluation['final_confidence'] = confidence_value
 
-        total_strategies = len(strategy_results)
-        aligned_count = (
-            strategy_results.count(final_action)
-            if final_action in {'CALL', 'PUT'}
-            else 0
-        )
-        evaluation['aligned_count'] = aligned_count
-        evaluation['total_strategies'] = total_strategies
-
-        logger.info(
-            f"[{symbol}] ✅ Confluence: {aligned_count}/{total_strategies} | "
-            f"Confidence={confidence_value:.2f} | Action={final_action}"
-        )
-
-        if aligned_count < 2:
-            logger.info(
-                f"[{symbol}] 🚫 Skip: insufficient confluence ({aligned_count}/2 required)"
-            )
-            return False
-
-        if confidence_value < 0.65:
-            logger.info(
-                f"[{symbol}] 🚫 Skip: confidence {confidence_value:.2f} < 0.65 required"
-            )
-            return False
+        aligned_count = int(evaluation.get('aligned_count', 0))
+        total_strategies = int(evaluation.get('total_strategies', 0))
 
         atr_value = float(evaluation.get('atr', 0.0) or 0.0)
         if atr_value <= 0.0:
@@ -4953,9 +4838,6 @@ class TradingEngine:
             if len(self._trade_timestamps) >= MAX_TRADES_PER_HOUR:
                 logging.info("⛔ Máximo de operaciones por hora alcanzado (modo estricto).")
                 return False
-        if combined_confidence is None:
-            logging.info("🚫 Trade skipped because final confidence was unavailable.")
-            return False
         if not self.risk.can_trade(ai_confidence):
             return False
         if operation_active:
