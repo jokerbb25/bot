@@ -3,6 +3,13 @@ from __future__ import annotations
 import logging
 from typing import Any, Callable, Dict, List, Optional
 
+from PyQt5.QtCore import qRegisterMetaType
+from PyQt5.QtGui import QTextCursor, QTextBlock
+
+# ✅ Required to avoid GUI crash when receiving logs from threads
+qRegisterMetaType(QTextCursor)
+qRegisterMetaType(QTextBlock)
+
 from engine.state import BotState, trade_state
 
 logger = logging.getLogger(__name__)
