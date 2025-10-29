@@ -39,6 +39,12 @@ from PyQt5.QtCore import QThread, pyqtSignal
 from aprendizaje import Aprendizaje
 from telegram_bot import BOT_ACTIVE, telegram_listener
 
+from settings import RISK_CFG
+from engine import state as engine_state
+from engine.state import BotState, position_lock, trade_state
+from engine.close import on_order_closed
+from utils.logwrap import gui as log_gui, skip
+
 try:
     import websocket  # type: ignore
 except ImportError:  # pragma: no cover
@@ -110,6 +116,35 @@ WINNER_MEMORY_PATH = Path("sesgos_ganadores.json")
 LEARNING_MEMORY_PATH = Path("learning_memory.json")
 LEARNING_MEMORY_BACKUP_PATH = Path("learning_memory_backup.json")
 STATS_DATA_PATH = Path("stats.json")
+
+
+def can_trade_now() -> bool:
+    with position_lock:
+        state = trade_state.get("state", BotState.IDLE)
+        if state in (BotState.OPEN, BotState.CLOSING):
+            log_gui.push_status("BUSY_OPEN_TRADE")
+            return False
+        now = time.time()
+        cooldown = RISK_CFG.get("reentry_cooldown_sec", 0)
+        last_closed = getattr(engine_state, "last_close_ts", 0.0)
+        if state == BotState.COOLDOWN:
+            if now - last_closed < cooldown:
+                log_gui.push_status("COOLDOWN")
+                return False
+            trade_state["state"] = BotState.IDLE
+        if now - last_closed < cooldown:
+            log_gui.push_status("COOLDOWN")
+            return False
+    return True
+
+
+def has_open_with_magic(symbol: str, magic: int) -> bool:
+    state = trade_state.get("state")
+    if state != BotState.OPEN:
+        return False
+    if trade_state.get("symbol") != symbol:
+        return False
+    return trade_state.get("magic") == magic
 
 
 def send_telegram_message(text: str) -> None:
@@ -2993,6 +3028,7 @@ class TradingEngine:
         self._summary_listeners: List[Callable[[str, Dict[str, Any]], None]] = []
         self._trade_state_listeners: List[Callable[[str], None]] = []
         self._result_listeners: List[Callable[[Dict[str, Any]], None]] = []
+        log_gui.bind(self._notify_status)
         self._strategy_lock = threading.Lock()
         self.strategy_states: Dict[str, bool] = {name: True for name, _ in STRATEGY_FUNCTIONS}
         self.strategy_states["Divergence"] = True
@@ -3446,6 +3482,8 @@ class TradingEngine:
                 logging.debug(f"Error en escucha de resumen: {exc}")
 
     def _notify_trade_state(self, state: str) -> None:
+        if trade_state.get("state") == BotState.OPEN and state == "ready":
+            return
         for callback in list(self._trade_state_listeners):
             try:
                 callback(state)
@@ -4416,16 +4454,19 @@ class TradingEngine:
                 logging.info(
                     f"🚫 Trade skipped due to low confidence ({confidence_value:.2f} < {min_confidence:.2f})"
                 )
+                skip("LOW_CONF", f"symbol={symbol} conf={confidence_value:.2f}")
                 continue
             if aligned_total < min_confluence:
                 logging.info(
                     f"🚫 Trade skipped due to low confluence ({aligned_total}/{min_confluence})"
                 )
+                skip("NO_CONFLUENCE", f"symbol={symbol} aligned={aligned_total}")
                 continue
             if volatility_value is not None and volatility_value < MIN_VOLATILITY:
                 logging.info(
                     f"🚫 Skipping trade on {symbol} due to low volatility ({volatility_value:.4f})"
                 )
+                skip("LOW_VOL", f"symbol={symbol} vol={volatility_value:.4f}")
                 continue
 
             rsi_signal = str(evaluation.get('rsi_signal', 'NONE')).upper()
@@ -4434,6 +4475,7 @@ class TradingEngine:
                 logging.info(
                     f"🚫 Skipping trade on {symbol} due to RSI/EMA conflict → RSI={rsi_signal}, EMA={ema_signal}"
                 )
+                skip("RSI_EMA_CONFLICT", f"symbol={symbol}")
                 continue
 
             if not self._passes_confluence_validation(evaluation):
@@ -4589,11 +4631,14 @@ class TradingEngine:
             name: str(res.signal or "NONE").upper()
             for name, res in results
         }
+        if not can_trade_now():
+            return False
         if 'stake' not in evaluation:
             evaluation['stake'] = self._calculate_kelly_stake(evaluation.get('predicted_probability', 0.5))
         stake_amount = float(max(0.1, evaluation.get('stake', self.trade_amount)))
         ml_probability = float(evaluation.get('predicted_probability', 0.5))
         trade_initiated = False
+        direction_side = "BUY" if str(signal).upper() == "CALL" else "SELL"
         volatility_raw = evaluation.get('volatility')
         volatility_value: Optional[float] = None
         if volatility_raw is not None:
@@ -4650,6 +4695,7 @@ class TradingEngine:
                 send_telegram_message(msg)
             except Exception:
                 pass
+            skip("VOLATILITY", f"symbol={symbol} context={context}")
             return False
         mid_low = low_vol + (high_vol - low_vol) * 0.2
         mid_high = high_vol - (high_vol - low_vol) * 0.2
@@ -4657,6 +4703,7 @@ class TradingEngine:
             logging.info(
                 f"⚠️ Volatility {evaluated_volatility:.6f} outside safe zone [{mid_low:.6f}, {mid_high:.6f}], skipping."
             )
+            skip("VOLATILITY", f"symbol={symbol} out_of_band")
             return False
         confidence_value = float(combined_confidence) if combined_confidence is not None else 0.0
         latest_rsi_value = float(evaluation.get('latest_rsi', 0.0))
@@ -4695,6 +4742,7 @@ class TradingEngine:
             logging.info(
                 f"🚫 Skipping trade on {symbol} due to RSI/EMA conflict → RSI={rsi_signal_eval}, EMA={ema_signal_eval}"
             )
+            skip("RSI_EMA_CONFLICT", f"symbol={symbol}")
             return False
         context_key = f"{symbol}|{final_action}|RSI:{round(latest_rsi_value, 1)}|EMA:{round(ema_spread_value, 1)}"
         if final_action in {'CALL', 'PUT'}:
@@ -4712,6 +4760,7 @@ class TradingEngine:
                 logging.info(
                     f"🧱 Pattern blocked due to repeated losses (streak={bias_entry['loss_streak']})"
                 )
+                skip("PATTERN_BLOCKED", f"symbol={symbol}")
                 return False
             adjusted_confidence = confidence_value
             for memory_entry in self.learning_memory.values():
@@ -4923,7 +4972,22 @@ class TradingEngine:
         if not self.risk.can_trade(ai_confidence):
             return False
         if operation_active:
+            log_gui.push_status("BUSY_OPEN_TRADE")
             return False
+        with position_lock:
+            if has_open_with_magic(symbol, trade_state.get("magic", 0)):
+                log_gui.push_status("BUSY_OPEN_TRADE")
+                return False
+            trade_state.update(
+                {
+                    "state": BotState.ARMED,
+                    "symbol": symbol,
+                    "direction": direction_side,
+                    "entry_price": entry_price,
+                    "open_time": time.time(),
+                    "ticket": None,
+                }
+            )
         auto_learn.register_trade_context(
             symbol,
             signal,
@@ -4940,18 +5004,50 @@ class TradingEngine:
         contract_id, duration_seconds = self.api.buy(symbol, signal, stake_amount)
         if contract_id is None:
             logging.warning('No se pudo abrir la operación, se reanuda el análisis.')
+            with position_lock:
+                if trade_state.get("state") == BotState.ARMED:
+                    trade_state.update(
+                        {
+                            "state": BotState.IDLE,
+                            "ticket": None,
+                            "symbol": None,
+                            "direction": None,
+                            "entry_price": None,
+                            "open_time": None,
+                        }
+                    )
+            log_gui.push_status("ORDER_REJECTED")
             self._notify_trade_state("ready")
             return False
         operation_active = True
         self.active_trade_symbol = symbol
+        with position_lock:
+            trade_state.update(
+                {
+                    "state": BotState.OPEN,
+                    "ticket": contract_id,
+                    "symbol": symbol,
+                    "direction": direction_side,
+                    "entry_price": entry_price,
+                    "open_time": time.time(),
+                }
+            )
         self._notify_trade_state('active')
         dur_seconds = duration_seconds if duration_seconds > 0 else TRADE_DURATION_SECONDS
         logging.info(f"🟢 Operación abierta — Contrato #{contract_id} | Duración: {dur_seconds}s")
         self._trade_timestamps.append(time.time())
         trade_initiated = True
         try:
+            notify_wait = False
+            with position_lock:
+                if trade_state.get("ticket") == contract_id:
+                    trade_state["state"] = BotState.CLOSING
+                    notify_wait = True
+            if notify_wait:
+                self._notify_trade_state("waiting")
             result_status = self._wait_for_contract_result(contract_id, dur_seconds)
             trade_result, pnl = self._resolve_trade_result(result_status, stake_amount)
+            on_order_closed(contract_id, trade_result, pnl)
             if contract_id is not None and not self._register_processed_contract(contract_id):
                 logging.debug(f"Contrato #{contract_id} ya procesado, omitiendo duplicado de resultados")
                 return trade_initiated
@@ -5175,8 +5271,24 @@ class TradingEngine:
         finally:
             operation_active = False
             self.active_trade_symbol = None
+            with position_lock:
+                current_state = trade_state.get("state")
+                if current_state == BotState.ARMED:
+                    trade_state.update(
+                        {
+                            "state": BotState.IDLE,
+                            "symbol": None,
+                            "direction": None,
+                            "entry_price": None,
+                            "open_time": None,
+                            "ticket": None,
+                        }
+                    )
             logging.info(RESUME_MESSAGE)
-            self._notify_trade_state("ready")
+            if trade_state.get("state") == BotState.COOLDOWN:
+                log_gui.push_status("COOLDOWN")
+            else:
+                self._notify_trade_state("ready")
         return trade_initiated
 
     def run(self) -> None:
@@ -5212,6 +5324,17 @@ class TradingEngine:
         with self._closed_lock:
             self._closed_contracts.clear()
         CSV_LOGGED_CONTRACTS.clear()
+        with position_lock:
+            trade_state.update(
+                {
+                    "state": BotState.IDLE,
+                    "symbol": None,
+                    "direction": None,
+                    "entry_price": None,
+                    "open_time": None,
+                    "ticket": None,
+                }
+            )
 
 
 # ===============================================================
@@ -6021,6 +6144,8 @@ class BotWindow(QtWidgets.QWidget):
             "waiting": "Estado: Esperando cierre de operación...",
             "ready": "Estado: Listo",
         }
+        if trade_state.get("state") == BotState.OPEN and state == "ready":
+            return
         texto = mapping.get(state, "Estado: Listo")
         if hasattr(self, "trade_state_label"):
             self.trade_state_label.setText(texto)
