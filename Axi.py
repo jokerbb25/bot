@@ -71,7 +71,7 @@ LOW_VOL_THRESHOLD = 0.0006   # legacy (unused after patch)
 LOW_VOL_CONFIDENCE = 0.85    # legacy (unused after patch)
 NEUTRAL_RSI_BAND = (45.0, 55.0)
 NEUTRAL_RSI_CONF = 0.95
-MIN_ALIGNED_STRATEGIES = 3
+MIN_ALIGNED_STRATEGIES = 2
 POST_LOSS_COOLDOWN_SEC = 120
 MAX_TRADES_PER_HOUR = 20
 KEEP_WIN_MIN_CONF = 0.70
@@ -110,11 +110,8 @@ def connect_axi(account_id: int, password: str, server: str) -> None:
     print("✅ Connected to Axi MT5")
 
 
-def execute_market_order(symbol: str, action: str, atr_value: float, lot_size: float = LOT_SIZE):
-    """
-    Executes a market order on MT5 (instant order).
-    SL/TP are dynamic based on ATR.
-    """
+def execute_market_order(symbol: str, action: str, atr_value: float, lot_size: float = LOT_SIZE) -> Tuple[Any, Optional[float]]:
+    """Execute a market order on MT5 using ATR-based dynamic stops."""
 
     symbol_info = mt5.symbol_info(symbol)
     if symbol_info is None:
@@ -128,34 +125,13 @@ def execute_market_order(symbol: str, action: str, atr_value: float, lot_size: f
     order_type = mt5.ORDER_TYPE_BUY if direction == "CALL" else mt5.ORDER_TYPE_SELL
     price = tick.ask if direction == "CALL" else tick.bid
     point = float(getattr(symbol_info, "point", 0.0) or 0.0)
-    lot = float(lot_size)
-    atr = float(max(atr_value, 0.0))
-
     if point <= 0.0:
         raise RuntimeError(f"Invalid point size for {symbol}")
 
+    lot = float(lot_size)
+    atr = float(max(atr_value, 0.0))
     atr_pips = atr / point if point else 0.0
-
-    # ==========================================================
-    # ✅ ATR VOLATILITY FILTER (PIPS BASED)
-    # ==========================================================
-
-    ATR_LIMITS = {
-        "XAUUSD": (30, 350),
-    }
-
-    MIN_ATR, MAX_ATR = ATR_LIMITS.get(symbol.upper(), (2, 40))
-
-    if not (MIN_ATR <= atr_pips <= MAX_ATR):
-        logger.info(f"❌ Skip {symbol} - ATR {atr_pips:.1f} pips not in [{MIN_ATR}-{MAX_ATR}]")
-        return None
-
-    # ==========================================================
-    # ✅ AUTO-SL/TP (NO MORE "Invalid Stops")
-    # ==========================================================
-
     stop_level = int(getattr(symbol_info, "trade_stops_level", 0) or 0)
-
     sl_points = max(stop_level, int(max(1.0, atr_pips * 1.2)))
     tp_points = max(stop_level, int(max(1.0, atr_pips * 2.5)))
 
@@ -163,40 +139,67 @@ def execute_market_order(symbol: str, action: str, atr_value: float, lot_size: f
         "action": mt5.TRADE_ACTION_DEAL,
         "symbol": symbol,
         "volume": lot,
-        "type": mt5.ORDER_TYPE_BUY if direction == "CALL" else mt5.ORDER_TYPE_SELL,
+        "type": order_type,
         "price": price,
         "sl": price - sl_points * point if direction == "CALL" else price + sl_points * point,
         "tp": price + tp_points * point if direction == "CALL" else price - tp_points * point,
         "magic": 1001,
-        "comment": "axi-bot-auto",
+        "comment": "axi-bot",
+        "type_time": mt5.ORDER_TIME_GTC,
+        "type_filling": mt5.ORDER_FILLING_IOC,
     }
 
     result = mt5.order_send(request)
 
-    if result is None:
-        logger.error("❌ Order failed: No response from MT5")
+    if result is None or getattr(result, "retcode", None) != mt5.TRADE_RETCODE_DONE:
+        logger.error(
+            f"[{symbol}] ❌ Order failed: retcode={getattr(result, 'retcode', None)}"
+        )
         if BOT_ACTIVE:
-            telegram_send(
-                f"❌ ORDER FAILED\n{symbol}\nReason: No response from MT5"
-            )
-        return None
-
-    if result.retcode != mt5.TRADE_RETCODE_DONE:
-        logger.error(f"❌ Order failed: {getattr(result, 'comment', 'Unknown error')}")
-        if BOT_ACTIVE:
+            reason = getattr(result, "comment", "No response from MT5" if result is None else "Unknown error")
             telegram_send(
                 "❌ ORDER FAILED\n"
-                f"{symbol}\nReason: {getattr(result, 'comment', 'Unknown error')}"
+                f"{symbol}\nReason: {reason}"
             )
-    else:
-        logger.info(f"✅ Order placed! #{getattr(result, 'order', 0)} {symbol} → {direction}")
+        return result, None
+
+    logger.info(
+        f"[{symbol}] ✅ Order placed #{getattr(result, 'order', 0)} {direction} @ {price:.5f}"
+    )
+    if BOT_ACTIVE:
+        telegram_send(
+            "✅ MARKET ORDER EXECUTED\n"
+            f"{symbol}\nAction: {direction}\nLot: {lot}"
+        )
+
+    ticket = getattr(result, "order", 0) or getattr(result, "deal", 0) or 0
+    profit: Optional[float] = None
+    if ticket:
+        try:
+            now = datetime.now(timezone.utc)
+            mt5.history_select(now - timedelta(days=1), now + timedelta(days=1))
+        except Exception:
+            pass
+        time.sleep(0.5)
+        deals = mt5.history_deals_get(position=ticket)
+        if not deals:
+            deals = mt5.history_deals_get(ticket=ticket)
+        if deals:
+            last_deal = deals[-1]
+            profit = float(getattr(last_deal, "profit", 0.0))
+
+    if profit is not None:
+        status = "GANADA" if profit > 0 else ("PERDIDA" if profit < 0 else "NEUTRA")
+        logger.info(f"[{symbol}] 📊 MT5 result → Profit={profit:.2f} → {status}")
         if BOT_ACTIVE:
             telegram_send(
-                "✅ MARKET ORDER EXECUTED\n"
-                f"{symbol}\nAction: {direction}\nLot: {lot}"
+                "📊 MT5 RESULT\n"
+                f"{symbol}\nProfit: {profit:.2f}\nEstado: {status}"
             )
+    else:
+        logger.warning(f"[{symbol}] ⚠️ Could not fetch MT5 deal to compute real PnL")
 
-    return result
+    return result, profit
 
 
 def get_candles(symbol: str, timeframe: int = mt5.TIMEFRAME_M1, count: int = 100) -> List[Dict[str, Any]]:
@@ -4428,7 +4431,7 @@ class TradingEngine:
             )
             min_confidence = CONFIDENCE_MIN
             # === GLOBAL CONFLUENCE RULE ===
-            min_confluence = MIN_ALIGNED_STRATEGIES  # fixed at 3 for all symbols
+            min_confluence = MIN_ALIGNED_STRATEGIES  # actualizado a 2 para forex
 
             if confidence_value < min_confidence:
                 logging.info(
@@ -4603,6 +4606,9 @@ class TradingEngine:
         entry_price = float(evaluation['entry_price'])
         signal_source = evaluation['signal_source']
         results: List[Tuple[str, StrategyResult]] = evaluation.get('results', [])
+        strategy_results: List[str] = []
+        for _, res in results:
+            strategy_results.append(str(res.signal or "NONE").upper())
         strategy_signals_map: Dict[str, str] = {
             name: str(res.signal or "NONE").upper()
             for name, res in results
@@ -4870,13 +4876,9 @@ class TradingEngine:
         combined_confidence = confidence_value
         evaluation['final_confidence'] = confidence_value
 
-        strategy_outputs = [
-            str(res.signal or 'NONE').upper()
-            for _, res in results
-        ]
-        total_strategies = len(strategy_outputs)
+        total_strategies = len(strategy_results)
         aligned_count = (
-            strategy_outputs.count(final_action)
+            strategy_results.count(final_action)
             if final_action in {'CALL', 'PUT'}
             else 0
         )
@@ -4884,16 +4886,20 @@ class TradingEngine:
         evaluation['total_strategies'] = total_strategies
 
         logger.info(
-            f"[{symbol}] ✅ Confluence: {aligned_count}/{total_strategies} strategies aligned "
-            f"| Confidence={confidence_value:.2f} | Action={final_action}"
+            f"[{symbol}] ✅ Confluence: {aligned_count}/{total_strategies} | "
+            f"Confidence={confidence_value:.2f} | Action={final_action}"
         )
 
         if aligned_count < 2:
-            logger.info(f"[{symbol}] ❌ Skip: not enough aligned strategies (<2)")
+            logger.info(
+                f"[{symbol}] 🚫 Skip: insufficient confluence ({aligned_count}/2 required)"
+            )
             return False
 
         if confidence_value < 0.65:
-            logger.info(f"❌ Skip: confidence {confidence_value:.2f} < 0.65 required")
+            logger.info(
+                f"[{symbol}] 🚫 Skip: confidence {confidence_value:.2f} < 0.65 required"
+            )
             return False
 
         atr_value = float(evaluation.get('atr', 0.0) or 0.0)
@@ -4903,7 +4909,7 @@ class TradingEngine:
                 atr_value = fallback_atr
         symbol_info = mt5.symbol_info(symbol)
         if symbol_info is None:
-            logger.error(f"❌ Cannot get symbol info for {symbol_upper}")
+            logger.error(f"[{symbol}] ❌ Cannot get symbol info")
             return False
         point_value = float(getattr(symbol_info, 'point', 0.0) or 0.0)
         atr_pips_value = atr_value / point_value if point_value else 0.0
@@ -4917,7 +4923,9 @@ class TradingEngine:
         min_atr, max_atr = ATR_LIMITS.get(symbol_upper, (2, 40))
         if not (min_atr <= atr_pips_value <= max_atr):
             logger.info(decision_snapshot)
-            logger.info(f"❌ Skip {symbol} - ATR {atr_pips_value:.1f} pips not in [{min_atr}-{max_atr}]")
+            logger.info(
+                f"[{symbol}] 🚫 Skip: ATR {atr_pips_value:.1f} pips not in [{min_atr}-{max_atr}]"
+            )
             return False
 
         logger.info(decision_snapshot)
@@ -4968,8 +4976,11 @@ class TradingEngine:
         if atr_value <= 0.0:
             atr_value = 1.0
         order_result = None
+        trade_profit: Optional[float] = None
         try:
-            order_result = execute_market_order(symbol, final_action, atr_value, LOT_SIZE)
+            order_result, trade_profit = execute_market_order(
+                symbol, final_action, atr_value, LOT_SIZE
+            )
             logger.info(
                 f"🚀 EXECUTED MARKET ORDER {symbol} → {final_action} | Confidence={confidence_value:.2f}"
             )
@@ -4986,15 +4997,20 @@ class TradingEngine:
             logging.warning(f"Orden rechazada por MT5 (retcode={retcode})")
             self._notify_trade_state("ready")
             return False
-        contract_id = order_result.order or order_result.deal or int(time.time())
+        contract_id = (
+            getattr(order_result, 'order', 0)
+            or getattr(order_result, 'deal', 0)
+            or int(time.time())
+        )
         operation_active = True
         self.active_trade_symbol = symbol
         self._notify_trade_state('active')
         logging.info(f"🟢 Operación abierta — Ticket #{contract_id} | Volumen: {stake_amount}")
         self._trade_timestamps.append(time.time())
         trade_initiated = True
+        pnl = float(trade_profit) if trade_profit is not None else 0.0
+        trade_result = 'WIN' if pnl > 0 else ('LOSS' if pnl < 0 else 'DRAW')
         try:
-            trade_result, pnl = self._resolve_trade_result(order_result, stake_amount, signal)
             if contract_id is not None and not self._register_processed_contract(contract_id):
                 logging.debug(f"Ticket #{contract_id} ya procesado, omitiendo duplicado de resultados")
                 return trade_initiated
@@ -5054,13 +5070,14 @@ class TradingEngine:
             volatilidad_actual = float(evaluation['volatility'])
             confidence_value = float(evaluation.get('final_confidence', combined_confidence))
             win_flag = trade_result == 'WIN'
+            loss_flag = trade_result == 'LOSS'
             self.total_operations += 1
             if win_flag:
                 self.win_operations += 1
             self.session_total += 1
             if win_flag:
                 self.session_wins += 1
-            else:
+            elif loss_flag:
                 self.session_losses += 1
             session_accuracy = (
                 (self.session_wins / self.session_total) * 100.0
@@ -5123,7 +5140,9 @@ class TradingEngine:
                 "simbolo": symbol,
                 "decision": signal,
                 "confianza": confidence_value,
-                "resultado": "GANADA" if win_flag else "PERDIDA",
+                "resultado": (
+                    "GANADA" if win_flag else ("PERDIDA" if loss_flag else "NEUTRA")
+                ),
                 "pnl": profit_value,
                 "nota": notes,
                 "ticket": contract_id,
@@ -5143,8 +5162,15 @@ class TradingEngine:
                 logging.debug(f"Ticket {contract_id} already closed. Skipping duplicate log.")
                 should_notify = False
             if should_notify:
-                emoji = "✅" if win_flag else "❌"
-                resultado_texto = "GANADA" if win_flag else "PERDIDA"
+                if win_flag:
+                    emoji = "✅"
+                    resultado_texto = "GANADA"
+                elif loss_flag:
+                    emoji = "❌"
+                    resultado_texto = "PERDIDA"
+                else:
+                    emoji = "⚖️"
+                    resultado_texto = "NEUTRA"
                 logging.info(f"✅ Dynamic confidence applied: {confidence_value:.2f}")
                 memory_total = len(self.learning_memory)
                 message = (
