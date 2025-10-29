@@ -19,6 +19,7 @@ from typing import Any, Callable, Dict, Iterable, List, Optional, Set, Tuple
 import numpy as np
 import pandas as pd
 import requests
+import MetaTrader5 as mt5
 from ta.momentum import RSIIndicator
 from ta.trend import EMAIndicator, SMAIndicator, ADXIndicator, MACD
 from ta.volatility import BollingerBands, AverageTrueRange
@@ -39,17 +40,10 @@ from PyQt5.QtCore import QThread, pyqtSignal
 from aprendizaje import Aprendizaje
 from telegram_bot import BOT_ACTIVE, telegram_listener
 
-try:
-    import websocket  # type: ignore
-except ImportError:  # pragma: no cover
-    websocket = None
-
 # ===============================================================
 # CONFIG & CONSTANTS
 # ===============================================================
-APP_ID = "1089"
-API_TOKEN = "dK57Ark9QreDexO"
-SYMBOLS = ["R_25", "R_50", "R_75", "R_100"]
+SYMBOLS = ["EURUSD", "GBPUSD", "USDJPY", "XAUUSD", "USDCAD"]
 GRANULARITY = 60
 CANDLE_COUNT = 200
 STAKE = 1.0
@@ -61,13 +55,25 @@ MAX_DAILY_PROFIT = 100.0
 COOLDOWN_AFTER_LOSS = 60
 MAX_DRAWDOWN = -150.0
 MIN_TRADE_CONFIDENCE = 0.45
-MIN_CONFIDENCE = 0.75
-MIN_VOLATILITY = 0.0005
+MIN_CONFIDENCE = 0.0
+MIN_VOLATILITY = 0.0
+LOT_SIZE = 0.01  # configurable, equivalent to $1 per pip depending on broker leverage
+ATR_MULT_SL = 2.0
+ATR_MULT_TP = 3.0
 
-# === STRICT MODE PARAMETERS ===
-CONFIDENCE_MIN = 0.80
-LOW_VOL_THRESHOLD = 0.0006
-LOW_VOL_CONFIDENCE = 0.85
+# === ATR(pips) ACCEPTANCE WINDOWS ===
+MIN_CONFLUENCE = 3
+
+WEIGHT_BOOST = {
+    "XAUUSD": {"trend": 0.03, "range": -0.02},
+    "USDJPY": {"trend": 0.01, "range": -0.01},
+}
+
+# === STRICT MODE PARAMETERS (Disable for Forex) ===
+STRICT_MODE_ENABLED = False  # was True
+CONFIDENCE_MIN = 0.80        # legacy (unused after patch)
+LOW_VOL_THRESHOLD = 0.0006   # legacy (unused after patch)
+LOW_VOL_CONFIDENCE = 0.85    # legacy (unused after patch)
 NEUTRAL_RSI_BAND = (45.0, 55.0)
 NEUTRAL_RSI_CONF = 0.95
 MIN_ALIGNED_STRATEGIES = 3
@@ -75,7 +81,6 @@ POST_LOSS_COOLDOWN_SEC = 120
 MAX_TRADES_PER_HOUR = 20
 KEEP_WIN_MIN_CONF = 0.70
 MAINTENANCE_EVERY = 50
-STRICT_MODE_ENABLED = True
 
 # === TELEGRAM BOT CONFIGURATION ===
 TELEGRAM_TOKEN = "8300367826:AAGzaMCJRY6pzZEqzjqgzAaRUXC_19KcB60"
@@ -99,6 +104,128 @@ logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(mes
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 warnings.filterwarnings("ignore", category=RuntimeWarning, message="overflow encountered in exp")
 
+print("🧠 Axi module active — running strategies with MT5 market feed.")
+
+logger = logging.getLogger(__name__)
+
+
+def connect_axi(account_id: int, password: str, server: str) -> None:
+    if not mt5.initialize(login=account_id, password=password, server=server):
+        raise Exception(f"❌ Axi connection failed → {mt5.last_error()}")
+    print("✅ Connected to Axi MT5")
+
+
+def execute_market_order(symbol: str, action: str, atr_value: float, lot_size: float = LOT_SIZE):
+    """
+    Executes a market order on MT5 (instant order).
+    SL/TP are dynamic based on ATR.
+    """
+
+    symbol_info = mt5.symbol_info(symbol)
+    if symbol_info is None:
+        raise RuntimeError(f"Symbol {symbol} is not available in MT5")
+    point = float(getattr(symbol_info, "point", 0.0) or 0.0)
+    if point == 0.0:
+        raise RuntimeError(f"Invalid point size for {symbol}")
+
+    sl_distance = float(max(atr_value, 0.0)) * ATR_MULT_SL
+    tp_distance = float(max(atr_value, 0.0)) * ATR_MULT_TP
+
+    tick = mt5.symbol_info_tick(symbol)
+    if tick is None:
+        raise RuntimeError(f"No tick data for {symbol}")
+
+    order_type = mt5.ORDER_TYPE_BUY if action == "CALL" else mt5.ORDER_TYPE_SELL
+    price = tick.ask if action == "CALL" else tick.bid
+
+    sl = price - sl_distance * point if action == "CALL" else price + sl_distance * point
+    tp = price + tp_distance * point if action == "CALL" else price - tp_distance * point
+
+    order_request = {
+        "action": mt5.TRADE_ACTION_DEAL,
+        "symbol": symbol,
+        "volume": float(lot_size),
+        "type": order_type,
+        "price": price,
+        "sl": sl,
+        "tp": tp,
+        "magic": 202503,
+        "comment": "AXI AUTO TRADE",
+        "type_filling": mt5.ORDER_FILLING_IOC,
+        "type_time": mt5.ORDER_TIME_GTC,
+    }
+
+    result = mt5.order_send(order_request)
+
+    if result is None:
+        logger.error("❌ Order failed: No response from MT5")
+        if BOT_ACTIVE:
+            telegram_send(
+                f"❌ ORDER FAILED\n{symbol}\nReason: No response from MT5"
+            )
+        return None
+
+    if result.retcode != mt5.TRADE_RETCODE_DONE:
+        logger.error(f"❌ Order failed: {getattr(result, 'comment', 'Unknown error')}")
+        if BOT_ACTIVE:
+            telegram_send(
+                "❌ ORDER FAILED\n"
+                f"{symbol}\nReason: {getattr(result, 'comment', 'Unknown error')}"
+            )
+    else:
+        logger.info(f"✅ Order placed! #{getattr(result, 'order', 0)} {symbol} → {action}")
+        if BOT_ACTIVE:
+            telegram_send(
+                "✅ MARKET ORDER EXECUTED\n"
+                f"{symbol}\nAction: {action}\nLot: {lot_size}\nSL/TP based on ATR"
+            )
+
+    return result
+
+
+def get_candles(symbol: str, timeframe: int = mt5.TIMEFRAME_M1, count: int = 100) -> List[Dict[str, Any]]:
+    rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, count)
+    if rates is None or len(rates) == 0:
+        print(f"[WARN] No candles for {symbol}")
+        return []
+    return [
+        {
+            "time": rate["time"],
+            "open": rate["open"],
+            "high": rate["high"],
+            "low": rate["low"],
+            "close": rate["close"],
+        }
+        for rate in rates
+    ]
+
+
+def fetch_axi_candles(symbol: str, timeframe: int = mt5.TIMEFRAME_M1, count: int = 200) -> List[Dict[str, Any]]:
+    return get_candles(symbol, timeframe=timeframe, count=count)
+
+
+def send_order(symbol: str, direction: str, volume: float = 0.1):
+    order_type = mt5.ORDER_TYPE_BUY if direction == "CALL" else mt5.ORDER_TYPE_SELL
+    tick = mt5.symbol_info_tick(symbol)
+    if tick is None:
+        raise RuntimeError(f"No tick data for {symbol}")
+    price = tick.ask if direction == "CALL" else tick.bid
+    request = {
+        "action": mt5.TRADE_ACTION_DEAL,
+        "symbol": symbol,
+        "volume": float(volume),
+        "type": order_type,
+        "price": price,
+        "deviation": 20,
+        "magic": 123456,
+        "comment": "botAxi",
+        "type_time": mt5.ORDER_TIME_GTC,
+        "type_filling": mt5.ORDER_FILLING_IOC,
+    }
+    result = mt5.order_send(request)
+    print(f"[AXI] Order result → {result}")
+    return result
+
 operation_active = False
 TRADE_DURATION_SECONDS = 60
 RESULT_POLL_INTERVAL = 5
@@ -119,6 +246,10 @@ def send_telegram_message(text: str) -> None:
         requests.post(url, json=payload, timeout=5)
     except Exception as exc:
         logging.warning(f"⚠️ Telegram message failed: {exc}")
+
+
+def telegram_send(text: str) -> None:
+    send_telegram_message(text)
 
 
 
@@ -570,9 +701,9 @@ def telegram_bot() -> None:
                 elif "info" in command:
                     engine_ref = global_engine
                     if engine_ref is not None:
-                        _send_text(f"📄 Último contrato: {engine_ref.get_last_contract_info()}")
+                        _send_text(f"📄 Último ticket: {engine_ref.get_last_contract_info()}")
                     else:
-                        _send_text("ℹ️ No hay información de contratos disponible.")
+                        _send_text("ℹ️ No hay información de tickets disponible.")
         except Exception as exc:
             logging.error(f"❌ Telegram bot error: {exc}")
             time.sleep(5)
@@ -672,8 +803,88 @@ def bollinger_bands(series: pd.Series, period: int = 20, num_dev: float = 2.0) -
     return bb.bollinger_lband(), bb.bollinger_hband()
 
 
+# === PIP SIZE MAP ===
+PIP_SIZE = {
+    "EURUSD": 0.0001,
+    "GBPUSD": 0.0001,
+    "USDCAD": 0.0001,
+    "USDJPY": 0.01,
+    "XAUUSD": 0.10,
+}
+
+
+def pip_size(symbol: str) -> float:
+    return PIP_SIZE.get(symbol.upper(), 0.0001)
+
+
+# === ATR acceptance windows (in pips) per instrument ===
+ATR_WINDOWS = {
+    "EURUSD": (2, 35),
+    "GBPUSD": (3, 40),
+    "USDJPY": (2, 45),
+    "USDCAD": (2, 40),
+    "XAUUSD": (30, 350),
+}
+DEFAULT_ATR_WINDOW = (2, 40)
+
+
+def atr_in_pips_from_df(symbol: str, df: pd.DataFrame, period: int = 14) -> float:
+    if df is None or df.empty:
+        return 0.0
+    atr_series = AverageTrueRange(
+        high=df["high"],
+        low=df["low"],
+        close=df["close"],
+        window=period,
+        fillna=False,
+    ).average_true_range()
+    if atr_series is None or atr_series.empty:
+        return 0.0
+    atr_val = float(atr_series.iloc[-1])
+    return atr_val / pip_size(symbol)
+
+
 def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
     return AverageTrueRange(high=df["high"], low=df["low"], close=df["close"], window=period, fillna=False).average_true_range()
+
+
+def detect_regime(adx_value: float, bb_width: float) -> str:
+    adx_val = float(adx_value)
+    bb_val = float(bb_width)
+    if adx_val >= 25.0 or bb_val >= 0.015:
+        return "TREND"
+    return "RANGE"
+
+
+def min_confidence_for(regime: str) -> float:
+    normalized_regime = (regime or "RANGE").upper()
+    return 0.65 if normalized_regime == "TREND" else 0.75
+
+
+def compute_atr_for_symbol(symbol: str, period: int = 14, count: int = CANDLE_COUNT) -> float:
+    try:
+        candles = fetch_axi_candles(symbol, timeframe=mt5.TIMEFRAME_M1, count=max(count, period + 2))
+        if not candles:
+            return 0.0
+        candle_objects = [
+            Candle(
+                epoch=int(entry["time"]),
+                open=float(entry["open"]),
+                high=float(entry["high"]),
+                low=float(entry["low"]),
+                close=float(entry["close"]),
+            )
+            for entry in candles
+        ]
+        df = to_dataframe(candle_objects)
+        atr_series = atr(df, period)
+        if atr_series.empty:
+            return 0.0
+        value = float(atr_series.iloc[-1])
+        return 0.0 if math.isnan(value) else value
+    except Exception as exc:
+        logger.debug(f"Failed to compute ATR for {symbol}: {exc}")
+        return 0.0
 
 
 def donchian_channels(df: pd.DataFrame, period: int = 20) -> Tuple[pd.Series, pd.Series]:
@@ -693,7 +904,7 @@ def log_trade(record: TradeRecord) -> None:
     logged_contracts = CSV_LOGGED_CONTRACTS
     if contract_id is not None:
         if contract_id in logged_contracts:
-            logging.debug(f"Duplicate contract {contract_id} ignored.")
+            logging.debug(f"Duplicate ticket {contract_id} ignored.")
             return
         logged_contracts.add(contract_id)
     try:
@@ -2842,137 +3053,20 @@ def build_feature_vector(df: pd.DataFrame, reasons: List[str], results: List[Tup
     return features
 
 
-# ===============================================================
-# DERIV CONNECTION
-# ===============================================================
-class DerivWebSocket:
-    def __init__(self) -> None:
-        if websocket is None:
-            raise RuntimeError("websocket-client not available")
-        self.socket: Optional[websocket.WebSocket] = None
-        self.lock = threading.Lock()
-        self.req_id = 1
-
-    def connect(self) -> None:
-        while True:
-            try:
-                self.socket = websocket.create_connection(
-                    f"wss://ws.derivws.com/websockets/v3?app_id={APP_ID}", timeout=30
-                )
-                self._send({"authorize": API_TOKEN})
-                self._recv()
-                logging.info("Deriv conectado")
-                return
-            except Exception as exc:
-                logging.warning(f"Error de conexión con Deriv: {exc}")
-                time.sleep(2)
-
-    def _send(self, payload: Dict[str, Any]) -> int:
-        if self.socket is None:
-            raise RuntimeError("Socket closed")
-        with self.lock:
-            payload["req_id"] = self.req_id
-            self.req_id += 1
-            self.socket.send(json.dumps(payload))
-            return payload["req_id"]
-
-    def _recv(self) -> Dict[str, Any]:
-        if self.socket is None:
-            raise RuntimeError("Socket closed")
-        return json.loads(self.socket.recv())
-
-    def fetch_candles(self, symbol: str) -> List[Candle]:
-        req_id = self._send(
-            {
-                "ticks_history": symbol,
-                "granularity": GRANULARITY,
-                "count": CANDLE_COUNT,
-                "end": "latest",
-                "style": "candles",
-            }
+def fetch_axi_candle_objects(symbol: str, count: int = CANDLE_COUNT, timeframe: int = mt5.TIMEFRAME_M1) -> List[Candle]:
+    raw_candles = get_candles(symbol, timeframe=timeframe, count=count)
+    candles: List[Candle] = []
+    for item in raw_candles:
+        candles.append(
+            Candle(
+                epoch=int(item["time"]),
+                open=float(item["open"]),
+                high=float(item["high"]),
+                low=float(item["low"]),
+                close=float(item["close"]),
+            )
         )
-        while True:
-            msg = self._recv()
-            if msg.get("req_id") == req_id:
-                candles = []
-                for item in msg.get("candles", []):
-                    candles.append(
-                        Candle(
-                            epoch=int(item["epoch"]),
-                            open=float(item["open"]),
-                            high=float(item["high"]),
-                            low=float(item["low"]),
-                            close=float(item["close"]),
-                        )
-                    )
-                return candles
-
-    def buy(self, symbol: str, direction: str, amount: float) -> Tuple[Optional[int], int]:
-        req_id = self._send(
-            {
-                "proposal": 1,
-                "amount": amount,
-                "basis": "stake",
-                "contract_type": direction,
-                "currency": "USD",
-                "duration": 1,
-                "duration_unit": "m",
-                "symbol": symbol,
-            }
-        )
-        proposal = None
-        while True:
-            msg = self._recv()
-            if msg.get("req_id") == req_id:
-                if "error" in msg:
-                    logging.warning(f"Error al generar propuesta: {msg['error']}")
-                    return None, 0.0
-                proposal = msg["proposal"]
-                break
-        buy_id = self._send({"buy": proposal["id"], "price": proposal["ask_price"]})
-        while True:
-            msg = self._recv()
-            if msg.get("req_id") == buy_id:
-                if "error" in msg:
-                    logging.warning(f"Error al comprar contrato: {msg['error']}")
-                    return None, 0
-                duration_val = int(proposal.get("duration", 1))
-                unit = str(proposal.get("duration_unit", "m")).lower()
-                if unit == "s":
-                    duration_seconds = duration_val
-                elif unit == "h":
-                    duration_seconds = duration_val * 3600
-                elif unit == "d":
-                    duration_seconds = duration_val * 86400
-                else:
-                    duration_seconds = duration_val * 60
-                return msg["buy"]["contract_id"], duration_seconds
-
-    def check_trade_result(self, contract_id: int, retries: int = 6, delay: float = 3.0) -> str:
-        for attempt in range(retries):
-            try:
-                req_id = self._send({"proposal_open_contract": 1, "contract_id": contract_id})
-                while True:
-                    msg = self._recv()
-                    if msg.get("req_id") == req_id:
-                        if "error" in msg:
-                            raise RuntimeError(msg["error"].get("message", "Error desconocido"))
-                        data = msg.get("proposal_open_contract", {})
-                        status = str(data.get("status", "")).lower()
-                        if status in {"won", "lost"}:
-                            return status
-                        if data.get("is_sold"):
-                            profit_raw = data.get("profit")
-                            try:
-                                profit_val = float(profit_raw)
-                            except (TypeError, ValueError):
-                                profit_val = 0.0
-                            return "won" if profit_val > 0 else "lost"
-                        break
-            except Exception as exc:
-                logging.warning(f"[{contract_id}] Error al consultar resultado: {exc}")
-            time.sleep(delay)
-        return "unknown"
+    return candles
 
 
 # ===============================================================
@@ -2980,7 +3074,6 @@ class DerivWebSocket:
 # ===============================================================
 class TradingEngine:
     def __init__(self) -> None:
-        self.api = DerivWebSocket()
         self.risk = RiskManager()
         self.ai = AdaptiveAIManager()
         self.trade_history: List[TradeRecord] = []
@@ -3066,7 +3159,7 @@ class TradingEngine:
             reference_ops,
         )
         startup_message = (
-            f"🤖 Bot iniciado correctamente y conectado a Deriv\n"
+            f"🤖 Bot iniciado correctamente y conectado a Axi MT5\n"
             f"🧠 Memoria cargada con {wins_loaded} ganadoras y {losses_loaded} perdedoras"
         )
         try:
@@ -3076,7 +3169,6 @@ class TradingEngine:
         self._telegram_thread: Optional[threading.Thread] = None
         self.telegram_bot = telegram_bot
         self.last_volatility: float = 0.0
-        self._keepalive_thread: Optional[threading.Thread] = None
         self.failed_candle_count = 0
 
     def add_trade_listener(self, callback: Callable[[TradeRecord, Dict[str, float]], None]) -> None:
@@ -3299,25 +3391,6 @@ class TradingEngine:
         except Exception as exc:
             logging.error(f"❌ Error starting background services: {exc}")
 
-    def _silent_keepalive_ping(self) -> None:
-        """Silently keep the Deriv WebSocket alive."""
-        import json
-        import time
-
-        while True:
-            try:
-                socket = getattr(self.api, "socket", None)
-                if socket is not None and getattr(socket, "connected", False):
-                    socket.send(json.dumps({"ping": 1}))
-                else:
-                    self.api.connect()
-            except Exception:
-                try:
-                    self.api.connect()
-                except Exception:
-                    pass
-            time.sleep(90)
-
     def save_learning_data(self) -> None:
         try:
             self.aprendizaje.save_data()
@@ -3337,15 +3410,11 @@ class TradingEngine:
         self.running.set()
         self._notify_status("connecting")
         try:
-            self.api.connect()
-            if self._keepalive_thread is None or not self._keepalive_thread.is_alive():
-                self._keepalive_thread = threading.Thread(
-                    target=self._silent_keepalive_ping,
-                    daemon=True,
-                )
-                self._keepalive_thread.start()
+            if not mt5.initialize():
+                error_info = mt5.last_error()
+                raise RuntimeError(f"No se pudo inicializar MetaTrader5: {error_info}")
             try:
-                send_telegram_message("🤖 Bot iniciado correctamente y conectado a Deriv")
+                send_telegram_message("🤖 Bot iniciado correctamente y conectado a Axi MT5")
             except Exception:
                 logging.debug("No se pudo enviar mensaje de inicio a Telegram")
         except Exception:
@@ -3542,38 +3611,21 @@ class TradingEngine:
         self.stop()
 
 
-    def _wait_for_contract_result(self, contract_id: int, duration_seconds: int) -> str:
-        end_time = datetime.now(timezone.utc) + timedelta(seconds=duration_seconds)
-        logging.info(f"⏳ Esperando resultado real del contrato #{contract_id}...")
-        while True:
-            now = datetime.now(timezone.utc)
-            remaining = int((end_time - now).total_seconds())
-            if remaining <= 0:
-                break
-            logging.info(f"⌛ Contrato #{contract_id} — {remaining}s restantes...")
-            time.sleep(min(RESULT_POLL_INTERVAL, max(1, remaining)))
-        status = self.api.check_trade_result(contract_id)
-        if status == "won":
-            logging.info(f"✅ Contrato #{contract_id} GANADO")
-        elif status == "lost":
-            logging.info(f"❌ Contrato #{contract_id} PERDIDO")
-        else:
-            logging.info(f"⚠️ Contrato #{contract_id} sin resultado confirmado, reintentando...")
-            status = self.api.check_trade_result(contract_id, retries=3, delay=5.0)
-            if status == "won":
-                logging.info(f"✅ Contrato #{contract_id} GANADO")
-            elif status == "lost":
-                logging.info(f"❌ Contrato #{contract_id} PERDIDO")
-            else:
-                logging.info(f"⚠️ Contrato #{contract_id} continúa sin resultado tras múltiples intentos")
-        return status
-
-    def _resolve_trade_result(self, status: str, stake: float) -> Tuple[str, float]:
-        if status == "won":
+    def _resolve_trade_result(self, order_result: Any, stake: float, signal: str) -> Tuple[str, float]:
+        if order_result is None:
+            return "UNKNOWN", 0.0
+        profit_value = float(getattr(order_result, "profit", 0.0) or 0.0)
+        if profit_value > 0:
+            return "WIN", profit_value
+        if profit_value < 0:
+            return "LOSS", profit_value
+        retcode = getattr(order_result, "retcode", None)
+        if retcode == mt5.TRADE_RETCODE_DONE:
+            direction = signal.upper()
+            logging.info(f"✅ Orden {direction} ejecutada correctamente en MT5")
             return "WIN", float(stake) * PAYOUT
-        if status == "lost":
-            return "LOSS", -float(stake)
-        return "UNKNOWN", 0.0
+        logging.info("❌ Orden MT5 no ejecutada correctamente")
+        return "LOSS", -float(stake)
 
     def _register_processed_contract(self, contract_id: int) -> bool:
         with self._processed_lock:
@@ -3644,7 +3696,7 @@ class TradingEngine:
         stake = 0.0
         try:
             try:
-                candles = self.api.fetch_candles(symbol)
+                candles = fetch_axi_candle_objects(symbol)
             except Exception as exc:
                 logging.warning(f"Error al obtener velas de {symbol}: {exc}")
                 candles = []
@@ -3671,6 +3723,8 @@ class TradingEngine:
                 logging.warning(f"Sin velas disponibles para {symbol}, se omite del ciclo")
                 return None
             df = to_dataframe(candles)
+            atr_series_calc = atr(df, 14) if not df.empty else pd.Series(dtype=float)
+            atr_latest_value = float(atr_series_calc.iloc[-1]) if not atr_series_calc.empty else 0.0
             results, consensus = self._evaluate_strategies(df)
             self._notify_summary(symbol, consensus)
             signal = consensus['signal']
@@ -3713,12 +3767,17 @@ class TradingEngine:
                 'latest_rsi': 0.0,
                 'ema_spread': 0.0,
                 'boll_width': 0.0,
+                'bb_width': 0.0,
                 'volatility': 0.0,
+                'atr': atr_latest_value,
                 'signal_source': 'COMBINED',
                 'ema_diff': float(df['close'].iloc[-1] - df['close'].iloc[-2]) if len(df) > 1 else 0.0,
                 'indicator_confidence': 0.0,
                 'adx': 0.0,
                 'macd': 0.0,
+                'recent_closes': [],
+                'recent_highs': [],
+                'recent_lows': [],
                 'predicted_probability': 0.5,
                 'confluence_direction': 'NONE',
                 'confluence_confirmed': False,
@@ -3852,6 +3911,7 @@ class TradingEngine:
                     'latest_rsi': latest_rsi,
                     'ema_spread': ema_spread,
                     'boll_width': boll_width,
+                    'bb_width': boll_ratio,
                     'volatility': smoothed_volatility,
                     'indicator_confidence': indicator_conf,
                     'adx': adx_value,
@@ -3879,6 +3939,9 @@ class TradingEngine:
                     'ema50_current': ema50_current,
                     'ema50_previous': ema50_previous,
                     'ema50_slope': ema50_current - ema50_previous,
+                    'recent_closes': df['close'].tail(120).tolist(),
+                    'recent_highs': df['high'].tail(120).tolist(),
+                    'recent_lows': df['low'].tail(120).tolist(),
                 }
             )
             evaluation['current_context'] = self._build_context_snapshot(
@@ -4564,7 +4627,7 @@ class TradingEngine:
 
     def _fetch_exit_price(self, symbol: str, fallback: float) -> float:
         try:
-            candles = self.api.fetch_candles(symbol)
+            candles = fetch_axi_candle_objects(symbol)
             if candles:
                 return float(candles[-1].close)
         except Exception as exc:
@@ -4591,7 +4654,8 @@ class TradingEngine:
         }
         if 'stake' not in evaluation:
             evaluation['stake'] = self._calculate_kelly_stake(evaluation.get('predicted_probability', 0.5))
-        stake_amount = float(max(0.1, evaluation.get('stake', self.trade_amount)))
+        stake_amount = float(LOT_SIZE)
+        evaluation['stake'] = stake_amount
         ml_probability = float(evaluation.get('predicted_probability', 0.5))
         trade_initiated = False
         volatility_raw = evaluation.get('volatility')
@@ -4604,60 +4668,11 @@ class TradingEngine:
         if volatility_value is not None:
             self.current_volatility = volatility_value
 
-        def _normalize_symbol(sym: str) -> str:
-            candidate = (sym or "").upper()
-            for base in ("R_25", "R_50", "R_75", "R_100"):
-                if candidate.startswith(base):
-                    return base
-            return candidate
-
-        base_symbol = _normalize_symbol(symbol)
         symbol_upper = str(symbol).upper()
-        # === ADAPTIVE VOLATILITY THRESHOLDS BY SYMBOL ===
-        low_vol, high_vol = 0.0003, 0.0025
-        if "R_25" in symbol_upper:
-            low_vol, high_vol = 0.00015, 0.0012
-        elif "R_50" in symbol_upper:
-            low_vol, high_vol = 0.00025, 0.0015
-        elif "R_75" in symbol_upper:
-            low_vol, high_vol = 0.0003, 0.0018
-        elif "R_100" in symbol_upper:
-            low_vol, high_vol = 0.00035, 0.002
         evaluated_volatility = float(getattr(self, "current_volatility", 0.0) or 0.0)
-        if evaluated_volatility > 0.05:
-            evaluated_volatility = evaluated_volatility / 100.0
-        epsilon = 1e-6
-        volatility_ok = True
-        if evaluated_volatility > (high_vol + epsilon):
-            logging.info(
-                f"🌪️ High volatility ({evaluated_volatility:.6f}) > {high_vol:.6f} for {base_symbol} → trade skipped."
-            )
-            volatility_ok = False
-        elif evaluated_volatility < (low_vol - epsilon):
-            logging.info(
-                f"💤 Low volatility ({evaluated_volatility:.6f}) < {low_vol:.6f} for {base_symbol} → trade skipped."
-            )
-            volatility_ok = False
-        else:
-            logging.info(
-                f"✅ Volatility OK for {base_symbol}: {evaluated_volatility:.6f} within [{low_vol:.6f}, {high_vol:.6f}]"
-            )
-        if not volatility_ok:
-            context = 'high' if evaluated_volatility > high_vol else 'low'
-            msg = f"⚠️ {base_symbol} skipped due to {context} volatility ({evaluated_volatility:.6f})"
-            logging.info(f"🚫 {msg}")
-            try:
-                send_telegram_message(msg)
-            except Exception:
-                pass
-            return False
-        mid_low = low_vol + (high_vol - low_vol) * 0.2
-        mid_high = high_vol - (high_vol - low_vol) * 0.2
-        if not (mid_low - epsilon <= evaluated_volatility <= mid_high + epsilon):
-            logging.info(
-                f"⚠️ Volatility {evaluated_volatility:.6f} outside safe zone [{mid_low:.6f}, {mid_high:.6f}], skipping."
-            )
-            return False
+        recent_closes = evaluation.get('recent_closes') or []
+        recent_highs = evaluation.get('recent_highs') or []
+        recent_lows = evaluation.get('recent_lows') or []
         confidence_value = float(combined_confidence) if combined_confidence is not None else 0.0
         latest_rsi_value = float(evaluation.get('latest_rsi', 0.0))
         ema_spread_value = float(evaluation.get('ema_spread', 0.0))
@@ -4693,9 +4708,14 @@ class TradingEngine:
             and rsi_signal_eval != ema_signal_eval
         ):
             logging.info(
-                f"🚫 Skipping trade on {symbol} due to RSI/EMA conflict → RSI={rsi_signal_eval}, EMA={ema_signal_eval}"
+                f"⚠️ RSI/EMA conflict detected for {symbol} → penalizing confidence."
             )
-            return False
+            confidence_value *= 0.80
+            combined_confidence = confidence_value
+            evaluation['final_confidence'] = confidence_value
+        adx_value = float(evaluation.get('adx', 0.0) or 0.0)
+        bb_width_value = float(evaluation.get('bb_width', evaluation.get('boll_width', 0.0)) or 0.0)
+        regime_value = evaluation.get('regime') or detect_regime(adx_value, bb_width_value)
         context_key = f"{symbol}|{final_action}|RSI:{round(latest_rsi_value, 1)}|EMA:{round(ema_spread_value, 1)}"
         if final_action in {'CALL', 'PUT'}:
             current_rsi_rounded = round(latest_rsi_value, 1)
@@ -4884,16 +4904,76 @@ class TradingEngine:
         if not self._is_macro_trend_aligned(evaluation, final_action):
             return False
         self.last_volatility = current_vol_reference
-        min_confidence = CONFIDENCE_MIN
-        # === GLOBAL CONFLUENCE RULE ===
-        min_confluence = MIN_ALIGNED_STRATEGIES  # fixed at 3 for all symbols
+        data_length = min(len(recent_closes), len(recent_highs), len(recent_lows))
         confluence_value = aligned_strategies
-        if confidence_value < min_confidence:
-            logging.info(f"🚫 Trade skipped due to low confidence ({confidence_value:.2f} < {min_confidence:.2f})")
+        min_confluence = MIN_CONFLUENCE
+        if data_length == 0:
+            decision_snapshot = (
+                f"[{symbol_upper}] 🧮 Conf={confidence_value:.2f} Regime={regime_value} "
+                f"ATRp=0.0p Confluence={confluence_value} Dir={final_action}"
+            )
+            logger.info(decision_snapshot)
+            logger.info(f"[{symbol_upper}] ❌ Skip: insufficient candle history for ATR gate")
+            return False
+        trimmed_highs = [float(value) for value in recent_highs[-data_length:]]
+        trimmed_lows = [float(value) for value in recent_lows[-data_length:]]
+        trimmed_closes = [float(value) for value in recent_closes[-data_length:]]
+        df_recent = pd.DataFrame(
+            {
+                "high": trimmed_highs,
+                "low": trimmed_lows,
+                "close": trimmed_closes,
+            }
+        )
+        try:
+            lower_series, upper_series = bollinger_bands(df_recent["close"])
+            if not lower_series.empty and not upper_series.empty:
+                last_lower = float(lower_series.iloc[-1])
+                last_upper = float(upper_series.iloc[-1])
+                mid_price = (last_upper + last_lower) / 2.0
+                bb_width_value = (last_upper - last_lower) / max(abs(mid_price), 1e-9)
+            else:
+                bb_width_value = float(
+                    evaluation.get("bb_width", evaluation.get("boll_width", 0.0)) or 0.0
+                )
+        except Exception:
+            bb_width_value = float(
+                evaluation.get("bb_width", evaluation.get("boll_width", 0.0)) or 0.0
+            )
+        regime_value = detect_regime(adx_value, bb_width_value)
+        evaluation['regime'] = regime_value
+        boost_settings = WEIGHT_BOOST.get(symbol_upper, {})
+        if regime_value == 'TREND':
+            confidence_value += boost_settings.get('trend', 0.0)
+        else:
+            confidence_value += boost_settings.get('range', 0.0)
+        confidence_value = float(np.clip(confidence_value, 0.0, 1.0))
+        combined_confidence = confidence_value
+        evaluation['final_confidence'] = confidence_value
+        atr_pips_value = atr_in_pips_from_df(symbol_upper, df_recent, period=14)
+        min_pips, max_pips = ATR_WINDOWS.get(symbol_upper, DEFAULT_ATR_WINDOW)
+        decision_snapshot = (
+            f"[{symbol_upper}] 🧮 Conf={confidence_value:.2f} Regime={regime_value} "
+            f"ATRp={atr_pips_value:.1f}p Confluence={confluence_value} Dir={final_action}"
+        )
+        if not (min_pips <= atr_pips_value <= max_pips):
+            logger.info(decision_snapshot)
+            logger.info(
+                f"[{symbol_upper}] ❌ Skip: ATR {atr_pips_value:.1f} pips outside {min_pips}-{max_pips}"
+            )
             return False
         if confluence_value < min_confluence:
-            logging.info(f"🚫 Trade skipped due to low confluence ({confluence_value}/{min_confluence})")
+            logger.info(decision_snapshot)
+            logger.info(f"[{symbol_upper}] ❌ Skip: confluence {confluence_value} < {min_confluence}")
             return False
+        required_confidence = min_confidence_for(regime_value)
+        if confidence_value < required_confidence:
+            logger.info(decision_snapshot)
+            logger.info(
+                f"[{symbol_upper}] ❌ Skip: confidence {confidence_value:.2f} < {required_confidence:.2f} @ {regime_value}"
+            )
+            return False
+        logger.info(decision_snapshot)
         if STRICT_MODE_ENABLED:
             if (
                 NEUTRAL_RSI_BAND[0]
@@ -4937,23 +5017,43 @@ class TradingEngine:
         logging.info(
             f"🚀 Executing trade on {symbol} | Confidence={confidence_value:.2f} | Confluence={confluence_value}/{min_confluence} | Volatility={evaluated_volatility:.6f}"
         )
-        contract_id, duration_seconds = self.api.buy(symbol, signal, stake_amount)
-        if contract_id is None:
-            logging.warning('No se pudo abrir la operación, se reanuda el análisis.')
+        atr_value = float(evaluation.get('atr', 0.0) or 0.0)
+        if atr_value <= 0.0:
+            fallback_atr = compute_atr_for_symbol(symbol)
+            if fallback_atr > 0.0:
+                atr_value = fallback_atr
+            else:
+                atr_value = 1.0
+        order_result = None
+        try:
+            order_result = execute_market_order(symbol, final_action, atr_value, LOT_SIZE)
+            logger.info(
+                f"🚀 EXECUTED MARKET ORDER {symbol} → {final_action} | Confidence={confidence_value:.2f}"
+            )
+        except Exception as exc:
+            logging.warning(f"No se pudo enviar la orden MT5: {exc}")
             self._notify_trade_state("ready")
             return False
+        if order_result is None:
+            logging.warning('No se obtuvo respuesta de la orden, se reanuda el análisis.')
+            self._notify_trade_state("ready")
+            return False
+        retcode = getattr(order_result, "retcode", None)
+        if retcode != mt5.TRADE_RETCODE_DONE:
+            logging.warning(f"Orden rechazada por MT5 (retcode={retcode})")
+            self._notify_trade_state("ready")
+            return False
+        contract_id = order_result.order or order_result.deal or int(time.time())
         operation_active = True
         self.active_trade_symbol = symbol
         self._notify_trade_state('active')
-        dur_seconds = duration_seconds if duration_seconds > 0 else TRADE_DURATION_SECONDS
-        logging.info(f"🟢 Operación abierta — Contrato #{contract_id} | Duración: {dur_seconds}s")
+        logging.info(f"🟢 Operación abierta — Ticket #{contract_id} | Volumen: {stake_amount}")
         self._trade_timestamps.append(time.time())
         trade_initiated = True
         try:
-            result_status = self._wait_for_contract_result(contract_id, dur_seconds)
-            trade_result, pnl = self._resolve_trade_result(result_status, stake_amount)
+            trade_result, pnl = self._resolve_trade_result(order_result, stake_amount, signal)
             if contract_id is not None and not self._register_processed_contract(contract_id):
-                logging.debug(f"Contrato #{contract_id} ya procesado, omitiendo duplicado de resultados")
+                logging.debug(f"Ticket #{contract_id} ya procesado, omitiendo duplicado de resultados")
                 return trade_initiated
             self.risk.register_trade(pnl)
             if features is not None:
@@ -5097,7 +5197,7 @@ class TradingEngine:
                 )
             should_notify = True
             if contract_id is not None and not self._register_contract_closure(contract_id):
-                logging.debug(f"Contract {contract_id} already closed. Skipping duplicate log.")
+                logging.debug(f"Ticket {contract_id} already closed. Skipping duplicate log.")
                 should_notify = False
             if should_notify:
                 emoji = "✅" if win_flag else "❌"
@@ -5171,7 +5271,7 @@ class TradingEngine:
             ):
                 self._handle_auto_shutdown()
         except Exception as exc:
-            logging.warning(f"Error al gestionar la operación #{contract_id}: {exc}")
+            logging.warning(f"Error al gestionar el ticket #{contract_id}: {exc}")
         finally:
             operation_active = False
             self.active_trade_symbol = None
@@ -5202,11 +5302,9 @@ class TradingEngine:
         self._notify_trade_state("ready")
         self.ai.shutdown()
         try:
-            if self.api.socket is not None:
-                self.api.socket.close()
+            mt5.shutdown()
         except Exception:
             pass
-        self.api.socket = None
         with self._processed_lock:
             self._processed_contracts.clear()
         with self._closed_lock:
@@ -5271,16 +5369,16 @@ class BotThread(QThread):
             self.logged_contracts = getattr(self, "logged_contracts", set())
             logged_contracts = self.logged_contracts
             if contract_id in logged_contracts:
-                logging.debug(f"Duplicate contract {contract_id} ignored.")
+                logging.debug(f"Duplicate ticket {contract_id} ignored.")
                 return
             logged_contracts.add(contract_id)
             self._closed_contracts.add(contract_id)
         ticket = data.get("ticket")
         resultado = data.get("resultado", "-")
         if ticket is not None:
-            mensaje = f"✅ Contrato #{ticket} {resultado}"
+            mensaje = f"✅ Ticket #{ticket} {resultado}"
         else:
-            mensaje = f"✅ Contrato {resultado}"
+            mensaje = f"✅ Ticket {resultado}"
         self.log_signal.emit(mensaje)
         self.result_signal.emit(dict(data))
 
@@ -5326,7 +5424,7 @@ class BotThread(QThread):
 class BotWindow(QtWidgets.QWidget):
     def __init__(self) -> None:
         super().__init__()
-        self.setWindowTitle("Bot Deriv Pro Trader")
+        self.setWindowTitle("Bot Axi Pro Trader")
         self.resize(1320, 780)
         self.setStyleSheet(
             """
@@ -5897,7 +5995,7 @@ class BotWindow(QtWidgets.QWidget):
             self.logged_contracts = getattr(self, "logged_contracts", set())
             logged_contracts = self.logged_contracts
             if contract_id in logged_contracts:
-                logging.debug(f"Duplicate contract {contract_id} ignored.")
+                logging.debug(f"Duplicate ticket {contract_id} ignored.")
                 return
             logged_contracts.add(contract_id)
         target_row = self._find_contract_row(contract_id)
