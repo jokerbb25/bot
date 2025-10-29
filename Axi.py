@@ -58,11 +58,6 @@ MIN_TRADE_CONFIDENCE = 0.45
 MIN_CONFIDENCE = 0.0
 MIN_VOLATILITY = 0.0
 LOT_SIZE = 0.01  # configurable, equivalent to $1 per pip depending on broker leverage
-ATR_MULT_SL = 2.0
-ATR_MULT_TP = 3.0
-
-# === ATR(pips) ACCEPTANCE WINDOWS ===
-MIN_CONFLUENCE = 3
 
 WEIGHT_BOOST = {
     "XAUUSD": {"trend": 0.03, "range": -0.02},
@@ -124,38 +119,59 @@ def execute_market_order(symbol: str, action: str, atr_value: float, lot_size: f
     symbol_info = mt5.symbol_info(symbol)
     if symbol_info is None:
         raise RuntimeError(f"Symbol {symbol} is not available in MT5")
-    point = float(getattr(symbol_info, "point", 0.0) or 0.0)
-    if point == 0.0:
-        raise RuntimeError(f"Invalid point size for {symbol}")
-
-    sl_distance = float(max(atr_value, 0.0)) * ATR_MULT_SL
-    tp_distance = float(max(atr_value, 0.0)) * ATR_MULT_TP
 
     tick = mt5.symbol_info_tick(symbol)
     if tick is None:
         raise RuntimeError(f"No tick data for {symbol}")
 
-    order_type = mt5.ORDER_TYPE_BUY if action == "CALL" else mt5.ORDER_TYPE_SELL
-    price = tick.ask if action == "CALL" else tick.bid
+    direction = str(action or "CALL").upper()
+    order_type = mt5.ORDER_TYPE_BUY if direction == "CALL" else mt5.ORDER_TYPE_SELL
+    price = tick.ask if direction == "CALL" else tick.bid
+    point = float(getattr(symbol_info, "point", 0.0) or 0.0)
+    lot = float(lot_size)
+    atr = float(max(atr_value, 0.0))
 
-    sl = price - sl_distance * point if action == "CALL" else price + sl_distance * point
-    tp = price + tp_distance * point if action == "CALL" else price - tp_distance * point
+    if point <= 0.0:
+        raise RuntimeError(f"Invalid point size for {symbol}")
 
-    order_request = {
-        "action": mt5.TRADE_ACTION_DEAL,
-        "symbol": symbol,
-        "volume": float(lot_size),
-        "type": order_type,
-        "price": price,
-        "sl": sl,
-        "tp": tp,
-        "magic": 202503,
-        "comment": "AXI AUTO TRADE",
-        "type_filling": mt5.ORDER_FILLING_IOC,
-        "type_time": mt5.ORDER_TIME_GTC,
+    atr_pips = atr / point if point else 0.0
+
+    # ==========================================================
+    # ✅ ATR VOLATILITY FILTER (PIPS BASED)
+    # ==========================================================
+
+    ATR_LIMITS = {
+        "XAUUSD": (30, 350),
     }
 
-    result = mt5.order_send(order_request)
+    MIN_ATR, MAX_ATR = ATR_LIMITS.get(symbol.upper(), (2, 40))
+
+    if not (MIN_ATR <= atr_pips <= MAX_ATR):
+        logger.info(f"❌ Skip {symbol} - ATR {atr_pips:.1f} pips not in [{MIN_ATR}-{MAX_ATR}]")
+        return None
+
+    # ==========================================================
+    # ✅ AUTO-SL/TP (NO MORE "Invalid Stops")
+    # ==========================================================
+
+    stop_level = int(getattr(symbol_info, "trade_stops_level", 0) or 0)
+
+    sl_points = max(stop_level, int(max(1.0, atr_pips * 1.2)))
+    tp_points = max(stop_level, int(max(1.0, atr_pips * 2.5)))
+
+    request = {
+        "action": mt5.TRADE_ACTION_DEAL,
+        "symbol": symbol,
+        "volume": lot,
+        "type": mt5.ORDER_TYPE_BUY if direction == "CALL" else mt5.ORDER_TYPE_SELL,
+        "price": price,
+        "sl": price - sl_points * point if direction == "CALL" else price + sl_points * point,
+        "tp": price + tp_points * point if direction == "CALL" else price - tp_points * point,
+        "magic": 1001,
+        "comment": "axi-bot-auto",
+    }
+
+    result = mt5.order_send(request)
 
     if result is None:
         logger.error("❌ Order failed: No response from MT5")
@@ -173,11 +189,11 @@ def execute_market_order(symbol: str, action: str, atr_value: float, lot_size: f
                 f"{symbol}\nReason: {getattr(result, 'comment', 'Unknown error')}"
             )
     else:
-        logger.info(f"✅ Order placed! #{getattr(result, 'order', 0)} {symbol} → {action}")
+        logger.info(f"✅ Order placed! #{getattr(result, 'order', 0)} {symbol} → {direction}")
         if BOT_ACTIVE:
             telegram_send(
                 "✅ MARKET ORDER EXECUTED\n"
-                f"{symbol}\nAction: {action}\nLot: {lot_size}\nSL/TP based on ATR"
+                f"{symbol}\nAction: {direction}\nLot: {lot}"
             )
 
     return result
@@ -204,27 +220,6 @@ def fetch_axi_candles(symbol: str, timeframe: int = mt5.TIMEFRAME_M1, count: int
     return get_candles(symbol, timeframe=timeframe, count=count)
 
 
-def send_order(symbol: str, direction: str, volume: float = 0.1):
-    order_type = mt5.ORDER_TYPE_BUY if direction == "CALL" else mt5.ORDER_TYPE_SELL
-    tick = mt5.symbol_info_tick(symbol)
-    if tick is None:
-        raise RuntimeError(f"No tick data for {symbol}")
-    price = tick.ask if direction == "CALL" else tick.bid
-    request = {
-        "action": mt5.TRADE_ACTION_DEAL,
-        "symbol": symbol,
-        "volume": float(volume),
-        "type": order_type,
-        "price": price,
-        "deviation": 20,
-        "magic": 123456,
-        "comment": "botAxi",
-        "type_time": mt5.ORDER_TIME_GTC,
-        "type_filling": mt5.ORDER_FILLING_IOC,
-    }
-    result = mt5.order_send(request)
-    print(f"[AXI] Order result → {result}")
-    return result
 
 operation_active = False
 TRADE_DURATION_SECONDS = 60
@@ -803,45 +798,7 @@ def bollinger_bands(series: pd.Series, period: int = 20, num_dev: float = 2.0) -
     return bb.bollinger_lband(), bb.bollinger_hband()
 
 
-# === PIP SIZE MAP ===
-PIP_SIZE = {
-    "EURUSD": 0.0001,
-    "GBPUSD": 0.0001,
-    "USDCAD": 0.0001,
-    "USDJPY": 0.01,
-    "XAUUSD": 0.10,
-}
 
-
-def pip_size(symbol: str) -> float:
-    return PIP_SIZE.get(symbol.upper(), 0.0001)
-
-
-# === ATR acceptance windows (in pips) per instrument ===
-ATR_WINDOWS = {
-    "EURUSD": (2, 35),
-    "GBPUSD": (3, 40),
-    "USDJPY": (2, 45),
-    "USDCAD": (2, 40),
-    "XAUUSD": (30, 350),
-}
-DEFAULT_ATR_WINDOW = (2, 40)
-
-
-def atr_in_pips_from_df(symbol: str, df: pd.DataFrame, period: int = 14) -> float:
-    if df is None or df.empty:
-        return 0.0
-    atr_series = AverageTrueRange(
-        high=df["high"],
-        low=df["low"],
-        close=df["close"],
-        window=period,
-        fillna=False,
-    ).average_true_range()
-    if atr_series is None or atr_series.empty:
-        return 0.0
-    atr_val = float(atr_series.iloc[-1])
-    return atr_val / pip_size(symbol)
 
 
 def atr(df: pd.DataFrame, period: int = 14) -> pd.Series:
@@ -2011,8 +1968,6 @@ class auto_learning:
             macd_value = float(item.get("MACD", 0.0))
             adx_value = float(item.get("ADX", 0.0))
             confidence = self.calculate_confidence(rsi_value, ema_value, 0.5, adx_value, macd_value)
-            if confidence < min_confidence:
-                continue
             if adx_value < adx_min:
                 continue
             if rsi_value > rsi_high and macd_value > 0:
@@ -4904,42 +4859,8 @@ class TradingEngine:
         if not self._is_macro_trend_aligned(evaluation, final_action):
             return False
         self.last_volatility = current_vol_reference
-        data_length = min(len(recent_closes), len(recent_highs), len(recent_lows))
         confluence_value = aligned_strategies
-        min_confluence = MIN_CONFLUENCE
-        if data_length == 0:
-            decision_snapshot = (
-                f"[{symbol_upper}] 🧮 Conf={confidence_value:.2f} Regime={regime_value} "
-                f"ATRp=0.0p Confluence={confluence_value} Dir={final_action}"
-            )
-            logger.info(decision_snapshot)
-            logger.info(f"[{symbol_upper}] ❌ Skip: insufficient candle history for ATR gate")
-            return False
-        trimmed_highs = [float(value) for value in recent_highs[-data_length:]]
-        trimmed_lows = [float(value) for value in recent_lows[-data_length:]]
-        trimmed_closes = [float(value) for value in recent_closes[-data_length:]]
-        df_recent = pd.DataFrame(
-            {
-                "high": trimmed_highs,
-                "low": trimmed_lows,
-                "close": trimmed_closes,
-            }
-        )
-        try:
-            lower_series, upper_series = bollinger_bands(df_recent["close"])
-            if not lower_series.empty and not upper_series.empty:
-                last_lower = float(lower_series.iloc[-1])
-                last_upper = float(upper_series.iloc[-1])
-                mid_price = (last_upper + last_lower) / 2.0
-                bb_width_value = (last_upper - last_lower) / max(abs(mid_price), 1e-9)
-            else:
-                bb_width_value = float(
-                    evaluation.get("bb_width", evaluation.get("boll_width", 0.0)) or 0.0
-                )
-        except Exception:
-            bb_width_value = float(
-                evaluation.get("bb_width", evaluation.get("boll_width", 0.0)) or 0.0
-            )
+        required_confluence = 2
         regime_value = detect_regime(adx_value, bb_width_value)
         evaluation['regime'] = regime_value
         boost_settings = WEIGHT_BOOST.get(symbol_upper, {})
@@ -4950,30 +4871,40 @@ class TradingEngine:
         confidence_value = float(np.clip(confidence_value, 0.0, 1.0))
         combined_confidence = confidence_value
         evaluation['final_confidence'] = confidence_value
-        atr_pips_value = atr_in_pips_from_df(symbol_upper, df_recent, period=14)
-        min_pips, max_pips = ATR_WINDOWS.get(symbol_upper, DEFAULT_ATR_WINDOW)
+        atr_value = float(evaluation.get('atr', 0.0) or 0.0)
+        if atr_value <= 0.0:
+            fallback_atr = compute_atr_for_symbol(symbol)
+            if fallback_atr > 0.0:
+                atr_value = fallback_atr
+        symbol_info = mt5.symbol_info(symbol)
+        if symbol_info is None:
+            logger.error(f"❌ Cannot get symbol info for {symbol_upper}")
+            return False
+        point_value = float(getattr(symbol_info, 'point', 0.0) or 0.0)
+        atr_pips_value = atr_value / point_value if point_value else 0.0
         decision_snapshot = (
             f"[{symbol_upper}] 🧮 Conf={confidence_value:.2f} Regime={regime_value} "
             f"ATRp={atr_pips_value:.1f}p Confluence={confluence_value} Dir={final_action}"
         )
-        if not (min_pips <= atr_pips_value <= max_pips):
+        if confluence_value < required_confluence:
             logger.info(decision_snapshot)
-            logger.info(
-                f"[{symbol_upper}] ❌ Skip: ATR {atr_pips_value:.1f} pips outside {min_pips}-{max_pips}"
-            )
+            logger.info(f"❌ Skip: insufficient confluence → {confluence_value}/{required_confluence} required")
             return False
-        if confluence_value < min_confluence:
-            logger.info(decision_snapshot)
-            logger.info(f"[{symbol_upper}] ❌ Skip: confluence {confluence_value} < {min_confluence}")
-            return False
-        required_confidence = min_confidence_for(regime_value)
+        required_confidence = 0.65
         if confidence_value < required_confidence:
             logger.info(decision_snapshot)
-            logger.info(
-                f"[{symbol_upper}] ❌ Skip: confidence {confidence_value:.2f} < {required_confidence:.2f} @ {regime_value}"
-            )
+            logger.info(f"❌ Skip: confidence {confidence_value:.2f} < required {required_confidence}")
+            return False
+        ATR_LIMITS = {
+            "XAUUSD": (30, 350),
+        }
+        min_atr, max_atr = ATR_LIMITS.get(symbol_upper, (2, 40))
+        if not (min_atr <= atr_pips_value <= max_atr):
+            logger.info(decision_snapshot)
+            logger.info(f"❌ Skip {symbol} - ATR {atr_pips_value:.1f} pips not in [{min_atr}-{max_atr}]")
             return False
         logger.info(decision_snapshot)
+
         if STRICT_MODE_ENABLED:
             if (
                 NEUTRAL_RSI_BAND[0]
@@ -5015,15 +4946,10 @@ class TradingEngine:
             stake_amount,
         )
         logging.info(
-            f"🚀 Executing trade on {symbol} | Confidence={confidence_value:.2f} | Confluence={confluence_value}/{min_confluence} | Volatility={evaluated_volatility:.6f}"
+            f"🚀 Executing trade on {symbol} | Confidence={confidence_value:.2f} | Confluence={confluence_value}/{required_confluence} | Volatility={evaluated_volatility:.6f}"
         )
-        atr_value = float(evaluation.get('atr', 0.0) or 0.0)
         if atr_value <= 0.0:
-            fallback_atr = compute_atr_for_symbol(symbol)
-            if fallback_atr > 0.0:
-                atr_value = fallback_atr
-            else:
-                atr_value = 1.0
+            atr_value = 1.0
         order_result = None
         try:
             order_result = execute_market_order(symbol, final_action, atr_value, LOT_SIZE)
