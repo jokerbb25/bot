@@ -6562,7 +6562,5 @@ def main() -> None:
     window.show()
     window.initialize_background_services()
     app.exec_()
-
-
 if __name__ == "__main__":
     main()
