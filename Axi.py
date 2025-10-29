@@ -9,6 +9,7 @@ import math
 import shutil
 import os
 import subprocess
+from enum import Enum, auto
 from collections import defaultdict, deque
 from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
@@ -95,9 +96,24 @@ ADAPTIVE_STATE_PATH = Path("adaptive_ai_state.npz")
 STRATEGY_CONFIG_PATH = Path("strategies_config.json")
 ADVISORY_INTERVAL_SEC = 180
 
+RISK_CFG = {
+    "sl_mode": "atr_aggressive",
+    "sl_atr_mult": 0.40,
+    "sl_min_pips": 3,
+    "sl_max_pips": 15,
+    "sl_time_guard_seconds": 2,
+    "slp_enable": True,
+    "slp_arm_after_pips": 6,
+    "slp_be_offset_pips": 2,
+    "slp_trail_distance_pips": 5,
+    "reentry_cooldown_sec": 15,
+}
+
 logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 warnings.filterwarnings("ignore", category=RuntimeWarning, message="overflow encountered in exp")
+
+logger = logging.getLogger(__name__)
 
 operation_active = False
 TRADE_DURATION_SECONDS = 60
@@ -609,6 +625,299 @@ class TradeRecord:
     pnl: float
     reasons: List[str]
     metadata: Dict[str, Any] = field(default_factory=dict)
+
+
+# ===============================================================
+# ENGINE STATE & GUARD RAILS
+# ===============================================================
+class BotState(Enum):
+    IDLE = auto()
+    ARMED = auto()
+    OPEN = auto()
+    CLOSING = auto()
+    COOLDOWN = auto()
+
+
+trade_state: Dict[str, Any] = {
+    "state": BotState.IDLE,
+    "ticket": None,
+    "symbol": None,
+    "direction": None,
+    "entry_price": None,
+    "open_time": None,
+    "duration": None,
+    "magic": 20251029,
+}
+
+position_lock = threading.RLock()
+last_close_ts = 0.0
+current_conf = 0.0
+
+
+def _pip_size(symbol: str) -> float:
+    if symbol.startswith("R_"):
+        return 0.01
+    return 0.0001
+
+
+class GuiProxy:
+    def push_status(self, message: str) -> None:
+        logger.info(message)
+        engine = globals().get("global_engine")
+        if engine is not None:
+            engine._notify_status(message)
+
+    def mark_open(self, symbol: str, direction: str, confidence: float, entry: float, sl_pips: int) -> None:
+        logger.info(
+            "TRADE_OPEN symbol=%s direction=%s confidence=%.2f entry=%.5f sl_pips=%d",
+            symbol,
+            direction,
+            confidence,
+            entry,
+            sl_pips,
+        )
+        engine = globals().get("global_engine")
+        if engine is not None:
+            engine._notify_trade_state("active")
+
+    def mark_closed(self, ticket: int, result: str, pnl: float) -> None:
+        logger.info("TRADE_CLOSED ticket=%s result=%s pnl=%.2f", ticket, result, pnl)
+        engine = globals().get("global_engine")
+        if engine is not None:
+            engine._notify_trade_state("ready")
+
+
+gui = GuiProxy()
+
+
+def skip(reason_code: str, details: str = "") -> None:
+    message = f"SKIPPED_{reason_code}"
+    if details:
+        message += f" | {details}"
+    logger.info(message)
+    gui.push_status(message)
+    return None
+
+
+def can_trade_now() -> bool:
+    global last_close_ts
+    now = time.time()
+    with position_lock:
+        if trade_state["state"] in (BotState.OPEN, BotState.CLOSING):
+            gui.push_status("BUSY_OPEN_TRADE")
+            return False
+        if trade_state["state"] == BotState.COOLDOWN:
+            if now - last_close_ts >= RISK_CFG["reentry_cooldown_sec"]:
+                trade_state["state"] = BotState.IDLE
+            else:
+                gui.push_status("COOLDOWN")
+                return False
+        if now - last_close_ts < RISK_CFG["reentry_cooldown_sec"]:
+            gui.push_status("COOLDOWN")
+            return False
+    return True
+
+
+def clamp(value: float, lo: float, hi: float) -> float:
+    return max(lo, min(hi, value))
+
+
+def compute_sl_pips(atr_pips: float) -> int:
+    if RISK_CFG["sl_mode"] == "atr_aggressive":
+        sl_value = atr_pips * RISK_CFG["sl_atr_mult"]
+        return int(round(clamp(sl_value, RISK_CFG["sl_min_pips"], RISK_CFG["sl_max_pips"])))
+    return int(RISK_CFG["sl_min_pips"])
+
+
+def price_to_pips(symbol: str, price_delta: float) -> float:
+    pip_value = _pip_size(symbol)
+    if pip_value == 0:
+        return 0.0
+    return price_delta / pip_value
+
+
+def pips_to_price(symbol: str, pips: float) -> float:
+    return pips * _pip_size(symbol)
+
+
+def _latest_price(symbol: str) -> float:
+    engine = globals().get("global_engine")
+    if engine is None:
+        entry = trade_state.get("entry_price")
+        return float(entry or 0.0)
+    return float(engine.get_last_price(symbol))
+
+
+def get_bid(symbol: str) -> float:
+    return _latest_price(symbol)
+
+
+def get_ask(symbol: str) -> float:
+    return _latest_price(symbol)
+
+
+class _Position:
+    __slots__ = ("symbol", "magic")
+
+    def __init__(self, symbol: str, magic: int) -> None:
+        self.symbol = symbol
+        self.magic = magic
+
+
+def mt5_positions() -> List[_Position]:
+    with position_lock:
+        if trade_state["state"] == BotState.OPEN and trade_state["ticket"] is not None:
+            return [_Position(trade_state["symbol"], trade_state["magic"])]
+    return []
+
+
+def has_open_with_magic(symbol: str, magic: int) -> bool:
+    for pos in mt5_positions():
+        if pos.symbol == symbol and pos.magic == magic:
+            return True
+    return False
+
+
+def mt5_send_order(
+    symbol: str,
+    direction: str,
+    lot: float,
+    sl_price: Optional[float] = None,
+    tp_price: Optional[float] = None,
+    magic: Optional[int] = None,
+) -> Optional[Tuple[int, int]]:
+    engine = globals().get("global_engine")
+    if engine is None:
+        logger.error("ENGINE_UNAVAILABLE")
+        return None
+    deriv_direction = "CALL" if direction == "BUY" else "PUT"
+    contract_id, duration_seconds = engine.api.buy(symbol, deriv_direction, lot)
+    if contract_id is None:
+        return None
+    logger.info(
+        "ORDER_PLACED ticket=%s symbol=%s direction=%s sl=%.5f tp=%s",  # tp may be None
+        contract_id,
+        symbol,
+        direction,
+        float(sl_price or 0.0),
+        tp_price,
+    )
+    return contract_id, duration_seconds
+
+
+def mt5_modify_sl(ticket: int, sl_price: float) -> None:
+    logger.info("MODIFY_SL ticket=%s price=%.5f", ticket, sl_price)
+
+
+def _slp_watcher(ticket: int) -> None:
+    arm = RISK_CFG["slp_arm_after_pips"]
+    be_offset = RISK_CFG["slp_be_offset_pips"]
+    trail_distance = RISK_CFG["slp_trail_distance_pips"]
+    armed = False
+    last_sl: Optional[float] = None
+    with position_lock:
+        open_time = float(trade_state.get("open_time") or time.time())
+    guard_until = open_time + RISK_CFG["sl_time_guard_seconds"]
+    while True:
+        with position_lock:
+            if trade_state["ticket"] != ticket or trade_state["state"] != BotState.OPEN:
+                return
+            symbol = trade_state["symbol"]
+            direction = trade_state["direction"]
+            entry_price = float(trade_state.get("entry_price") or 0.0)
+        price = get_bid(symbol) if direction == "SELL" else get_ask(symbol)
+        pnl_pips = price_to_pips(
+            symbol,
+            (price - entry_price) if direction == "BUY" else (entry_price - price),
+        )
+        if not armed and pnl_pips >= arm and time.time() >= guard_until:
+            be_price = entry_price + pips_to_price(symbol, be_offset) if direction == "BUY" else entry_price - pips_to_price(symbol, be_offset)
+            mt5_modify_sl(ticket, be_price)
+            last_sl = be_price
+            armed = True
+            gui.push_status(f"SLP_ARMED_BE({arm}p ➜ +{be_offset}p)")
+            logger.info("SLP: moved to BE+offset")
+        if armed:
+            desired_sl = price - pips_to_price(symbol, trail_distance) if direction == "BUY" else price + pips_to_price(symbol, trail_distance)
+            if (direction == "BUY" and (last_sl is None or desired_sl > last_sl)) or (
+                direction == "SELL" and (last_sl is None or desired_sl < last_sl)
+            ):
+                mt5_modify_sl(ticket, desired_sl)
+                last_sl = desired_sl
+                gui.push_status(f"SLP_TRAIL({trail_distance}p)")
+        time.sleep(0.25)
+
+
+def execute_trade(
+    symbol: str,
+    direction: str,
+    lot: float,
+    entry_price: float,
+    atr_pips: float,
+) -> Optional[Tuple[int, int]]:
+    if direction not in {"BUY", "SELL"}:
+        return None
+    sl_pips = compute_sl_pips(atr_pips)
+    sl_price = entry_price - pips_to_price(symbol, sl_pips) if direction == "BUY" else entry_price + pips_to_price(symbol, sl_pips)
+    with position_lock:
+        if has_open_with_magic(symbol, trade_state["magic"]):
+            gui.push_status("BUSY_OPEN_TRADE")
+            return None
+        order_info = mt5_send_order(
+            symbol,
+            direction,
+            lot,
+            sl_price=sl_price,
+            tp_price=None,
+            magic=trade_state["magic"],
+        )
+        if order_info is None:
+            logger.error("ORDER_REJECTED")
+            gui.push_status("ORDER_REJECTED")
+            return None
+        ticket, duration_seconds = order_info
+        trade_state.update(
+            {
+                "state": BotState.OPEN,
+                "ticket": ticket,
+                "symbol": symbol,
+                "direction": direction,
+                "entry_price": entry_price,
+                "open_time": time.time(),
+                "duration": duration_seconds,
+            }
+        )
+        gui.mark_open(symbol, direction, confidence=current_conf, entry=entry_price, sl_pips=sl_pips)
+    if RISK_CFG["slp_enable"]:
+        watcher = threading.Thread(target=_slp_watcher, args=(ticket,), daemon=True)
+        watcher.start()
+    return ticket, duration_seconds
+
+
+def maybe_execute(
+    symbol: str,
+    action: str,
+    lot: float,
+    atr_pips: float,
+    entry_price: float,
+    confidence: float,
+) -> Optional[Tuple[int, int]]:
+    if action not in ("BUY", "SELL"):
+        return skip("NO_ACTION", f"symbol={symbol}")
+    if confidence < MIN_CONFIDENCE:
+        return skip("LOW_CONF", f"conf={confidence:.2f}")
+    if not can_trade_now():
+        return None
+    return execute_trade(symbol, action, lot, entry_price, atr_pips)
+
+
+def on_order_closed(ticket: int, result: str, pnl: float) -> None:
+    global last_close_ts
+    with position_lock:
+        if trade_state["ticket"] == ticket:
+            trade_state.update({"state": BotState.COOLDOWN, "ticket": None, "symbol": None, "direction": None})
+            last_close_ts = time.time()
+    gui.mark_closed(ticket, result=result, pnl=pnl)
 
 
 # ===============================================================
@@ -3013,6 +3322,7 @@ class TradingEngine:
         with auto_learn.weights_lock:
             self._baseline_weights = dict(auto_learn.weights)
         self._indicator_cache: Dict[str, Dict[str, Any]] = {symbol: {} for symbol in SYMBOLS}
+        self._last_prices: Dict[str, float] = {symbol: 0.0 for symbol in SYMBOLS}
         self._volatility_history: Dict[str, deque] = {symbol: deque(maxlen=5) for symbol in SYMBOLS}
         self._cycle_id_counter = 0
         self._last_regime_cycle = -1
@@ -3595,6 +3905,9 @@ class TradingEngine:
                 self._closed_contracts.pop()
             return True
 
+    def get_last_price(self, symbol: str) -> float:
+        return float(self._last_prices.get(symbol, 0.0))
+
 
     def _determine_signal_source(
         self,
@@ -3697,6 +4010,7 @@ class TradingEngine:
                     f"✅ Señal final: {signal} | Confianza {confidence:.2f} | Estrategias activas: {active_total}/{TOTAL_STRATEGY_COUNT}"
                 )
             entry_price = float(df['close'].iloc[-1]) if not df.empty else 0.0
+            self._last_prices[symbol] = entry_price
             evaluation: Dict[str, Any] = {
                 'symbol': symbol,
                 'signal': signal,
@@ -3764,6 +4078,9 @@ class TradingEngine:
             cache['epoch'] = last_epoch
             price_reference = entry_price if entry_price else 1.0
             boll_ratio = boll_width / price_reference if price_reference else 0.0
+            atr_series = atr(df, 14) if len(df) else pd.Series(dtype=float)
+            atr_value = float(atr_series.iloc[-1]) if not atr_series.empty else 0.0
+            evaluation['atr_pips'] = price_to_pips(symbol, atr_value)
             volatilidad_serie = df['close'].pct_change().rolling(20).std()
             volatilidad_actual = float(np.nan_to_num(volatilidad_serie.iloc[-1], nan=0.0)) if len(volatilidad_serie) else 0.0
             historial_vol = self._volatility_history.setdefault(symbol, deque(maxlen=5))
@@ -4889,11 +5206,12 @@ class TradingEngine:
         min_confluence = MIN_ALIGNED_STRATEGIES  # fixed at 3 for all symbols
         confluence_value = aligned_strategies
         if confidence_value < min_confidence:
-            logging.info(f"🚫 Trade skipped due to low confidence ({confidence_value:.2f} < {min_confidence:.2f})")
-            return False
+            return skip("LOW_CONF", f"conf={confidence_value:.2f}")
         if confluence_value < min_confluence:
-            logging.info(f"🚫 Trade skipped due to low confluence ({confluence_value}/{min_confluence})")
-            return False
+            return skip(
+                "NO_CONFLUENCE",
+                f"conf={confidence_value:.2f} confs={confluence_value}",
+            )
         if STRICT_MODE_ENABLED:
             if (
                 NEUTRAL_RSI_BAND[0]
@@ -4924,6 +5242,8 @@ class TradingEngine:
             return False
         if operation_active:
             return False
+        if not can_trade_now():
+            return False
         auto_learn.register_trade_context(
             symbol,
             signal,
@@ -4937,11 +5257,14 @@ class TradingEngine:
         logging.info(
             f"🚀 Executing trade on {symbol} | Confidence={confidence_value:.2f} | Confluence={confluence_value}/{min_confluence} | Volatility={evaluated_volatility:.6f}"
         )
-        contract_id, duration_seconds = self.api.buy(symbol, signal, stake_amount)
-        if contract_id is None:
-            logging.warning('No se pudo abrir la operación, se reanuda el análisis.')
-            self._notify_trade_state("ready")
+        action = 'BUY' if signal == 'CALL' else 'SELL' if signal == 'PUT' else 'NONE'
+        atr_pips = float(evaluation.get('atr_pips', 0.0))
+        global current_conf
+        current_conf = ai_confidence
+        execution = maybe_execute(symbol, action, stake_amount, atr_pips, entry_price, ai_confidence)
+        if not execution:
             return False
+        contract_id, duration_seconds = execution
         operation_active = True
         self.active_trade_symbol = symbol
         self._notify_trade_state('active')
@@ -4956,6 +5279,7 @@ class TradingEngine:
                 logging.debug(f"Contrato #{contract_id} ya procesado, omitiendo duplicado de resultados")
                 return trade_initiated
             self.risk.register_trade(pnl)
+            on_order_closed(contract_id, trade_result, pnl)
             if features is not None:
                 self.ai.log_trade(features, 1 if trade_result == 'WIN' else 0)
             strategy_details = {
@@ -6021,6 +6345,8 @@ class BotWindow(QtWidgets.QWidget):
             "waiting": "Estado: Esperando cierre de operación...",
             "ready": "Estado: Listo",
         }
+        if state == "ready" and trade_state.get("state") == BotState.OPEN:
+            return
         texto = mapping.get(state, "Estado: Listo")
         if hasattr(self, "trade_state_label"):
             self.trade_state_label.setText(texto)
