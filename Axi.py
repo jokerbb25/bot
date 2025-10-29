@@ -4872,6 +4872,14 @@ class TradingEngine:
         confidence_value = float(np.clip(confidence_value, 0.0, 1.0))
         combined_confidence = confidence_value
         evaluation['final_confidence'] = confidence_value
+        # ==========================================================
+        # LOG ALWAYS — BEFORE APPLYING FILTERS
+        # ==========================================================
+        logger.info(
+            f"[{symbol}] Strategies aligned = {aligned_strategies} | "
+            f"Confidence = {confidence_value:.2f}"
+        )
+
         atr_value = float(evaluation.get('atr', 0.0) or 0.0)
         if atr_value <= 0.0:
             fallback_atr = compute_atr_for_symbol(symbol)
@@ -4887,9 +4895,9 @@ class TradingEngine:
             f"[{symbol_upper}] 🧮 Conf={confidence_value:.2f} Regime={regime_value} "
             f"ATRp={atr_pips_value:.1f}p Confluence={confluence_value} Dir={final_action}"
         )
-        if confluence_value < required_confluence:
+        if aligned_strategies < 2:
             logger.info(decision_snapshot)
-            logger.info(f"❌ Skip: only {aligned_strategies}/{required_confluence} strategies aligned")
+            logger.info(f"❌ Skip: only {aligned_strategies}/2 strategies aligned")
             return False
         required_confidence = 0.65
         if confidence_value < required_confidence:
