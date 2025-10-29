@@ -58,6 +58,7 @@ MIN_TRADE_CONFIDENCE = 0.45
 MIN_CONFIDENCE = 0.0
 MIN_VOLATILITY = 0.0
 LOT_SIZE = 0.01  # configurable, equivalent to $1 per pip depending on broker leverage
+MIN_CONFLUENCE = 2
 
 WEIGHT_BOOST = {
     "XAUUSD": {"trend": 0.03, "range": -0.02},
@@ -4860,7 +4861,7 @@ class TradingEngine:
             return False
         self.last_volatility = current_vol_reference
         confluence_value = aligned_strategies
-        required_confluence = 2
+        required_confluence = MIN_CONFLUENCE
         regime_value = detect_regime(adx_value, bb_width_value)
         evaluation['regime'] = regime_value
         boost_settings = WEIGHT_BOOST.get(symbol_upper, {})
@@ -4888,12 +4889,12 @@ class TradingEngine:
         )
         if confluence_value < required_confluence:
             logger.info(decision_snapshot)
-            logger.info(f"❌ Skip: insufficient confluence → {confluence_value}/{required_confluence} required")
+            logger.info(f"❌ Skip: only {aligned_strategies}/{required_confluence} strategies aligned")
             return False
         required_confidence = 0.65
         if confidence_value < required_confidence:
             logger.info(decision_snapshot)
-            logger.info(f"❌ Skip: confidence {confidence_value:.2f} < required {required_confidence}")
+            logger.info(f"❌ Skip: confidence {confidence_value:.2f} < 0.65 required")
             return False
         ATR_LIMITS = {
             "XAUUSD": (30, 350),
