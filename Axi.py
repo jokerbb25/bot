@@ -39,6 +39,12 @@ from PyQt5 import QtCore, QtGui, QtWidgets
 from PyQt5.QtCore import QThread, pyqtSignal
 from aprendizaje import Aprendizaje
 from telegram_bot import BOT_ACTIVE, telegram_listener
+from engine.close import on_order_closed
+from engine.execute import execute_trade, price_to_pips
+from engine.state import BotState, trade_state
+from engine.trade_guard import can_trade_now
+from settings import RISK_CFG
+from utils.logwrap import skip
 
 # ===============================================================
 # CONFIG & CONSTANTS
@@ -123,54 +129,48 @@ def connect_axi(account_id: int, password: str, server: str) -> None:
     print("✅ Connected to Axi MT5")
 
 
-def execute_market_order(symbol: str, action: str, atr_value: float, lot_size: float = LOT_SIZE):
-    """
-    Executes a market order on MT5 (instant order).
-    SL/TP are dynamic based on ATR.
-    """
+def execute_market_order(
+    symbol: str,
+    action: str,
+    atr_value: float,
+    lot_size: float = LOT_SIZE,
+    confidence: Optional[float] = None,
+    atr_pips_hint: Optional[float] = None,
+):
+    """Send a market order while applying aggressive ATR-based risk controls."""
 
     symbol_info = mt5.symbol_info(symbol)
     if symbol_info is None:
         raise RuntimeError(f"Symbol {symbol} is not available in MT5")
-    point = float(getattr(symbol_info, "point", 0.0) or 0.0)
-    if point == 0.0:
-        raise RuntimeError(f"Invalid point size for {symbol}")
-
-    sl_distance = float(max(atr_value, 0.0)) * ATR_MULT_SL
-    tp_distance = float(max(atr_value, 0.0)) * ATR_MULT_TP
 
     tick = mt5.symbol_info_tick(symbol)
     if tick is None:
         raise RuntimeError(f"No tick data for {symbol}")
 
-    order_type = mt5.ORDER_TYPE_BUY if action == "CALL" else mt5.ORDER_TYPE_SELL
-    price = tick.ask if action == "CALL" else tick.bid
+    direction = "BUY" if action == "CALL" else "SELL"
+    entry_price = float(tick.ask if direction == "BUY" else tick.bid)
 
-    sl = price - sl_distance * point if action == "CALL" else price + sl_distance * point
-    tp = price + tp_distance * point if action == "CALL" else price - tp_distance * point
+    atr_pips_value = atr_pips_hint
+    if atr_pips_value is None:
+        try:
+            atr_pips_value = abs(price_to_pips(symbol, atr_value))
+        except Exception:
+            atr_pips_value = float(max(atr_value, 0.0))
+    atr_pips_value = max(float(atr_pips_value), float(RISK_CFG['sl_min_pips']))
 
-    order_request = {
-        "action": mt5.TRADE_ACTION_DEAL,
-        "symbol": symbol,
-        "volume": float(lot_size),
-        "type": order_type,
-        "price": price,
-        "sl": sl,
-        "tp": tp,
-        "magic": 202503,
-        "comment": "AXI AUTO TRADE",
-        "type_filling": mt5.ORDER_FILLING_IOC,
-        "type_time": mt5.ORDER_TIME_GTC,
-    }
-
-    result = mt5.order_send(order_request)
+    result = execute_trade(
+        symbol=symbol,
+        direction=direction,
+        lot=lot_size,
+        entry_price=entry_price,
+        atr_pips=atr_pips_value,
+        confidence=confidence,
+    )
 
     if result is None:
-        logger.error("❌ Order failed: No response from MT5")
+        logger.error("❌ Order failed: No response from trade executor")
         if BOT_ACTIVE:
-            telegram_send(
-                f"❌ ORDER FAILED\n{symbol}\nReason: No response from MT5"
-            )
+            telegram_send(f"❌ ORDER FAILED\n{symbol}\nReason: Busy or executor error")
         return None
 
     if result.retcode != mt5.TRADE_RETCODE_DONE:
@@ -185,7 +185,7 @@ def execute_market_order(symbol: str, action: str, atr_value: float, lot_size: f
         if BOT_ACTIVE:
             telegram_send(
                 "✅ MARKET ORDER EXECUTED\n"
-                f"{symbol}\nAction: {action}\nLot: {lot_size}\nSL/TP based on ATR"
+                f"{symbol}\nAction: {action}\nLot: {lot_size}\nATR-SL active"
             )
 
     return result
@@ -4663,6 +4663,7 @@ class TradingEngine:
         evaluation['stake'] = stake_amount
         ml_probability = float(evaluation.get('predicted_probability', 0.5))
         trade_initiated = False
+        operation_active = trade_state.get('state') == BotState.OPEN
         volatility_raw = evaluation.get('volatility')
         volatility_value: Optional[float] = None
         if volatility_raw is not None:
@@ -4681,10 +4682,10 @@ class TradingEngine:
         atr_pips_value = atr_in_pips(symbol_upper, recent_closes, recent_highs, recent_lows)
         min_pips, max_pips = ATR_WINDOWS.get(symbol_upper, DEFAULT_ATR_WINDOW)
         if not (min_pips <= atr_pips_value <= max_pips):
-            logging.info(
-                f"[{symbol_upper}] ❎ Skip: ATR {atr_pips_value:.1f} pips outside window {min_pips}-{max_pips} pips"
+            return skip(
+                "ATR_WINDOW",
+                f"symbol={symbol_upper} atr={atr_pips_value:.1f} range={min_pips}-{max_pips}",
             )
-            return False
         confidence_value = float(combined_confidence) if combined_confidence is not None else 0.0
         latest_rsi_value = float(evaluation.get('latest_rsi', 0.0))
         ema_spread_value = float(evaluation.get('ema_spread', 0.0))
@@ -4925,16 +4926,18 @@ class TradingEngine:
         self.last_volatility = current_vol_reference
         min_confidence = max(CONFIDENCE_MIN, min_confidence_for(symbol_upper, regime_value))
         if confidence_value < min_confidence:
-            logging.info(
-                f"[{symbol_upper}] ❎ Skip: confidence {confidence_value:.2f} < {min_confidence:.2f} @ {regime_value}"
+            return skip(
+                "LOW_CONF",
+                f"symbol={symbol_upper} conf={confidence_value:.2f} min={min_confidence:.2f}",
             )
-            return False
         # === GLOBAL CONFLUENCE RULE ===
         min_confluence = MIN_CONFLUENCE
         confluence_value = aligned_strategies
         if confluence_value < min_confluence:
-            logging.info(f"🚫 Trade skipped due to low confluence ({confluence_value}/{min_confluence})")
-            return False
+            return skip(
+                "NO_CONFLUENCE",
+                f"symbol={symbol_upper} aligned={confluence_value}/{min_confluence}",
+            )
         if STRICT_MODE_ENABLED:
             if (
                 NEUTRAL_RSI_BAND[0]
@@ -4942,28 +4945,20 @@ class TradingEngine:
                 <= NEUTRAL_RSI_BAND[1]
                 and confidence_value < NEUTRAL_RSI_CONF
             ):
-                logging.info(
-                    "🚫 Skipping trade — neutral RSI & insufficient confidence (modo estricto)."
-                )
-                return False
+                return skip("NEUTRAL_RSI", f"symbol={symbol_upper} conf={confidence_value:.2f}")
             now_ts = time.time()
             if self._post_loss_cooldown_until and now_ts < self._post_loss_cooldown_until:
                 remaining = self._post_loss_cooldown_until - now_ts
-                logging.info(
-                    f"⏳ Skipping trade — cooldown activo tras pérdida ({remaining:.0f}s restantes, modo estricto)."
-                )
-                return False
+                return skip("POST_LOSS_COOLDOWN", f"remaining={remaining:.0f}s")
             while self._trade_timestamps and now_ts - self._trade_timestamps[0] > 3600:
                 self._trade_timestamps.popleft()
             if len(self._trade_timestamps) >= MAX_TRADES_PER_HOUR:
-                logging.info("⛔ Máximo de operaciones por hora alcanzado (modo estricto).")
-                return False
+                return skip("MAX_HOURLY_TRADES", f"count={len(self._trade_timestamps)}")
         if combined_confidence is None:
-            logging.info("🚫 Trade skipped because final confidence was unavailable.")
-            return False
+            return skip("NO_CONFIDENCE", f"symbol={symbol_upper}")
         if not self.risk.can_trade(ai_confidence):
-            return False
-        if operation_active:
+            return skip("RISK_BLOCK", f"symbol={symbol_upper}")
+        if not can_trade_now():
             return False
         auto_learn.register_trade_context(
             symbol,
@@ -4989,7 +4984,14 @@ class TradingEngine:
         order_result = None
         try:
             if confidence_value >= execution_threshold:
-                order_result = execute_market_order(symbol, final_action, atr_value, LOT_SIZE)
+                order_result = execute_market_order(
+                    symbol,
+                    final_action,
+                    atr_value,
+                    LOT_SIZE,
+                    confidence=confidence_value,
+                    atr_pips_hint=atr_pips_value,
+                )
                 logger.info(
                     f"🚀 EXECUTED MARKET ORDER {symbol} → {final_action} | Confidence={confidence_value:.2f}"
                 )
@@ -5024,6 +5026,8 @@ class TradingEngine:
             if contract_id is not None and not self._register_processed_contract(contract_id):
                 logging.debug(f"Ticket #{contract_id} ya procesado, omitiendo duplicado de resultados")
                 return trade_initiated
+            if contract_id is not None:
+                on_order_closed(contract_id, trade_result, pnl)
             self.risk.register_trade(pnl)
             if features is not None:
                 self.ai.log_trade(features, 1 if trade_result == 'WIN' else 0)
