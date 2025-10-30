@@ -2,6 +2,7 @@ import sys
 import time
 import json
 import threading
+from threading import Lock
 import logging
 import warnings
 import csv
@@ -3060,6 +3061,8 @@ class TradingEngine:
         self._indicator_cache: Dict[str, Dict[str, Any]] = {symbol: {} for symbol in SYMBOLS}
         self._volatility_history: Dict[str, deque] = {symbol: deque(maxlen=5) for symbol in SYMBOLS}
         self._cycle_id_counter = 0
+        self._cycle_lock = Lock()
+        self._cycle_running = False
         self._last_regime_cycle = -1
         self._current_cycle_id = 0
         self._latest_regime_inputs: Dict[str, Any] = {}
@@ -4434,6 +4437,16 @@ class TradingEngine:
         return True
 
     def scan_market(self) -> None:
+        if not self._cycle_lock.acquire(blocking=False):
+            return
+        self._cycle_running = True
+        try:
+            self._scan_market_impl()
+        finally:
+            self._cycle_running = False
+            self._cycle_lock.release()
+
+    def _scan_market_impl(self) -> None:
         if not self.running.is_set():
             return
         if not BOT_ACTIVE:
@@ -4474,13 +4487,13 @@ class TradingEngine:
             if not self.running.is_set():
                 break
             if evaluation is None:
-                ui_bus.bridge.log_signal.emit(
+                self._log(
                     f"⚠️ No valid signal on {symbol}, moving to next symbol."
                 )
-                ui_bus.bridge.log_signal.emit(
+                self._log(
                     f"✅ Finished {symbol}, switching to next symbol."
                 )
-                ui_bus.bridge.log_signal.emit("➡️ Next symbol...")
+                self._log("➡️ Next symbol...")
                 self._log(f"✅ finished {symbol} total {time.time() - start_cycle:.3f}s\n")
                 QThread.msleep(1)
                 continue
@@ -4494,7 +4507,7 @@ class TradingEngine:
             else:
                 signal = evaluation.get('signal')
                 if signal not in {'CALL', 'PUT'}:
-                    ui_bus.bridge.log_signal.emit(
+                    self._log(
                         f"⚠️ No valid signal on {symbol}, moving to next symbol."
                     )
                 else:
@@ -4502,7 +4515,7 @@ class TradingEngine:
                     confidence_raw = evaluation.get('final_confidence')
                     confidence_value = float(confidence_raw) if confidence_raw is not None else 0.0
                     if not is_strong and confidence_value < min_required:
-                        ui_bus.bridge.log_signal.emit(
+                        self._log(
                             f"⚠️ Confidence too low for {symbol} ({confidence_value:.2f}) — skipping."
                         )
                     else:
@@ -4523,17 +4536,17 @@ class TradingEngine:
                         if self._execute_selected_trade(evaluation):
                             trade_executed = True
 
-            ui_bus.bridge.log_signal.emit(
+            self._log(
                 f"✅ Finished {symbol}, switching to next symbol."
             )
             self._log(f"✅ finished {symbol} total {time.time() - start_cycle:.3f}s\n")
             if time.time() - start_ts > 2.0:
-                ui_bus.bridge.log_signal.emit(
+                self._log(
                     f"⏱️ Timeout evaluating {symbol}, moving on."
                 )
             if trade_executed:
                 break
-            ui_bus.bridge.log_signal.emit("➡️ Next symbol...")
+            self._log("➡️ Next symbol...")
             QThread.msleep(1)
 
         if not self.running.is_set():
@@ -5416,6 +5429,7 @@ class BotWindow(QtWidgets.QWidget):
 
         self.bot_thread: Optional[QtCore.QThread] = None
         self.bot_worker: Optional[BotWorker] = None
+        self._worker_started = False
         self.latest_stats: Dict[str, float] = {
             "operations": 0.0,
             "wins": 0.0,
@@ -5820,6 +5834,9 @@ class BotWindow(QtWidgets.QWidget):
     def start_trading(self) -> None:
         if self.bot_thread is not None and self.bot_thread.isRunning():
             return
+        if self._worker_started:
+            return
+        self._worker_started = True
         self.auto_shutdown_active = False
         self.engine.auto_shutdown_triggered = False
         self.logged_contracts.clear()
@@ -5843,6 +5860,7 @@ class BotWindow(QtWidgets.QWidget):
             if self.bot_thread is not None and not self.bot_thread.isRunning():
                 self.bot_thread = None
             self.bot_worker = None
+            self._worker_started = False
             if self.auto_shutdown_active:
                 self.auto_shutdown_active = False
                 self.start_button.setEnabled(True)
@@ -5856,6 +5874,7 @@ class BotWindow(QtWidgets.QWidget):
         self.bot_thread.wait(2000)
         self.bot_thread = None
         self.bot_worker = None
+        self._worker_started = False
         self.start_button.setEnabled(True)
         self.stop_button.setEnabled(False)
         self.status_label.setText("Estado: Detenido")
@@ -6076,10 +6095,12 @@ class BotWindow(QtWidgets.QWidget):
 
     def _on_worker_finished(self) -> None:
         self.bot_worker = None
+        self._worker_started = False
 
     def _on_thread_finished(self) -> None:
         self.bot_thread = None
         self.bot_worker = None
+        self._worker_started = False
         if self.auto_shutdown_active:
             self.start_button.setEnabled(False)
             self.stop_button.setEnabled(True)
