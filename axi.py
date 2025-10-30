@@ -5229,7 +5229,7 @@ class BotThread(QThread):
             mensaje = f"✅ Ticket #{ticket} {resultado}"
         else:
             mensaje = f"✅ Ticket {resultado}"
-        self.log_signal.emit(mensaje)
+        self.log_signal.emit(str(mensaje))
         self.result_signal.emit(dict(data))
 
     def run(self) -> None:  # type: ignore[override]
@@ -5308,11 +5308,11 @@ class BotWindow(QtWidgets.QWidget):
         existing_handler = next((h for h in logger.handlers if isinstance(h, QtLogHandler)), None)
         if existing_handler is None:
             self.log_handler = QtLogHandler()
-            self.log_handler.emitter.message.connect(self._append_log)
+            self.log_handler.emitter.message.connect(self.append_log)
             logger.addHandler(self.log_handler)
         else:
             self.log_handler = existing_handler
-            self.log_handler.emitter.message.connect(self._append_log)
+            self.log_handler.emitter.message.connect(self.append_log)
 
         self.engine = TradingEngine()
         global global_engine
@@ -5739,7 +5739,7 @@ class BotWindow(QtWidgets.QWidget):
         self.pending_contracts.clear()
         self.bot_thread = BotThread(self.engine)
         self.bot_thread.finished.connect(self._on_thread_finished)
-        self.bot_thread.log_signal.connect(self._append_log)
+        self.bot_thread.log_signal.connect(self.append_log)
         self.bot_thread.result_signal.connect(self.update_result_table)
         self.bot_thread.start()
         self.start_button.setEnabled(False)
@@ -5989,7 +5989,7 @@ class BotWindow(QtWidgets.QWidget):
         self._on_trade_state("ready")
 
     def _dispatch_gui_status(self, message: str) -> None:
-        QtCore.QTimer.singleShot(0, lambda m=message: self._append_log(f"[STATUS] {m}"))
+        QtCore.QTimer.singleShot(0, lambda m=message: self.append_log(f"[STATUS] {m}"))
 
     def _dispatch_gui_open(self, payload: Dict[str, Any]) -> None:
         def handler(data=dict(payload)):
@@ -6005,7 +6005,7 @@ class BotWindow(QtWidgets.QWidget):
                 parts.append(f"entry={float(entry):.5f}")
             if isinstance(sl_pips, (int, float)):
                 parts.append(f"SL={int(sl_pips)}p")
-            self._append_log(" | ".join(parts))
+            self.append_log(" | ".join(parts))
         QtCore.QTimer.singleShot(0, handler)
 
     def _dispatch_gui_close(self, payload: Dict[str, Any]) -> None:
@@ -6016,11 +6016,11 @@ class BotWindow(QtWidgets.QWidget):
             parts = [f"[TRADE] CLOSE ticket={ticket} result={result}"]
             if isinstance(pnl, (int, float)):
                 parts.append(f"pnl={float(pnl):.2f}")
-            self._append_log(" | ".join(parts))
+            self.append_log(" | ".join(parts))
         QtCore.QTimer.singleShot(0, handler)
 
-    def _append_log(self, message: str) -> None:
-        self.log_view.appendPlainText(message)
+    def append_log(self, text: str) -> None:
+        self.log_view.appendPlainText(text)
 
     def _update_stats_labels(self, stats: Dict[str, float]) -> None:
         self.stats_values["Operaciones"].setText(str(int(stats.get("operations", 0.0))))
