@@ -4432,78 +4432,74 @@ class TradingEngine:
         for symbol in symbols:
             if not self.running.is_set():
                 break
-            symbol_processed = False
-            while True:
+            start_ts = time.time()
+            evaluation: Optional[Dict[str, Any]] = None
+            for _ in range(2):
                 if not self.running.is_set():
                     break
                 evaluation = self._evaluate_symbol(symbol)
-                if evaluation is None:
-                    symbol_processed = True
-                    ui_bus.bridge.log_signal.emit(
-                        f"⚠️ No valid signal on {symbol}, moving to next symbol."
-                    )
-                    QtWidgets.QApplication.processEvents()
+                if evaluation is not None:
                     break
-                evaluations_found = True
-                probability = float(evaluation.get('predicted_probability', 0.5))
-                evaluation['stake'] = self._calculate_kelly_stake(probability)
-                if evaluation.get('confluence_confirmed'):
-                    if self.confirm_and_execute(evaluation):
-                        trade_executed = True
-                        symbol_processed = True
-                        break
-
-                signal = evaluation.get('signal')
-                if signal not in {'CALL', 'PUT'}:
-                    symbol_processed = True
-                    ui_bus.bridge.log_signal.emit(
-                        f"⚠️ No valid signal on {symbol}, moving to next symbol."
-                    )
-                    QtWidgets.QApplication.processEvents()
-                    break
-
-                is_strong = int(evaluation.get('strong', 0)) == 1
-                confidence_raw = evaluation.get('final_confidence')
-                confidence_value = float(confidence_raw) if confidence_raw is not None else 0.0
-                if not is_strong and confidence_value < min_required:
-                    symbol_processed = True
-                    ui_bus.bridge.log_signal.emit(
-                        f"⚠️ Confidence too low for {symbol} ({confidence_value:.2f}) — skipping."
-                    )
-                    QtWidgets.QApplication.processEvents()
-                    break
-
-                volatility_value_raw = evaluation.get('volatility')
-                volatility_value: Optional[float] = None
-                if volatility_value_raw is not None:
-                    try:
-                        volatility_value = float(volatility_value_raw)
-                    except (TypeError, ValueError):
-                        volatility_value = None
-                volatility_display = f"{volatility_value:.4f}" if volatility_value is not None else "N/A"
-                logging.info(
-                    f"📊 Final confidence {symbol}: {confidence_value:.2f} | Volatility: {volatility_display} | Action: {signal}"
-                )
-
-                logging.info(
-                    f"🚀 Executing trade on {symbol} | Confidence={confidence_value:.2f}"
-                )
-                if self._execute_selected_trade(evaluation):
-                    trade_executed = True
-                symbol_processed = True
-                break
-
             if not self.running.is_set():
                 break
-            if symbol_processed:
+            if evaluation is None:
+                ui_bus.bridge.log_signal.emit(
+                    f"⚠️ No valid signal on {symbol}, moving to next symbol."
+                )
                 ui_bus.bridge.log_signal.emit(
                     f"✅ Finished {symbol}, switching to next symbol."
                 )
-                QtWidgets.QApplication.processEvents()
-                if trade_executed:
-                    break
                 ui_bus.bridge.log_signal.emit("➡️ Next symbol...")
                 continue
+
+            evaluations_found = True
+            probability = float(evaluation.get('predicted_probability', 0.5))
+            evaluation['stake'] = self._calculate_kelly_stake(probability)
+
+            if evaluation.get('confluence_confirmed') and self.confirm_and_execute(evaluation):
+                trade_executed = True
+            else:
+                signal = evaluation.get('signal')
+                if signal not in {'CALL', 'PUT'}:
+                    ui_bus.bridge.log_signal.emit(
+                        f"⚠️ No valid signal on {symbol}, moving to next symbol."
+                    )
+                else:
+                    is_strong = int(evaluation.get('strong', 0)) == 1
+                    confidence_raw = evaluation.get('final_confidence')
+                    confidence_value = float(confidence_raw) if confidence_raw is not None else 0.0
+                    if not is_strong and confidence_value < min_required:
+                        ui_bus.bridge.log_signal.emit(
+                            f"⚠️ Confidence too low for {symbol} ({confidence_value:.2f}) — skipping."
+                        )
+                    else:
+                        volatility_value_raw = evaluation.get('volatility')
+                        volatility_value: Optional[float] = None
+                        if volatility_value_raw is not None:
+                            try:
+                                volatility_value = float(volatility_value_raw)
+                            except (TypeError, ValueError):
+                                volatility_value = None
+                        volatility_display = f"{volatility_value:.4f}" if volatility_value is not None else "N/A"
+                        logging.info(
+                            f"📊 Final confidence {symbol}: {confidence_value:.2f} | Volatility: {volatility_display} | Action: {signal}"
+                        )
+                        logging.info(
+                            f"🚀 Executing trade on {symbol} | Confidence={confidence_value:.2f}"
+                        )
+                        if self._execute_selected_trade(evaluation):
+                            trade_executed = True
+
+            ui_bus.bridge.log_signal.emit(
+                f"✅ Finished {symbol}, switching to next symbol."
+            )
+            if time.time() - start_ts > 2.0:
+                ui_bus.bridge.log_signal.emit(
+                    f"⏱️ Timeout evaluating {symbol}, moving on."
+                )
+            if trade_executed:
+                break
+            ui_bus.bridge.log_signal.emit("➡️ Next symbol...")
 
         if not self.running.is_set():
             _cycle_pause()
@@ -5301,9 +5297,7 @@ class BotWorker(QtCore.QObject):
                         self.log_signal.emit(f"❌ Worker error: {exc}")
                     except Exception:
                         logging.debug("Failed to emit worker error", exc_info=True)
-                    QtWidgets.QApplication.processEvents()
                     break
-                QtWidgets.QApplication.processEvents()
                 elapsed = time.time() - start_time
                 if elapsed > CYCLE_TIMEOUT:
                     logging.warning(f"⚠️ Cycle timeout ({elapsed:.2f}s) — forcing next iteration")
