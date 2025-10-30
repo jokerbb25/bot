@@ -12,5 +12,5 @@ def skip(reason_code: str, details: str = "") -> None:
     if details:
         message = f"{message} | {details}"
     logger.info(message)
-    gui.push_status(message)
+    gui.bridge.log_signal.emit(message)
     return None
