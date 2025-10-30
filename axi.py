@@ -6020,9 +6020,9 @@ class BotWindow(QtWidgets.QWidget):
         QtCore.QTimer.singleShot(0, handler)
 
     @pyqtSlot(str)
-    def append_log(self, text: str) -> None:
+    def append_log(self, message: str):
         try:
-            self.log_view.appendPlainText(text)
+            self.log_view.appendPlainText(message)
         except Exception:
             pass
 
