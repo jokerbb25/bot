@@ -3123,6 +3123,14 @@ class TradingEngine:
         self.last_volatility: float = 0.0
         self.failed_candle_count = 0
 
+    def _log(self, message: str) -> None:
+        logging.info(message)
+        try:
+            ui_bus.bridge.log_signal.emit(message)
+        except Exception:
+            logging.debug('Failed to emit log message', exc_info=True)
+
+
     def add_trade_listener(self, callback: Callable[[TradeRecord, Dict[str, float]], None]) -> None:
         self._trade_listeners.append(callback)
 
@@ -3664,9 +3672,12 @@ class TradingEngine:
         stake = 0.0
         try:
             failed_candle_count = getattr(self, "failed_candle_count", 0)
+            t_candles = time.time()
             try:
                 candles = fetch_axi_candle_objects(symbol)
             except Exception as exc:
+                elapsed_candles = time.time() - t_candles
+                self._log(f"⏱️ MT5.copy_rates took {elapsed_candles:.3f}s for {symbol} (error)")
                 logging.warning(f"⚠️ Candle fetch error on {symbol}: {exc}")
                 self.failed_candle_count = failed_candle_count + 1
                 # logging.error("❌ 4 consecutive candle fetch errors — triggering safe restart")
@@ -3681,6 +3692,8 @@ class TradingEngine:
                 # time.sleep(2)
                 # safe_restart_windows()
                 return None
+            elapsed_candles = time.time() - t_candles
+            self._log(f"⏱️ MT5.copy_rates took {elapsed_candles:.3f}s for {symbol}")
             self.failed_candle_count = 0
             if not candles:
                 logging.warning(f"Sin velas disponibles para {symbol}, se omite del ciclo")
@@ -3758,16 +3771,25 @@ class TradingEngine:
                 ema_corto_valor = float(cache.get('ema_fast', 0.0))
                 ema_largo_valor = float(cache.get('ema_slow', 0.0))
                 boll_width = float(cache.get('boll_width', 0.0))
-                ema_prev_fast = float(cache.get('ema_fast_prev', ema_corto_valor))
+                ema_prev_fast = float(cache.get('ema_fast_prev', cache.get('ema_fast', 0.0)))
+                self._log("   RSI done in 0.000s (cache)")
+                self._log("   EMA done in 0.000s (cache)")
+                self._log("   Bollinger done in 0.000s (cache)")
             else:
+                t_rsi = time.time()
                 latest_rsi_series = rsi(df['close'])
                 latest_rsi = float(latest_rsi_series.iloc[-1]) if not latest_rsi_series.empty else 0.0
+                self._log(f"   RSI done in {time.time() - t_rsi:.3f}s")
+                t_ema = time.time()
                 ema_fast_series = ema(df['close'], 9) if len(df) else pd.Series(dtype=float)
                 ema_slow_series = ema(df['close'], 21) if len(df) else pd.Series(dtype=float)
                 ema_corto_valor = float(ema_fast_series.iloc[-1]) if not ema_fast_series.empty else 0.0
                 ema_largo_valor = float(ema_slow_series.iloc[-1]) if not ema_slow_series.empty else 0.0
+                self._log(f"   EMA done in {time.time() - t_ema:.3f}s")
+                t_boll = time.time()
                 bandas_inferior, bandas_superior = bollinger_bands(df['close'])
                 boll_width = float(bandas_superior.iloc[-1] - bandas_inferior.iloc[-1]) if len(bandas_superior) else 0.0
+                self._log(f"   Bollinger done in {time.time() - t_boll:.3f}s")
                 ema_prev_fast = float(cache.get('ema_fast', ema_corto_valor))
                 cache.update({
                     'epoch': last_epoch,
@@ -3777,6 +3799,7 @@ class TradingEngine:
                     'ema_slow': ema_largo_valor,
                     'boll_width': boll_width,
                 })
+
             ema_slope = ema_corto_valor - ema_prev_fast
             cache['ema_fast_prev'] = ema_corto_valor
             cache['ema_fast'] = ema_corto_valor
@@ -3791,8 +3814,12 @@ class TradingEngine:
             historial_vol = self._volatility_history.setdefault(symbol, deque(maxlen=5))
             historial_vol.append(volatilidad_actual)
             smoothed_volatility = float(sum(historial_vol) / len(historial_vol)) if historial_vol else volatilidad_actual
+            t_adx = time.time()
             adx_value = auto_learn.calculate_adx(symbol, df['high'].values, df['low'].values, df['close'].values)
+            self._log(f"   ADX done in {time.time() - t_adx:.3f}s")
+            t_macd = time.time()
             macd_value = auto_learn.calculate_macd(df['close'].values)
+            self._log(f"   MACD done in {time.time() - t_macd:.3f}s")
             rsi_signal = next((out.signal for name, out in results if name == 'RSI'), 'NONE')
             ema_signal = next((out.signal for name, out in results if name == 'EMA Trend'), 'NONE')
             bollinger_result = next(
@@ -4419,6 +4446,8 @@ class TradingEngine:
             return
         self._cycle_id_counter += 1
         self._current_cycle_id = self._cycle_id_counter
+        start_cycle = time.time()
+        self._log(f"⏳ start cycle @ {start_cycle}")
         trade_executed = False
         symbols = list(SYMBOLS)
         def _cycle_pause(delay: float = 0.5) -> None:
@@ -4452,6 +4481,7 @@ class TradingEngine:
                     f"✅ Finished {symbol}, switching to next symbol."
                 )
                 ui_bus.bridge.log_signal.emit("➡️ Next symbol...")
+                self._log(f"✅ finished {symbol} total {time.time() - start_cycle:.3f}s\n")
                 QThread.msleep(1)
                 continue
 
@@ -4496,6 +4526,7 @@ class TradingEngine:
             ui_bus.bridge.log_signal.emit(
                 f"✅ Finished {symbol}, switching to next symbol."
             )
+            self._log(f"✅ finished {symbol} total {time.time() - start_cycle:.3f}s\n")
             if time.time() - start_ts > 2.0:
                 ui_bus.bridge.log_signal.emit(
                     f"⏱️ Timeout evaluating {symbol}, moving on."
