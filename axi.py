@@ -36,7 +36,7 @@ except ImportError:  # pragma: no cover
     gp_minimize = None  # type: ignore
 
 from PyQt5 import QtCore, QtGui, QtWidgets
-from PyQt5.QtCore import pyqtSignal, pyqtSlot
+from PyQt5.QtCore import QThread, pyqtSignal, pyqtSlot
 from aprendizaje import Aprendizaje
 from telegram_bot import BOT_ACTIVE, telegram_listener
 import gui
@@ -4430,6 +4430,8 @@ class TradingEngine:
         min_required = auto_learn.get_min_confidence()
 
         for symbol in symbols:
+            # ✅ prevent UI starvation
+            time.sleep(0.001)
             if not self.running.is_set():
                 break
             start_ts = time.time()
@@ -4450,6 +4452,7 @@ class TradingEngine:
                     f"✅ Finished {symbol}, switching to next symbol."
                 )
                 ui_bus.bridge.log_signal.emit("➡️ Next symbol...")
+                QThread.msleep(1)
                 continue
 
             evaluations_found = True
@@ -4500,6 +4503,7 @@ class TradingEngine:
             if trade_executed:
                 break
             ui_bus.bridge.log_signal.emit("➡️ Next symbol...")
+            QThread.msleep(1)
 
         if not self.running.is_set():
             _cycle_pause()
