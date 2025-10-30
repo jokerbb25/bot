@@ -36,7 +36,7 @@ except ImportError:  # pragma: no cover
     gp_minimize = None  # type: ignore
 
 from PyQt5 import QtCore, QtGui, QtWidgets
-from PyQt5.QtCore import QThread, pyqtSignal
+from PyQt5.QtCore import QThread, pyqtSignal, pyqtSlot
 from aprendizaje import Aprendizaje
 from telegram_bot import BOT_ACTIVE, telegram_listener
 import gui
@@ -5739,7 +5739,7 @@ class BotWindow(QtWidgets.QWidget):
         self.pending_contracts.clear()
         self.bot_thread = BotThread(self.engine)
         self.bot_thread.finished.connect(self._on_thread_finished)
-        self.bot_thread.log_signal.connect(self.append_log)
+        self.bot_thread.log_signal.connect(self.append_log, QtCore.Qt.QueuedConnection)
         self.bot_thread.result_signal.connect(self.update_result_table)
         self.bot_thread.start()
         self.start_button.setEnabled(False)
@@ -6019,8 +6019,12 @@ class BotWindow(QtWidgets.QWidget):
             self.append_log(" | ".join(parts))
         QtCore.QTimer.singleShot(0, handler)
 
+    @pyqtSlot(str)
     def append_log(self, text: str) -> None:
-        self.log_view.appendPlainText(text)
+        try:
+            self.log_view.appendPlainText(text)
+        except Exception:
+            pass
 
     def _update_stats_labels(self, stats: Dict[str, float]) -> None:
         self.stats_values["Operaciones"].setText(str(int(stats.get("operations", 0.0))))
