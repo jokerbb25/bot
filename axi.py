@@ -198,10 +198,9 @@ def get_candles(symbol: str, timeframe: int = mt5.TIMEFRAME_M1, count: int = 100
         rates = mt5.copy_rates_from_pos(resolved, timeframe, 0, count)
     except Exception as exc:
         logging.debug(f"Failed to retrieve candles for {symbol}: {exc}")
-        return []
-    if not rates:
-        logging.warning(f"No candles for {symbol}")
-        return []
+        raise RuntimeError(f"MT5 candle fetch failed: {exc}") from exc
+    if rates is None or len(rates) == 0:
+        raise RuntimeError("No candles received from MT5")
     return [
         {
             "time": rate["time"],
@@ -3664,30 +3663,25 @@ class TradingEngine:
         confidence = 0.0
         stake = 0.0
         try:
+            failed_candle_count = getattr(self, "failed_candle_count", 0)
             try:
                 candles = fetch_axi_candle_objects(symbol)
             except Exception as exc:
-                logging.warning(f"Error al obtener velas de {symbol}: {exc}")
-                candles = []
-            candle_data = candles
-            failed_candle_count = getattr(self, "failed_candle_count", 0)
-            if not candle_data or "Error" in str(candle_data):
+                logging.warning(f"⚠️ Candle fetch error on {symbol}: {exc}")
                 self.failed_candle_count = failed_candle_count + 1
-            else:
-                self.failed_candle_count = 0
-            if self.failed_candle_count >= 4:
-                logging.error("❌ 4 consecutive candle fetch errors — triggering safe restart")
-                try:
-                    self.save_learning_data()
-                    self.save_learning_memory()
-                    send_telegram_message(
-                        "⚠️ Error de conexión detectado en los 4 símbolos.\n♻️ Reinicio automático del bot ejecutado correctamente."
-                    )
-                except Exception as e:
-                    logging.error(f"Error during pre-restart saving: {e}")
-
-                time.sleep(2)
-                safe_restart_windows()
+                # logging.error("❌ 4 consecutive candle fetch errors — triggering safe restart")
+                # try:
+                #     self.save_learning_data()
+                #     self.save_learning_memory()
+                #     send_telegram_message(
+                #         "⚠️ Error de conexión detectado en los 4 símbolos.\n♻️ Reinicio automático del bot ejecutado correctamente."
+                #     )
+                # except Exception as e:
+                #     logging.error(f"Error during pre-restart saving: {e}")
+                # time.sleep(2)
+                # safe_restart_windows()
+                return None
+            self.failed_candle_count = 0
             if not candles:
                 logging.warning(f"Sin velas disponibles para {symbol}, se omite del ciclo")
                 return None
