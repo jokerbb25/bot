@@ -40,6 +40,7 @@ from PyQt5.QtCore import QThread, pyqtSignal, pyqtSlot
 from aprendizaje import Aprendizaje
 from telegram_bot import BOT_ACTIVE, telegram_listener
 import gui
+import ui_bus
 from engine.close import on_order_closed
 from engine.execute import maybe_execute, price_to_pips
 from engine.state import BotState, position_lock, trade_state
@@ -5298,6 +5299,8 @@ class BotWindow(QtWidgets.QWidget):
         self.log_view = QtWidgets.QPlainTextEdit()
         self.log_view.setReadOnly(True)
 
+        ui_bus.bridge.log_signal.connect(self.append_log, type=QtCore.Qt.QueuedConnection)
+
         self.bridge = EngineBridge()
         self.bridge.trade.connect(self._on_trade)
         self.bridge.status.connect(self._on_status)
@@ -5321,7 +5324,6 @@ class BotWindow(QtWidgets.QWidget):
         self.engine.add_status_listener(lambda status: self.bridge.status.emit(status))
         self.engine.add_summary_listener(lambda symbol, data: self.bridge.summary.emit(symbol, data))
         self.engine.add_trade_state_listener(lambda state: self.bridge.trade_state.emit(state))
-        gui.register_status_callback(self._dispatch_gui_status)
         gui.register_open_callback(self._dispatch_gui_open)
         gui.register_close_callback(self._dispatch_gui_close)
         self.strategy_initial_state = self._load_strategy_config()
