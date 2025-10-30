@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from typing import Optional, Tuple
+from typing import List, Optional, Tuple
 
 import metatrader5 as mt5
 
@@ -11,7 +11,7 @@ import gui
 from engine.state import BotState, position_lock, trade_state
 from risk.sl_calc import compute_sl_pips
 from settings import RISK_CFG
-from utils.logwrap import skip
+from ui_bus import bridge
 
 logger = logging.getLogger(__name__)
 
@@ -224,13 +224,33 @@ def maybe_execute(
     entry_price: float,
     confidence: Optional[float],
 ) -> Tuple[Optional[object], Optional[int]]:
+    log_buffer: List[str] = []
+
+    def _finalize(result: Optional[object], ticket: Optional[int]) -> Tuple[Optional[object], Optional[int]]:
+        conf_value = confidence if confidence is not None else 0.0
+        summary = " | ".join(log_buffer) if log_buffer else "OK"
+        if bridge is not None:
+            try:
+                bridge.log_signal.emit(
+                    f"[{symbol}] conf={conf_value:.2f} | action={action} | {summary}"
+                )
+            except Exception:
+                logger.debug("Failed to emit evaluation summary", exc_info=True)
+        return result, ticket
+
     if action not in ("BUY", "SELL"):
-        skip("NO_ACTION", f"symbol={symbol}")
-        return None, None
+        log_buffer.append(f"SKIPPED_NO_ACTION symbol={symbol}")
+        return _finalize(None, None)
     if not can_trade_now():
-        return None, None
+        log_buffer.append("SKIPPED_CAN_TRADE_NOW")
+        return _finalize(None, None)
     with position_lock:
         if has_open_with_magic(symbol, trade_state["magic"]):
-            gui.push_status("BUSY_OPEN_TRADE")
-            return None, None
-    return execute_trade(symbol, action, lot, entry_price, atr_pips, confidence)
+            log_buffer.append("BUSY_OPEN_TRADE")
+            return _finalize(None, None)
+    result, ticket = execute_trade(symbol, action, lot, entry_price, atr_pips, confidence)
+    if result is None or ticket is None:
+        log_buffer.append("ORDER_REJECTED")
+    else:
+        log_buffer.append(f"ORDER_PLACED ticket={ticket}")
+    return _finalize(result, ticket)
