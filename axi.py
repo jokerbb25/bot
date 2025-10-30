@@ -82,6 +82,7 @@ POST_LOSS_COOLDOWN_SEC = 120
 MAX_TRADES_PER_HOUR = 20
 KEEP_WIN_MIN_CONF = 0.70
 MAINTENANCE_EVERY = 50
+CYCLE_TIMEOUT = 15  # increased from 4 to prevent forced timeout
 
 # === TELEGRAM BOT CONFIGURATION ===
 TELEGRAM_TOKEN = "8300367826:AAGzaMCJRY6pzZEqzjqgzAaRUXC_19KcB60"
@@ -5129,7 +5130,7 @@ class TradingEngine:
                 if not self.running.is_set():
                     break
                 elapsed = time.time() - cycle_start
-                if elapsed > 3.0:
+                if elapsed > CYCLE_TIMEOUT:
                     logging.warning(f"⚠️ Cycle timeout ({elapsed:.2f}s) — forcing next iteration")
                 QtCore.QThread.msleep(100)
         finally:
@@ -5253,7 +5254,7 @@ class BotThread(QThread):
                     logging.error(f"Thread error: {exc}")
                     break
                 elapsed = time.time() - start_time
-                if elapsed > 3.0:
+                if elapsed > CYCLE_TIMEOUT:
                     logging.warning(f"⚠️ Cycle timeout ({elapsed:.2f}s) — forcing next iteration")
                 if not self._active or not self.engine.is_running():
                     break
