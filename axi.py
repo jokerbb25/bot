@@ -6020,16 +6020,7 @@ class BotWindow(QtWidgets.QWidget):
         QtCore.QTimer.singleShot(0, handler)
 
     def _append_log(self, message: str) -> None:
-        try:
-            if hasattr(self, "log_view") and self.log_view:
-                self.log_view.appendPlainText(message)
-                self.log_view.verticalScrollBar().setValue(
-                    self.log_view.verticalScrollBar().maximum()
-                )
-            else:
-                print(message)
-        except Exception as exc:
-            print(f"[LogError] {exc}: {message}")
+        self.log_view.appendPlainText(message)
 
     def _update_stats_labels(self, stats: Dict[str, float]) -> None:
         self.stats_values["Operaciones"].setText(str(int(stats.get("operations", 0.0))))
