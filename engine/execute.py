@@ -3,7 +3,7 @@ from __future__ import annotations
 import logging
 import threading
 import time
-from typing import List, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 import metatrader5 as mt5
 
@@ -16,20 +16,66 @@ from ui_bus import bridge
 logger = logging.getLogger(__name__)
 
 
+_SYMBOL_CACHE: Dict[str, str] = {}
+
+
+def resolve_symbol(symbol_name: str) -> str:
+    base = str(symbol_name or "")
+    cached = _SYMBOL_CACHE.get(base)
+    if cached:
+        return cached
+    try:
+        available = mt5.symbols_get()
+    except Exception:
+        available = None
+    resolved = base
+    if available:
+        target = base.upper()
+        direct_match = next(
+            (
+                str(getattr(entry, "name", "") or "")
+                for entry in available
+                if str(getattr(entry, "name", "") or "").upper() == target
+            ),
+            None,
+        )
+        if direct_match:
+            resolved = direct_match
+        else:
+            partial_match = next(
+                (
+                    str(getattr(entry, "name", "") or "")
+                    for entry in available
+                    if target in str(getattr(entry, "name", "") or "").upper()
+                ),
+                None,
+            )
+            if partial_match:
+                resolved = partial_match
+    _SYMBOL_CACHE[base] = resolved
+    if resolved != base:
+        logger.info("Resolved symbol %s -> %s", base, resolved)
+    return resolved
+
+
 def mt5_positions():
     positions = mt5.positions_get()
     return positions or ()
 
 
 def has_open_with_magic(symbol: str, magic: int) -> bool:
+    resolved = resolve_symbol(symbol)
     for position in mt5_positions():
-        if getattr(position, "symbol", None) == symbol and getattr(position, "magic", None) == magic:
+        name = getattr(position, "symbol", None)
+        if name not in {symbol, resolved}:
+            continue
+        if getattr(position, "magic", None) == magic:
             return True
     return False
 
 
 def _pip_size(symbol: str) -> float:
-    info = mt5.symbol_info(symbol)
+    info = mt5.symbol_info(resolve_symbol(symbol))
     if info is None:
         return 0.0
     point = float(getattr(info, "point", 0.0) or 0.0)
@@ -56,14 +102,16 @@ def price_to_pips(symbol: str, price_delta: float) -> float:
 
 
 def get_bid(symbol: str) -> float:
-    tick = mt5.symbol_info_tick(symbol)
+    mt5_symbol = resolve_symbol(symbol)
+    tick = mt5.symbol_info_tick(mt5_symbol)
     if tick is None:
         raise RuntimeError(f"No tick data for {symbol}")
     return float(getattr(tick, "bid", 0.0))
 
 
 def get_ask(symbol: str) -> float:
-    tick = mt5.symbol_info_tick(symbol)
+    mt5_symbol = resolve_symbol(symbol)
+    tick = mt5.symbol_info_tick(mt5_symbol)
     if tick is None:
         raise RuntimeError(f"No tick data for {symbol}")
     return float(getattr(tick, "ask", 0.0))
@@ -77,11 +125,13 @@ def mt5_send_order(
     tp_price: Optional[float],
     magic: int,
 ) -> Optional[object]:
+    mt5_symbol = resolve_symbol(symbol)
+    mt5.symbol_select(mt5_symbol, True)
     order_type = mt5.ORDER_TYPE_BUY if direction == "BUY" else mt5.ORDER_TYPE_SELL
     price = get_ask(symbol) if direction == "BUY" else get_bid(symbol)
     request = {
         "action": mt5.TRADE_ACTION_DEAL,
-        "symbol": symbol,
+        "symbol": mt5_symbol,
         "volume": float(lot),
         "type": order_type,
         "price": price,

@@ -36,13 +36,13 @@ except ImportError:  # pragma: no cover
     gp_minimize = None  # type: ignore
 
 from PyQt5 import QtCore, QtGui, QtWidgets
-from PyQt5.QtCore import QThread, pyqtSignal, pyqtSlot
+from PyQt5.QtCore import pyqtSignal, pyqtSlot
 from aprendizaje import Aprendizaje
 from telegram_bot import BOT_ACTIVE, telegram_listener
 import gui
 import ui_bus
 from engine.close import on_order_closed
-from engine.execute import maybe_execute, price_to_pips
+from engine.execute import maybe_execute, price_to_pips, resolve_symbol
 from engine.state import BotState, position_lock, trade_state
 from utils.logwrap import skip
 
@@ -120,11 +120,13 @@ def connect_axi(account_id: int, password: str, server: str) -> None:
 def execute_market_order(symbol: str, action: str, atr_value: float, lot_size: float = LOT_SIZE, confidence: Optional[float] = None) -> Tuple[Any, Optional[float]]:
     """Execute a market order on MT5 using ATR-based dynamic stops and SLP."""
 
-    symbol_info = mt5.symbol_info(symbol)
+    mt5_symbol = resolve_symbol(symbol)
+    mt5.symbol_select(mt5_symbol, True)
+    symbol_info = mt5.symbol_info(mt5_symbol)
     if symbol_info is None:
         raise RuntimeError(f"Symbol {symbol} is not available in MT5")
 
-    tick = mt5.symbol_info_tick(symbol)
+    tick = mt5.symbol_info_tick(mt5_symbol)
     if tick is None:
         raise RuntimeError(f"No tick data for {symbol}")
 
@@ -191,9 +193,14 @@ def execute_market_order(symbol: str, action: str, atr_value: float, lot_size: f
 
 
 def get_candles(symbol: str, timeframe: int = mt5.TIMEFRAME_M1, count: int = 100) -> List[Dict[str, Any]]:
-    rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, count)
-    if rates is None or len(rates) == 0:
-        print(f"[WARN] No candles for {symbol}")
+    resolved = resolve_symbol(symbol)
+    try:
+        rates = mt5.copy_rates_from_pos(resolved, timeframe, 0, count)
+    except Exception as exc:
+        logging.debug(f"Failed to retrieve candles for {symbol}: {exc}")
+        return []
+    if not rates:
+        logging.warning(f"No candles for {symbol}")
         return []
     return [
         {
@@ -3379,6 +3386,12 @@ class TradingEngine:
         self._notify_status("running")
         operation_active = False
         self._notify_trade_state("ready")
+        for base_symbol in SYMBOLS:
+            resolved_symbol = resolve_symbol(base_symbol)
+            try:
+                mt5.symbol_select(resolved_symbol, True)
+            except Exception:
+                logging.debug(f"Failed to select symbol {resolved_symbol}")
         with self._processed_lock:
             self._processed_contracts.clear()
         with self._closed_lock:
@@ -4408,15 +4421,16 @@ class TradingEngine:
             return
         now = time.time()
         if now < self._next_cycle_time:
-            QtWidgets.QApplication.processEvents(QtCore.QEventLoop.AllEvents, 50)
+            time.sleep(0.05)
             return
         self._cycle_id_counter += 1
         self._current_cycle_id = self._cycle_id_counter
         trade_executed = False
         symbols = list(SYMBOLS)
         def _cycle_pause(delay: float = 0.5) -> None:
-            QtWidgets.QApplication.processEvents(QtCore.QEventLoop.AllEvents, 50)
             self._next_cycle_time = time.time() + delay
+            if delay > 0:
+                time.sleep(min(delay, 0.5))
 
         evaluations_found = False
         min_required = auto_learn.get_min_confidence()
@@ -4781,7 +4795,9 @@ class TradingEngine:
             fallback_atr = compute_atr_for_symbol(symbol)
             if fallback_atr > 0.0:
                 atr_value = fallback_atr
-        symbol_info = mt5.symbol_info(symbol)
+        resolved_symbol = resolve_symbol(symbol)
+        mt5.symbol_select(resolved_symbol, True)
+        symbol_info = mt5.symbol_info(resolved_symbol)
         if symbol_info is None:
             logger.error(f"[{symbol}] ❌ Cannot get symbol info")
             return False
@@ -5132,7 +5148,7 @@ class TradingEngine:
                 elapsed = time.time() - cycle_start
                 if elapsed > CYCLE_TIMEOUT:
                     logging.warning(f"⚠️ Cycle timeout ({elapsed:.2f}s) — forcing next iteration")
-                QtCore.QThread.msleep(100)
+                time.sleep(0.1)
         finally:
             self.stop()
 
@@ -5194,18 +5210,18 @@ class QtLogHandler(logging.Handler):
         self.emitter.message.emit(message)
 
 
-class BotThread(QThread):
+class BotWorker(QtCore.QObject):
     log_signal = pyqtSignal(str)
     result_signal = pyqtSignal(dict)
+    finished = pyqtSignal()
 
     def __init__(self, engine: TradingEngine) -> None:
         super().__init__()
         self.engine = engine
-        self._active = True
+        self._active = False
         self._closed_contracts: Set[int] = set()
         self.logged_contracts: Set[int] = set()
         self._result_callback = self._handle_trade_result
-        self.engine.add_result_listener(self._result_callback)
 
     def _normalize_contract_id(self, value: Any) -> Optional[int]:
         if value is None:
@@ -5234,18 +5250,20 @@ class BotThread(QThread):
         self.log_signal.emit(str(mensaje))
         self.result_signal.emit(dict(data))
 
-    def run(self) -> None:  # type: ignore[override]
-        logging.info("🚀 BotThread started successfully.")
+    @pyqtSlot()
+    def run(self) -> None:
+        logging.info("🚀 BotWorker started successfully.")
         self._active = True
         self._closed_contracts.clear()
         self.logged_contracts.clear()
+        self.engine.add_result_listener(self._result_callback)
         try:
-            self.engine.start_engine()
-        except Exception as exc:
-            logging.error(f"Thread error: {exc}")
-            self._active = False
-            return
-        try:
+            try:
+                self.engine.start_engine()
+            except Exception as exc:
+                logging.error(f"Thread error: {exc}")
+                self._active = False
+                return
             while self._active and self.engine.is_running():
                 start_time = time.time()
                 try:
@@ -5258,17 +5276,20 @@ class BotThread(QThread):
                     logging.warning(f"⚠️ Cycle timeout ({elapsed:.2f}s) — forcing next iteration")
                 if not self._active or not self.engine.is_running():
                     break
-                QThread.msleep(100)
+                time.sleep(0.1)
         finally:
-            self.engine.stop()
-            self.engine.remove_result_listener(self._result_callback)
-            logging.info("🧩 BotThread stopped.")
-            self._active = False
+            try:
+                self.engine.stop()
+            finally:
+                self.engine.remove_result_listener(self._result_callback)
+                logging.info("🧩 BotWorker stopped.")
+                self._active = False
+                self.finished.emit()
 
+    @pyqtSlot()
     def stop(self) -> None:
         self._active = False
         self.engine.stop()
-        self.engine.remove_result_listener(self._result_callback)
         self._closed_contracts.clear()
         self.logged_contracts.clear()
 
@@ -5331,7 +5352,8 @@ class BotWindow(QtWidgets.QWidget):
         for name, enabled in self.strategy_initial_state.items():
             self.engine.set_strategy_state(name, enabled)
 
-        self.bot_thread: Optional[BotThread] = None
+        self.bot_thread: Optional[QtCore.QThread] = None
+        self.bot_worker: Optional[BotWorker] = None
         self.latest_stats: Dict[str, float] = {
             "operations": 0.0,
             "wins": 0.0,
@@ -5740,17 +5762,25 @@ class BotWindow(QtWidgets.QWidget):
         self.engine.auto_shutdown_triggered = False
         self.logged_contracts.clear()
         self.pending_contracts.clear()
-        self.bot_thread = BotThread(self.engine)
+        self.bot_thread = QtCore.QThread()
+        self.bot_worker = BotWorker(self.engine)
+        self.bot_worker.moveToThread(self.bot_thread)
+        self.bot_worker.log_signal.connect(self.append_log, QtCore.Qt.QueuedConnection)
+        self.bot_worker.result_signal.connect(self.update_result_table)
+        self.bot_worker.finished.connect(self.bot_thread.quit)
+        self.bot_worker.finished.connect(self._on_worker_finished)
+        self.bot_thread.started.connect(self.bot_worker.run)
         self.bot_thread.finished.connect(self._on_thread_finished)
-        self.bot_thread.log_signal.connect(self.append_log, QtCore.Qt.QueuedConnection)
-        self.bot_thread.result_signal.connect(self.update_result_table)
         self.bot_thread.start()
         self.start_button.setEnabled(False)
         self.stop_button.setEnabled(True)
         self.status_label.setText("Estado: Iniciando...")
 
     def stop_trading(self) -> None:
-        if self.bot_thread is None:
+        if self.bot_thread is None or not self.bot_thread.isRunning():
+            if self.bot_thread is not None and not self.bot_thread.isRunning():
+                self.bot_thread = None
+            self.bot_worker = None
             if self.auto_shutdown_active:
                 self.auto_shutdown_active = False
                 self.start_button.setEnabled(True)
@@ -5758,9 +5788,12 @@ class BotWindow(QtWidgets.QWidget):
                 self.status_label.setText("Estado: Detenido")
                 self._on_trade_state("ready")
             return
-        self.bot_thread.stop()
+        if self.bot_worker is not None:
+            self.bot_worker.stop()
+        self.bot_thread.quit()
         self.bot_thread.wait(2000)
         self.bot_thread = None
+        self.bot_worker = None
         self.start_button.setEnabled(True)
         self.stop_button.setEnabled(False)
         self.status_label.setText("Estado: Detenido")
@@ -5979,8 +6012,12 @@ class BotWindow(QtWidgets.QWidget):
         if hasattr(self, "trade_state_label"):
             self.trade_state_label.setText(texto)
 
+    def _on_worker_finished(self) -> None:
+        self.bot_worker = None
+
     def _on_thread_finished(self) -> None:
         self.bot_thread = None
+        self.bot_worker = None
         if self.auto_shutdown_active:
             self.start_button.setEnabled(False)
             self.stop_button.setEnabled(True)
@@ -6201,8 +6238,12 @@ class BotWindow(QtWidgets.QWidget):
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # type: ignore[override]
         if self.bot_thread is not None and self.bot_thread.isRunning():
-            self.bot_thread.stop()
+            if self.bot_worker is not None:
+                self.bot_worker.stop()
+            self.bot_thread.quit()
             self.bot_thread.wait(2000)
+            self.bot_thread = None
+            self.bot_worker = None
         logging.getLogger().removeHandler(self.log_handler)
         super().closeEvent(event)
 
