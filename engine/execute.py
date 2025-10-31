@@ -1,9 +1,8 @@
 from __future__ import annotations
 
 import logging
-import threading
 import time
-from typing import Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 import metatrader5 as mt5
 
@@ -17,6 +16,28 @@ logger = logging.getLogger(__name__)
 
 
 _SYMBOL_CACHE: Dict[str, str] = {}
+
+_SLP_STATE: Dict[str, Any] = {
+    "ticket": None,
+    "guard_until": 0.0,
+    "last_sl": None,
+    "armed": False,
+    "symbol": None,
+    "direction": None,
+}
+
+
+def reset_slp_state() -> None:
+    _SLP_STATE.update(
+        {
+            "ticket": None,
+            "guard_until": 0.0,
+            "last_sl": None,
+            "armed": False,
+            "symbol": None,
+            "direction": None,
+        }
+    )
 
 
 def resolve_symbol(symbol_name: str) -> str:
@@ -220,50 +241,73 @@ def execute_trade(
     gui.mark_open(symbol, direction, confidence=confidence, entry=entry_price, sl_pips=sl_pips)
     gui.push_status(f"TRADE_OPEN_{symbol}_{direction}")
     if RISK_CFG.get("slp_enable"):
-        watcher = threading.Thread(target=_slp_watcher, args=(ticket,), daemon=True)
-        watcher.start()
+        reset_slp_state()
+        _SLP_STATE.update(
+            {
+                "ticket": ticket,
+                "guard_until": time.time() + RISK_CFG.get("sl_time_guard_seconds", 0),
+                "last_sl": None,
+                "armed": False,
+                "symbol": symbol,
+                "direction": direction,
+            }
+        )
     return result, ticket
 
 
-def _slp_watcher(ticket: int) -> None:
+def slp_tick() -> None:
+    if not RISK_CFG.get("slp_enable"):
+        return
+    with position_lock:
+        ticket = trade_state.get("ticket")
+        state = trade_state.get("state")
+        if ticket is None or state != BotState.OPEN:
+            if _SLP_STATE["ticket"] is not None:
+                reset_slp_state()
+            return
+        symbol = trade_state.get("symbol")
+        direction = trade_state.get("direction")
+        entry = trade_state.get("entry_price")
+        open_time = trade_state.get("open_time") or time.time()
+        _SLP_STATE["ticket"] = ticket
+        _SLP_STATE["symbol"] = symbol
+        _SLP_STATE["direction"] = direction
+    if symbol is None or direction is None or entry is None:
+        return
     arm = RISK_CFG.get("slp_arm_after_pips", 0)
     be_offset = RISK_CFG.get("slp_be_offset_pips", 0)
     trail_distance = RISK_CFG.get("slp_trail_distance_pips", 0)
-    armed = False
-    last_sl: Optional[float] = None
-    guard_until = 0.0
-    while True:
-        with position_lock:
-            if trade_state.get("ticket") != ticket or trade_state.get("state") != BotState.OPEN:
-                return
-            symbol = trade_state["symbol"]
-            direction = trade_state["direction"]
-            entry = trade_state["entry_price"]
-            open_time = trade_state.get("open_time") or time.time()
-            guard_until = open_time + RISK_CFG.get("sl_time_guard_seconds", 0)
+    guard_until = max(float(open_time) + RISK_CFG.get("sl_time_guard_seconds", 0), float(_SLP_STATE.get("guard_until", 0.0) or 0.0))
+    _SLP_STATE["guard_until"] = guard_until
+    try:
         price = get_bid(symbol) if direction == "SELL" else get_ask(symbol)
+    except Exception:
+        return
+    if direction == "BUY":
+        pnl_pips = price_to_pips(symbol, price - entry)
+    else:
+        pnl_pips = price_to_pips(symbol, entry - price)
+    now = time.time()
+    armed = bool(_SLP_STATE.get("armed"))
+    last_sl = _SLP_STATE.get("last_sl")
+    if not armed and pnl_pips >= arm and now >= guard_until:
+        be_price = entry + pips_to_price(symbol, be_offset) if direction == "BUY" else entry - pips_to_price(symbol, be_offset)
+        if mt5_modify_sl(ticket, be_price):
+            _SLP_STATE.update({"last_sl": be_price, "armed": True})
+            gui.push_status(f"SLP_ARMED_BE({arm}p ➜ +{be_offset}p)")
+            logger.info("SLP: moved to BE+offset")
+        armed = bool(_SLP_STATE.get("armed"))
+        last_sl = _SLP_STATE.get("last_sl")
+    if armed:
+        desired_sl = price - pips_to_price(symbol, trail_distance) if direction == "BUY" else price + pips_to_price(symbol, trail_distance)
+        should_update = False
         if direction == "BUY":
-            pnl_pips = price_to_pips(symbol, price - entry)
+            should_update = last_sl is None or desired_sl > float(last_sl)
         else:
-            pnl_pips = price_to_pips(symbol, entry - price)
-        now = time.time()
-        if not armed and pnl_pips >= arm and now >= guard_until:
-            be_price = entry + pips_to_price(symbol, be_offset) if direction == "BUY" else entry - pips_to_price(symbol, be_offset)
-            if mt5_modify_sl(ticket, be_price):
-                last_sl = be_price
-                armed = True
-                gui.push_status(f"SLP_ARMED_BE({arm}p ➜ +{be_offset}p)")
-                logger.info("SLP: moved to BE+offset")
-        if armed:
-            desired_sl = price - pips_to_price(symbol, trail_distance) if direction == "BUY" else price + pips_to_price(symbol, trail_distance)
-            if direction == "BUY":
-                should_update = last_sl is None or desired_sl > last_sl
-            else:
-                should_update = last_sl is None or desired_sl < last_sl
-            if should_update and mt5_modify_sl(ticket, desired_sl):
-                last_sl = desired_sl
-                gui.push_status(f"SLP_TRAIL({trail_distance}p)")
-        time.sleep(0.25)
+            should_update = last_sl is None or desired_sl < float(last_sl)
+        if should_update and mt5_modify_sl(ticket, desired_sl):
+            _SLP_STATE["last_sl"] = desired_sl
+            gui.push_status(f"SLP_TRAIL({trail_distance}p)")
 
 
 def maybe_execute(

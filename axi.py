@@ -11,7 +11,6 @@ import shutil
 import os
 import subprocess
 from collections import defaultdict, deque
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -39,11 +38,10 @@ except ImportError:  # pragma: no cover
 from PyQt5 import QtCore, QtGui, QtWidgets
 from PyQt5.QtCore import QThread, pyqtSignal, pyqtSlot
 from aprendizaje import Aprendizaje
-from telegram_bot import BOT_ACTIVE, telegram_listener
 import gui
 import ui_bus
 from engine.close import on_order_closed
-from engine.execute import maybe_execute, price_to_pips, resolve_symbol
+from engine.execute import maybe_execute, price_to_pips, resolve_symbol, slp_tick
 from engine.state import BotState, position_lock, trade_state
 from utils.logwrap import skip
 
@@ -88,6 +86,9 @@ CYCLE_TIMEOUT = 15  # increased from 4 to prevent forced timeout
 # === TELEGRAM BOT CONFIGURATION ===
 TELEGRAM_TOKEN = "8300367826:AAGzaMCJRY6pzZEqzjqgzAaRUXC_19KcB60"
 TELEGRAM_CHAT_ID = "8364256476"
+
+BOT_ACTIVE = True
+BOT_WORKER_STARTED = False
 
 AI_ENABLED = True
 AI_PASSIVE_MODE = True
@@ -645,62 +646,62 @@ def update_stats_persist(win: bool) -> None:
 global_engine = None
 
 
-def telegram_bot() -> None:
-    global BOT_ACTIVE, global_engine
-    logging.info("🤖 Bot de Telegram activo y escuchando comandos...")
+class TelegramController:
+    def __init__(self, token: str, chat_id: str) -> None:
+        self.token = token
+        self.chat_id = chat_id
+        self.offset: Optional[int] = None
+        self.enabled = bool(token)
 
-    def _send_text(text: str) -> None:
-        send_telegram_message(text)
-
-    offset: Optional[int] = None
-    while True:
+    def poll(self, engine: "TradingEngine") -> None:
+        if not self.enabled:
+            return
+        params: Dict[str, Any] = {"timeout": 0, "limit": 25}
+        if self.offset is not None:
+            params["offset"] = self.offset
         try:
-            params: Dict[str, Any] = {"timeout": 10}
-            if offset is not None:
-                params["offset"] = offset
             response = requests.get(
-                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
+                f"https://api.telegram.org/bot{self.token}/getUpdates",
                 params=params,
-                timeout=15,
+                timeout=5,
             )
             payload = response.json()
-            if not payload.get("ok"):
-                time.sleep(5)
-                continue
-            for update in payload.get("result", []):
-                offset = update.get("update_id", 0) + 1
-                message = (update.get("message") or {}).get("text", "")
-                if not message:
-                    continue
-                command = message.lower()
-                if any(keyword in command for keyword in ("pause", "stop", "pausar")):
-                    BOT_ACTIVE = False
-                    _send_text("⏸ Bot detenido manualmente.")
-                elif any(keyword in command for keyword in ("resume", "start", "reanudar")):
-                    BOT_ACTIVE = True
-                    _send_text("▶️ Bot reanudado.")
-                elif any(keyword in command for keyword in ("status", "estado")):
-                    engine_ref = global_engine
-                    if engine_ref is not None:
-                        precision = engine_ref.get_accuracy()
-                        operations = engine_ref.total_operations
-                        _send_text(
-                            f"📊 Precisión: {precision:.2f}%\nOperaciones: {int(operations)}"
-                        )
-                    else:
-                        _send_text("ℹ️ Motor no disponible todavía.")
-                elif any(keyword in command for keyword in ("help", "ayuda")):
-                    _send_text("🧠 Comandos:\n- pausar\n- reanudar\n- estado\n- info")
-                elif "info" in command:
-                    engine_ref = global_engine
-                    if engine_ref is not None:
-                        _send_text(f"📄 Último ticket: {engine_ref.get_last_contract_info()}")
-                    else:
-                        _send_text("ℹ️ No hay información de tickets disponible.")
         except Exception as exc:
-            logging.error(f"❌ Telegram bot error: {exc}")
-            time.sleep(5)
-        time.sleep(3)
+            logging.error(f"❌ Telegram poll error: {exc}")
+            return
+        if not payload.get("ok"):
+            return
+        for update in payload.get("result", []):
+            self.offset = update.get("update_id", 0) + 1
+            message = (update.get("message") or {}).get("text", "") or ""
+            if not message:
+                continue
+            self._handle_command(message.lower(), engine)
+
+    def _handle_command(self, command: str, engine: "TradingEngine") -> None:
+        global BOT_ACTIVE
+        if any(keyword in command for keyword in ("pause", "stop", "pausar")):
+            BOT_ACTIVE = False
+            send_telegram_message("⏸ Bot detenido manualmente.")
+            return
+        if any(keyword in command for keyword in ("resume", "start", "reanudar")):
+            BOT_ACTIVE = True
+            send_telegram_message("▶️ Bot reanudado.")
+            return
+        if any(keyword in command for keyword in ("status", "estado")):
+            precision = engine.get_accuracy()
+            operations = engine.total_operations
+            send_telegram_message(
+                f"📊 Precisión: {precision:.2f}%\nOperaciones: {int(operations)}"
+            )
+            return
+        if any(keyword in command for keyword in ("help", "ayuda")):
+            send_telegram_message("🧠 Comandos:\n- pausar\n- reanudar\n- estado\n- info")
+            return
+        if "info" in command:
+            send_telegram_message(
+                f"📄 Último ticket: {engine.get_last_contract_info()}"
+            )
 
 
 # ===============================================================
@@ -915,7 +916,7 @@ class auto_learning:
         self.model_lock = threading.Lock()
         self.bias_lock = threading.Lock()
         self.memory_lock = threading.Lock()
-        self.executor = ThreadPoolExecutor(max_workers=2)
+        self.executor = None
         self.asset_stats: Dict[str, Dict[str, int]] = defaultdict(lambda: {"wins": 0, "total": 0})
         self.global_totals = {"wins": 0, "total": 0}
         self.last_trades: deque = deque(maxlen=50)
@@ -959,7 +960,7 @@ class auto_learning:
         self.reinforce_batches = 0
         self.optimize_batches = 0
         self.learning_event = threading.Event()
-        self.learning_thread: Optional[threading.Thread] = None
+        self.learning_thread = None
         self._pending_context: Dict[str, Dict[str, float]] = {}
         self.symbol_profiles: Dict[str, Dict[str, Any]] = {
             symbol: self._default_symbol_profile() for symbol in SYMBOLS
@@ -969,6 +970,9 @@ class auto_learning:
         self._current_symbol: Optional[str] = None
         self._ensure_csv()
         self._load_bias_storage()
+
+    def _run_task(self, func: Callable[..., None], *args: Any, **kwargs: Any) -> None:
+        func(*args, **kwargs)
     def _ensure_csv(self) -> None:
         if self.csv_path.exists():
             return
@@ -1007,19 +1011,7 @@ class auto_learning:
             save_biases(self.biases)
 
     def start_background_services(self) -> None:
-        if self.learning_thread is None or not self.learning_thread.is_alive():
-            self.learning_thread = threading.Thread(
-                target=self._learning_loop,
-                daemon=True,
-            )
-            self.learning_thread.start()
-        if self._telegram_thread is None or not self._telegram_thread.is_alive():
-            self._telegram_thread = threading.Thread(
-                target=telegram_listener,
-                args=(self,),
-                daemon=True,
-            )
-            self._telegram_thread.start()
+        return
 
     def _default_symbol_profile(self) -> Dict[str, Any]:
         return {
@@ -1185,7 +1177,7 @@ class auto_learning:
             else:
                 batch = None
         if batch:
-            self.executor.submit(self.process_batch, batch)
+            self._run_task(self.process_batch, batch)
 
     def process_batch(self, entries: Optional[List[Tuple[str, str, str, float, str]]] = None) -> None:
         if entries is None:
@@ -1420,7 +1412,7 @@ class auto_learning:
         volatility_value: float,
         price_change: float,
     ) -> None:
-        self.executor.submit(
+        self._run_task(
             self._update_history_sync,
             result,
             asset,
@@ -1556,7 +1548,7 @@ class auto_learning:
         except Exception as exc:  # pragma: no cover
             logging.debug(f"No se pudo registrar historial de autoaprendizaje: {exc}")
         if should_train:
-            self.executor.submit(self._train_model)
+            self._run_task(self._train_model)
         total_trades = self.global_totals['total']
         if total_trades and total_trades % 150 == 0:
             accuracy = self.global_totals['wins'] / max(1, total_trades)
@@ -1798,7 +1790,7 @@ class auto_learning:
             if trigger_optimize:
                 self.optimize_batches = optimize_batches
         if trigger_reinforce or trigger_optimize:
-            self.executor.submit(self._run_periodic_learning, trigger_optimize)
+            self._run_task(self._run_periodic_learning, trigger_optimize)
 
     def _run_periodic_learning(self, optimize: bool) -> None:
         try:
@@ -2097,7 +2089,7 @@ class auto_learning:
         return resumen
 
     def reset_history(self) -> None:
-        self.executor.submit(self._reset_history_sync)
+        self._run_task(self._reset_history_sync)
 
     def _reset_history_sync(self) -> None:
         with self.lock:
@@ -2746,10 +2738,9 @@ class AdaptiveAIManager:
         self.bias: float = 0.0
         self.learning_rate = 0.05
         self.learning_decay = 0.999
-        self.stop_event = threading.Event()
-        self.offline_thread = threading.Thread(target=self._advisory_loop, daemon=True)
+        self.offline_thread = None
+        self._next_advisory_check = time.time()
         self._load_state()
-        self.offline_thread.start()
 
     def _phase(self) -> str:
         if self.trade_counter >= AI_AUTONOMOUS_THRESHOLD and self.accuracy() >= AI_AUTONOMOUS_ACCURACY:
@@ -2824,30 +2815,29 @@ class AdaptiveAIManager:
             return min(0.98, technical_conf * 0.8 + ai_prob * 0.2)
         return min(0.98, 0.5 + (ai_prob - 0.5) * 0.8)
 
-    def _advisory_loop(self) -> None:
+    def advisory_tick(self) -> None:
         interval = max(30, ADVISORY_INTERVAL_SEC)
-        while not self.stop_event.is_set():
-            try:
-                acc = self.accuracy() * 100
-                phase = self._phase()
-                phase_text = {
-                    "passive": "pasiva",
-                    "semi-active": "semi-activa",
-                    "autonomous": "autónoma",
-                }.get(phase, phase)
-                logging.info(
-                    f"📊 Aviso IA → fase={phase_text} precisión={acc:.2f}% operaciones={self.trade_counter}"
-                )
-                self._train_model()
-            except Exception as exc:  # pragma: no cover
-                logging.error(exc)
-            if self.stop_event.wait(interval):
-                break
+        now = time.time()
+        if now < self._next_advisory_check:
+            return
+        self._next_advisory_check = now + interval
+        try:
+            acc = self.accuracy() * 100
+            phase = self._phase()
+            phase_text = {
+                "passive": "pasiva",
+                "semi-active": "semi-activa",
+                "autonomous": "autónoma",
+            }.get(phase, phase)
+            logging.info(
+                f"📊 Aviso IA → fase={phase_text} precisión={acc:.2f}% operaciones={self.trade_counter}"
+            )
+            self._train_model()
+        except Exception as exc:  # pragma: no cover
+            logging.error(exc)
 
     def shutdown(self) -> None:
-        self.stop_event.set()
-        if self.offline_thread.is_alive():
-            self.offline_thread.join(timeout=1.0)
+        return
 
     def _ensure_weight_dim(self, dim: int) -> None:
         with self.lock:
@@ -3121,8 +3111,8 @@ class TradingEngine:
             send_telegram_message(startup_message)
         except Exception:
             logging.debug("No se pudo notificar la carga de memoria de aprendizaje")
-        self._telegram_thread: Optional[threading.Thread] = None
-        self.telegram_bot = telegram_bot
+        self.telegram_controller = TelegramController(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID)
+        self._telegram_started = False
         self.last_volatility: float = 0.0
         self.failed_candle_count = 0
 
@@ -3336,19 +3326,7 @@ class TradingEngine:
         self._persist_learning_memory()
 
     def start_background_services(self) -> None:
-        try:
-            if hasattr(self, "telegram_bot") and callable(self.telegram_bot):
-                if self._telegram_thread is None or not self._telegram_thread.is_alive():
-                    self._telegram_thread = threading.Thread(
-                        target=self.telegram_bot,
-                        daemon=True,
-                    )
-                    self._telegram_thread.start()
-                    logging.info("📨 Telegram bot service started in background.")
-            else:
-                logging.info("ℹ️ Telegram bot not configured in this version.")
-        except Exception as exc:
-            logging.error(f"❌ Error starting background services: {exc}")
+        return
 
     def save_learning_data(self) -> None:
         try:
@@ -3392,6 +3370,9 @@ class TradingEngine:
         self._notify_status("running")
         operation_active = False
         self._notify_trade_state("ready")
+        if self.telegram_controller.enabled and not self._telegram_started:
+            self._telegram_started = True
+            logging.info("📨 Telegram polling enabled on main worker thread.")
         for base_symbol in SYMBOLS:
             resolved_symbol = resolve_symbol(base_symbol)
             try:
@@ -4433,6 +4414,7 @@ class TradingEngine:
         return True
 
     def scan_market(self) -> None:
+        logging.warning(f"🔍 scan_market() CALLED — Thread={threading.get_ident()}")
         if not self._cycle_lock.acquire(blocking=False):
             return
         self._cycle_running = True
@@ -4445,6 +4427,10 @@ class TradingEngine:
     def _scan_market_impl(self) -> None:
         if not self.running.is_set():
             return
+        if self._telegram_started:
+            self.telegram_controller.poll(self)
+        self.ai.advisory_tick()
+        slp_tick()
         if not BOT_ACTIVE:
             logging.info("⏸ Bot paused — waiting for Telegram resume command.")
             time.sleep(5)
@@ -5205,22 +5191,8 @@ class TradingEngine:
         return trade_initiated
 
     def run_unused_do_not_call(self) -> None:
-        """[DEPRECATED] This method is intentionally unused to avoid running multiple market loops.
-        Use BotWorker.run() for the active trading loop.
-        """
-        self.start_engine()
-        try:
-            while self.running.is_set():
-                cycle_start = time.time()
-                self.scan_market()
-                if not self.running.is_set():
-                    break
-                elapsed = time.time() - cycle_start
-                if elapsed > CYCLE_TIMEOUT:
-                    logging.warning(f"⚠️ Cycle timeout ({elapsed:.2f}s) — forcing next iteration")
-                time.sleep(0.1)
-        finally:
-            self.stop()
+        """[DEPRECATED] BotWorker drives the trading cycle."""
+        return
 
     def stop(self) -> None:
         global operation_active
@@ -5228,6 +5200,7 @@ class TradingEngine:
         operation_active = False
         self.active_trade_symbol = None
         self._notify_trade_state("ready")
+        self._telegram_started = False
         self.ai.shutdown()
         try:
             mt5.shutdown()
@@ -5841,6 +5814,10 @@ class BotWindow(QtWidgets.QWidget):
             engine.set_learning_enabled(enabled)
 
     def start_trading(self) -> None:
+        global BOT_WORKER_STARTED
+        if BOT_WORKER_STARTED:
+            logging.warning("🚫 Global guard: BotWorker already started.")
+            return
         if hasattr(self, "worker") and self.worker is not None and self.worker.isRunning():
             logging.warning("🚫 Worker already running — second worker creation blocked.")
             return
@@ -5855,6 +5832,7 @@ class BotWindow(QtWidgets.QWidget):
         self.worker.result_signal.connect(self.update_result_table)
         self.worker.finished.connect(self._on_worker_finished)
         self.worker.start()
+        BOT_WORKER_STARTED = True
         self.start_button.setEnabled(False)
         self.stop_button.setEnabled(True)
         self.status_label.setText("Estado: Iniciando...")
@@ -5864,6 +5842,8 @@ class BotWindow(QtWidgets.QWidget):
         if worker is None or not worker.isRunning():
             self.worker = None
             self._worker_started = False
+            global BOT_WORKER_STARTED
+            BOT_WORKER_STARTED = False
             if self.auto_shutdown_active:
                 self.auto_shutdown_active = False
                 self.start_button.setEnabled(True)
@@ -5878,6 +5858,7 @@ class BotWindow(QtWidgets.QWidget):
         logging.warning("🛑 BotWorker stopped cleanly.")
         self.worker = None
         self._worker_started = False
+        BOT_WORKER_STARTED = False
         self.start_button.setEnabled(True)
         self.stop_button.setEnabled(False)
         self.status_label.setText("Estado: Detenido")
@@ -6100,6 +6081,8 @@ class BotWindow(QtWidgets.QWidget):
     def _on_worker_finished(self) -> None:
         self.worker = None
         self._worker_started = False
+        global BOT_WORKER_STARTED
+        BOT_WORKER_STARTED = False
         if self.auto_shutdown_active:
             self.start_button.setEnabled(False)
             self.stop_button.setEnabled(True)
@@ -6328,6 +6311,8 @@ class BotWindow(QtWidgets.QWidget):
             logging.warning("🛑 BotWorker stopped cleanly.")
         self.worker = None
         self._worker_started = False
+        global BOT_WORKER_STARTED
+        BOT_WORKER_STARTED = False
         logging.getLogger().removeHandler(self.log_handler)
         super().closeEvent(event)
 
