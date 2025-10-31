@@ -45,7 +45,8 @@ class BotAxiGUI(QWidget):
     QWidget {
         background-color: #0B0F19;   /* BotAxi dark */
         color: #E2E8F0;
-        font: 12pt 'Consolas';   /* SAME FONT + SIZE AS OLD BOT */
+        font-size: 12px;
+        font-family: 'Consolas', 'Segoe UI', 'Roboto';
     }
 
     /* Tab bar — BotAxi blue and compact height */
@@ -56,11 +57,13 @@ class BotAxiGUI(QWidget):
     QTabBar::tab {
         background: #0F172A;         /* dark slate */
         color: #E2E8F0;
-        padding: 6px 16px;
+        padding: 10px 22px;
         margin-right: 2px;
         height: 28px;
+        min-width: 120px;
         border-radius: 6px;
         font-weight: 600;
+        font-size: 13px;
     }
     QTabBar::tab:selected {
         background: #1599FF;         /* BotAxi light blue */
@@ -72,8 +75,8 @@ class BotAxiGUI(QWidget):
         background-color: #1599FF;
         padding: 6px 12px;
         border-radius: 6px;
-        font-size: 10px;
-        min-width: 80px; min-height: 28px;
+        font-size: 13px;
+        min-width: 110px; min-height: 36px;
     }
     QPushButton#start { background-color: #10B981; }  /* green */
     QPushButton#stop  { background-color: #EF4444; }  /* red   */
@@ -82,14 +85,14 @@ class BotAxiGUI(QWidget):
     QTableWidget {
         background-color: #0F172A;
         gridline-color: #1E293B;
-        font-size: 10px;
+        font-size: 12px;
     }
     QHeaderView::section {
         background-color: #1599FF;
         color: white;
-        padding: 4px 6px;
+        padding: 6px 8px;
         border: 0px;
-        font-size: 10px;
+        font-size: 13px;
     }
 
     /* Inputs */
@@ -98,15 +101,15 @@ class BotAxiGUI(QWidget):
         border: 1px solid #1F2937;
         padding: 2px 6px;
         border-radius: 4px;
-        font-size: 10px;
-        min-height: 22px;
+        font-size: 12px;
+        min-height: 26px;
     }
 
     /* Logs + progress */
     QTextEdit {
         background-color: #0F172A;
         border: 1px solid #1E293B;
-        font-size: 10px;
+        font-size: 12px;
     }
     QProgressBar {
         border: 1px solid #1F2937;
@@ -125,10 +128,10 @@ class BotAxiGUI(QWidget):
 
         self.start_button = QPushButton("Start")
         self.start_button.setObjectName("start")
-        self.start_button.setFixedSize(80, 28)
+        self.start_button.setMinimumSize(110, 36)
         self.stop_button = QPushButton("Stop")
         self.stop_button.setObjectName("stop")
-        self.stop_button.setFixedSize(80, 28)
+        self.stop_button.setMinimumSize(110, 36)
         self.stop_button.setEnabled(False)
 
         self.status_label = QLabel("Estado: Idle")
@@ -159,9 +162,11 @@ class BotAxiGUI(QWidget):
         self.tp_label = QLabel("TP (pips)")
 
         self.confidence_label = QLabel("Confianza: 0% (Dirección: NONE)")
+        self.confidence_label.setStyleSheet("font-size: 14px; font-weight: bold;")
         self.confidence_bar = QProgressBar()
         self.confidence_bar.setRange(0, 100)
         self.confidence_bar.setValue(0)
+        self.confidence_bar.setMinimumHeight(26)
 
         self.trade_table = QTableWidget(0, 7)
         self.trade_table.setHorizontalHeaderLabels([
@@ -183,9 +188,12 @@ class BotAxiGUI(QWidget):
         self.trade_table.setSelectionBehavior(QAbstractItemView.SelectRows)
         self.trade_table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.trade_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.trade_table.setMinimumHeight(260)
 
         self.log_view = QTextEdit()
         self.log_view.setReadOnly(True)
+        self.log_view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
+        self.log_view.setMinimumHeight(220)
 
         self.trades_label = QLabel("Operaciones: 0")
         self.wins_label = QLabel("Ganadas: 0")
@@ -248,34 +256,27 @@ class BotAxiGUI(QWidget):
         header_layout.setSpacing(12)
         header_layout.addWidget(self.start_button)
         header_layout.addWidget(self.stop_button)
-        header_layout.addStretch(1)
+        header_layout.addStretch()
         header_layout.addWidget(self.status_label)
         header_layout.addWidget(self.ai_label)
         header_layout.addWidget(self.mode_label)
 
-        second_row = QHBoxLayout()
-        second_row.setSpacing(16)
-        amount_layout = QVBoxLayout()
-        amount_label = QLabel("Operation Amount")
-        amount_layout.addWidget(amount_label)
-        amount_layout.addWidget(self.amount_spin)
-        second_row.addLayout(amount_layout)
-
-        sltp_layout = QVBoxLayout()
-        mode_layout = QHBoxLayout()
-        mode_layout.addWidget(QLabel("SL/TP Mode"))
-        mode_layout.addWidget(self.sl_tp_mode_combo)
-        sltp_layout.addLayout(mode_layout)
-
-        values_layout = QGridLayout()
-        values_layout.addWidget(self.sl_label, 0, 0)
-        values_layout.addWidget(self.sl_spin, 0, 1)
-        values_layout.addWidget(self.tp_label, 1, 0)
-        values_layout.addWidget(self.tp_spin, 1, 1)
-        sltp_layout.addLayout(values_layout)
-        sltp_layout.addWidget(self.apply_pending_check)
-        second_row.addLayout(sltp_layout)
-        second_row.addStretch(1)
+        config_grid = QGridLayout()
+        config_grid.setHorizontalSpacing(18)
+        config_grid.setVerticalSpacing(10)
+        operation_label = QLabel("Operation Amount")
+        config_grid.addWidget(operation_label, 0, 0)
+        config_grid.addWidget(self.amount_spin, 1, 0)
+        mode_caption = QLabel("SL/TP Mode")
+        config_grid.addWidget(mode_caption, 0, 1)
+        config_grid.addWidget(self.sl_tp_mode_combo, 1, 1)
+        config_grid.addWidget(self.sl_label, 2, 1)
+        config_grid.addWidget(self.sl_spin, 3, 1)
+        config_grid.addWidget(self.tp_label, 4, 1)
+        config_grid.addWidget(self.tp_spin, 5, 1)
+        config_grid.addWidget(self.apply_pending_check, 6, 1)
+        config_grid.setColumnStretch(0, 1)
+        config_grid.setColumnStretch(1, 1)
 
         performance_layout = QHBoxLayout()
         performance_layout.setSpacing(16)
@@ -287,7 +288,7 @@ class BotAxiGUI(QWidget):
         performance_layout.addStretch(1)
 
         layout.addLayout(header_layout)
-        layout.addLayout(second_row)
+        layout.addLayout(config_grid)
         layout.addWidget(self.confidence_label)
         layout.addWidget(self.confidence_bar)
         layout.addLayout(performance_layout)
