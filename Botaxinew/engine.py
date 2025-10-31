@@ -4,19 +4,19 @@ import threading
 import time
 from datetime import datetime
 from pathlib import Path
-from typing import Any, Callable, Dict, List, Optional
+from typing import Any, Callable, Dict, List, Optional, Tuple
 
 import MetaTrader5 as mt5
 import pandas as pd
 import yaml
 
-from utils.indicators import evaluate_indicators
+from utils.indicators import calc_atr, evaluate_indicators
 from utils.logger import Logger
 from utils.learning import LearningMemory
 
 try:
     import requests
-except Exception:  # pragma: no cover - optional dependency
+except Exception:  # pragma: no cover
     requests = None
 
 
@@ -41,7 +41,7 @@ class BotEngine:
         self.order_callback = order_callback
         self.stats_callback = stats_callback
 
-        self.stop_event = threading.Event()
+        self.running = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self._thread_lock = threading.Lock()
         self.cycle_lock = threading.Lock()
@@ -53,7 +53,7 @@ class BotEngine:
         self.focus_symbol: Optional[str] = None
 
         self.timeframe = self._resolve_timeframe(self.config.get("timeframe", "M1"))
-        self.poll_interval = int(self.config.get("poll_interval", 5))
+        self.poll_interval = float(self.config.get("poll_interval", 1.0))
         self.history_bars = int(self.config.get("history_bars", 500))
 
         risk_config = self.config.get("risk", {})
@@ -63,7 +63,13 @@ class BotEngine:
         confidence_cfg = self.config.get("confidence", {})
         self.base_confidence = float(confidence_cfg.get("base_confidence", 0.7))
         self.lower_confidence = float(confidence_cfg.get("lower_confidence", 0.6))
-        self.memory_boost = float(confidence_cfg.get("memory_boost", 0.1))
+        self.memory_boost = float(confidence_cfg.get("memory_boost", 0.05))
+
+        self.sl_tp_mode = "Fixed pips"
+        self.sl_value = 7.5
+        self.tp_value = 15.0
+        self.apply_sl_tp_on_pending = True
+        self._apply_sl_tp_config_defaults()
 
         self.memory = LearningMemory(self.memory_path)
         self.strategy_flags: Dict[str, bool] = {
@@ -76,6 +82,7 @@ class BotEngine:
 
         self.last_operation_timestamp = 0.0
         self.trade_lock_seconds = 60
+        self.last_confidence = 0.0
 
         self.stats: Dict[str, Any] = {
             "trades": 0,
@@ -89,7 +96,8 @@ class BotEngine:
             if self._thread and self._thread.is_alive():
                 self.logger.log("Engine already running.")
                 return False
-            self.stop_event.clear()
+            self._apply_sl_tp_config_defaults()
+            self.running.set()
             self._thread = threading.Thread(target=self._run_loop, daemon=True)
             self._thread.start()
             return True
@@ -98,10 +106,11 @@ class BotEngine:
         with self._thread_lock:
             if not self._thread:
                 return
-            self.stop_event.set()
-        if self._thread:
-            self._thread.join(timeout=self.poll_interval + 1)
-        self._thread = None
+            self.running.clear()
+            thread = self._thread
+            self._thread = None
+        if thread:
+            thread.join(timeout=self.poll_interval + 2)
 
     def set_focus_symbol(self, symbol: str) -> None:
         with self._symbol_lock:
@@ -131,11 +140,27 @@ class BotEngine:
     def get_memory_snapshot(self) -> List[Dict[str, Any]]:
         return self.memory.get_patterns()
 
+    def set_sl_tp_mode(self, mode: str) -> None:
+        self.sl_tp_mode = str(mode) if mode else "Fixed pips"
+
+    def update_sl_tp_values(self, sl: float, tp: float) -> None:
+        self.sl_value = float(sl)
+        self.tp_value = float(tp)
+
+    def apply_sl_tp_to_pending(self, enabled: bool) -> None:
+        self.apply_sl_tp_on_pending = bool(enabled)
+
     def _load_config(self) -> Dict[str, Any]:
         if not self.config_path.exists():
             raise FileNotFoundError(f"Config file not found: {self.config_path}")
         with self.config_path.open("r", encoding="utf-8") as handle:
             return yaml.safe_load(handle) or {}
+
+    def _apply_sl_tp_config_defaults(self) -> None:
+        cfg = self.config.get("sl_tp", {})
+        self.set_sl_tp_mode(cfg.get("mode", "Fixed pips"))
+        self.update_sl_tp_values(cfg.get("sl_value", 7.5), cfg.get("tp_value", 15.0))
+        self.apply_sl_tp_to_pending(cfg.get("apply_to_pending", True))
 
     def _run_loop(self) -> None:
         if not mt5.initialize():
@@ -146,20 +171,20 @@ class BotEngine:
         self.send_telegram("✅ Trading engine started")
         self._notify_status("Scanning")
         try:
-            while not self.stop_event.is_set():
+            while self.running.is_set():
                 symbols_to_scan = self._get_symbols_to_scan()
                 if not symbols_to_scan:
                     self.logger.log("No symbols configured for scanning.")
-                    self.stop_event.wait(self.poll_interval)
+                    time.sleep(self.poll_interval)
                     continue
                 for symbol in symbols_to_scan:
-                    if self.stop_event.is_set():
+                    if not self.running.is_set():
                         break
                     try:
-                        self._execute_cycle(symbol)
-                    except Exception as exc:  # pragma: no cover - runtime safeguard
-                        self.logger.log(f"Error during cycle for {symbol}: {exc}")
-                self.stop_event.wait(self.poll_interval)
+                        self.scan_symbol(symbol)
+                    except Exception as exc:  # pragma: no cover
+                        self.logger.log(f"Error in {symbol}: {exc}")
+                    time.sleep(0.4)
         finally:
             mt5.shutdown()
             self.logger.log("🛑 Trading engine stopped — MT5 disconnected")
@@ -174,7 +199,7 @@ class BotEngine:
                 return [self.focus_symbol] + ordered
             return ordered
 
-    def _execute_cycle(self, symbol: str) -> None:
+    def scan_symbol(self, symbol: str) -> None:
         if not self.cycle_lock.acquire(blocking=False):
             return
         try:
@@ -192,7 +217,10 @@ class BotEngine:
             analysis["pullback"] = pullback_flag
 
             confidence = float(analysis.get("confidence", 0.0))
-            if self.strategy_flags.get("memory", True) and analysis.get("direction") in {"CALL", "PUT"}:
+            direction = str(analysis.get("direction", "NONE"))
+
+            memory_applied = False
+            if self.strategy_flags.get("memory", True) and direction in {"CALL", "PUT"}:
                 boosted_confidence, memory_applied = self.memory.apply_memory(
                     symbol,
                     float(analysis.get("rsi_value", 0.0)),
@@ -205,30 +233,32 @@ class BotEngine:
                 if memory_applied:
                     self.logger.log(f"🧠 Memory match: +{self.memory_boost:.2f} confidence boost")
                 confidence = boosted_confidence
-            else:
-                memory_applied = False
+
             analysis["confidence"] = confidence
+            self.last_confidence = confidence
 
             log_line = (
-                f"[{symbol}] RSI {analysis.get('rsi_value', 0.0):.2f} | "
+                f"[{symbol}] RSI {float(analysis.get('rsi_value', 0.0)):.2f} | "
                 f"EMA: {analysis.get('ema_trend', 'flat')} | "
                 f"MACD: {analysis.get('macd_signal', 'NONE')} | "
                 f"Pullback: {str(analysis.get('pullback', False)).lower()} | "
                 f"Confidence {confidence:.2f}"
             )
             self.logger.log(log_line)
-            direction = str(analysis.get("direction", "NONE"))
             self._notify_confidence(confidence, direction)
 
             last_price = float(df["close"].iloc[-1])
+            atr_value = float(analysis.get("atr", calc_atr(df)))
+
             if direction in {"CALL", "PUT"}:
                 if confidence >= self.base_confidence:
-                    executed = self._handle_market_order(symbol, direction, confidence, last_price, analysis)
+                    executed = self.execute_market_order(symbol, direction, confidence, df, atr_value, analysis)
                     if executed:
                         self._notify_status("Operation executed")
                         return
                 elif pullback_flag and confidence >= self.lower_confidence:
-                    executed = self._handle_pending_order(symbol, direction, confidence, last_price, analysis)
+                    pending_price = self._determine_pending_price(direction, last_price, atr_value)
+                    executed = self.execute_pending_order(symbol, direction, pending_price, df, atr_value)
                     if executed:
                         self._notify_status("Operation executed")
                         return
@@ -236,20 +266,47 @@ class BotEngine:
         finally:
             self.cycle_lock.release()
 
-    def _handle_market_order(
+    def execute_market_order(
         self,
         symbol: str,
         direction: str,
         confidence: float,
-        last_price: float,
+        df: pd.DataFrame,
+        atr_value: float,
         analysis: Dict[str, Any],
     ) -> bool:
         if not self._acquire_trade_slot():
             return False
-        lot = self.lot_high
-        confirmation = self._send_market_order(symbol, direction, lot, last_price)
-        if not confirmation:
+        lot = self._select_lot_by_confidence()
+        mt5.symbol_select(symbol, True)
+        tick = mt5.symbol_info_tick(symbol)
+        if not tick:
+            self.logger.log(f"No tick data available for {symbol}.")
             return False
+        entry_price = tick.ask if direction == "CALL" else tick.bid
+        sl_price, tp_price = self._calc_sl_tp_prices(symbol, direction, entry_price, df, atr_value)
+        order = {
+            "action": mt5.TRADE_ACTION_DEAL,
+            "symbol": symbol,
+            "volume": lot,
+            "type": mt5.ORDER_TYPE_BUY if direction == "CALL" else mt5.ORDER_TYPE_SELL,
+            "price": entry_price,
+            "sl": sl_price,
+            "tp": tp_price,
+            "deviation": 10,
+            "magic": 123456,
+            "comment": "AXINEW-market",
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": mt5.ORDER_FILLING_FOK,
+        }
+        result = mt5.order_send(order)
+        if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
+            self.logger.log(f"Market order failed for {symbol}: {getattr(result, 'retcode', 'no response')}")
+            return False
+        message = f"✅ ORDER EXECUTED [{symbol}] → {direction} lot={lot:.2f}"
+        self.logger.log(message)
+        self.send_telegram(message)
+
         event = self._build_trade_event(
             symbol=symbol,
             decision=direction,
@@ -285,30 +342,64 @@ class BotEngine:
         self._update_stats(trade_result, pnl_value)
         return True
 
-    def _handle_pending_order(
+    def execute_pending_order(
         self,
         symbol: str,
         direction: str,
-        confidence: float,
-        last_price: float,
-        analysis: Dict[str, Any],
+        price: float,
+        df: pd.DataFrame,
+        atr_value: float,
     ) -> bool:
         if not self._acquire_trade_slot():
             return False
-        lot = self.lot_low
-        confirmation = self._send_pending_order(symbol, direction, last_price, analysis, lot)
-        if not confirmation:
+        lot = self._select_lot_by_confidence()
+        mt5.symbol_select(symbol, True)
+        if not self.apply_sl_tp_on_pending:
+            sl_price, tp_price = 0.0, 0.0
+        else:
+            sl_price, tp_price = self._calc_sl_tp_prices(symbol, direction, price, df, atr_value)
+        order = {
+            "action": mt5.TRADE_ACTION_PENDING,
+            "symbol": symbol,
+            "volume": lot,
+            "type": mt5.ORDER_TYPE_BUY_LIMIT if direction == "CALL" else mt5.ORDER_TYPE_SELL_LIMIT,
+            "price": price,
+            "sl": sl_price,
+            "tp": tp_price,
+            "deviation": 10,
+            "magic": 123456,
+            "comment": "AXINEW-pending",
+            "type_time": mt5.ORDER_TIME_GTC,
+            "type_filling": mt5.ORDER_FILLING_RETURN,
+        }
+        result = mt5.order_send(order)
+        if result is None or result.retcode not in (mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_PLACED):
+            self.logger.log(f"Pending order failed for {symbol}: {getattr(result, 'retcode', 'no response')}")
             return False
+        message = f"📌 PENDING ORDER SET [{symbol}] {direction} @ {price:.5f}"
+        self.logger.log(message)
+        self.send_telegram(message)
         event = self._build_trade_event(
             symbol=symbol,
             decision=direction,
-            confidence=confidence,
+            confidence=self.last_confidence,
             result="PENDING",
             pnl=0.0,
             notes="Pending order",
         )
         self._notify_order(event)
         return True
+
+    def _determine_pending_price(self, direction: str, last_price: float, atr_value: float) -> float:
+        offset = max(atr_value * 0.5, last_price * 0.001)
+        if direction == "CALL":
+            return last_price - offset
+        return last_price + offset
+
+    def _select_lot_by_confidence(self) -> float:
+        if self.last_confidence >= self.base_confidence:
+            return round(self.lot_high, 2)
+        return round(self.lot_low, 2)
 
     def _acquire_trade_slot(self) -> bool:
         now = time.time()
@@ -330,65 +421,37 @@ class BotEngine:
         df["time"] = pd.to_datetime(df["time"], unit="s")
         return df
 
-    def _send_market_order(self, symbol: str, direction: str, lot: float, fallback_price: float) -> bool:
-        mt5.symbol_select(symbol, True)
-        order_type = mt5.ORDER_TYPE_BUY if direction == "CALL" else mt5.ORDER_TYPE_SELL
-        tick = mt5.symbol_info_tick(symbol)
-        price = (tick.ask if direction == "CALL" else tick.bid) if tick else fallback_price
-        request = {
-            "action": mt5.TRADE_ACTION_DEAL,
-            "symbol": symbol,
-            "volume": lot,
-            "type": order_type,
-            "price": price,
-            "deviation": 10,
-            "magic": 0,
-            "comment": "axinew_market",
-            "type_time": mt5.ORDER_TIME_GTC,
-            "type_filling": mt5.ORDER_FILLING_IOC,
-        }
-        result = mt5.order_send(request)
-        if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
-            self.logger.log(f"Market order failed for {symbol}: {getattr(result, 'retcode', 'no response')}")
-            return False
-        message = f"✅ ORDER EXECUTED [{symbol}] → {direction} lot={lot:.2f}"
-        self.logger.log(message)
-        self.send_telegram(message)
-        return True
+    def _points_per_pip(self, symbol: str) -> float:
+        info = mt5.symbol_info(symbol)
+        if info and info.digits in (3, 5):
+            return 10.0
+        return 1.0
 
-    def _send_pending_order(
+    def _calc_sl_tp_prices(
         self,
         symbol: str,
         direction: str,
-        last_price: float,
-        analysis: Dict[str, Any],
-        lot: float,
-    ) -> bool:
-        mt5.symbol_select(symbol, True)
-        order_type = mt5.ORDER_TYPE_BUY_LIMIT if direction == "CALL" else mt5.ORDER_TYPE_SELL_LIMIT
-        atr_value = float(analysis.get("atr", 0.0) or 0.0)
-        price_offset = max(atr_value * 0.5, last_price * 0.001)
-        price = last_price - price_offset if direction == "CALL" else last_price + price_offset
-        request = {
-            "action": mt5.TRADE_ACTION_PENDING,
-            "symbol": symbol,
-            "volume": lot,
-            "type": order_type,
-            "price": price,
-            "deviation": 10,
-            "magic": 0,
-            "comment": "axinew_pending",
-            "type_time": mt5.ORDER_TIME_GTC,
-            "type_filling": mt5.ORDER_FILLING_RETURN,
-        }
-        result = mt5.order_send(request)
-        if result is None or result.retcode not in (mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_PLACED):
-            self.logger.log(f"Pending order failed for {symbol}: {getattr(result, 'retcode', 'no response')}")
-            return False
-        message = f"📌 PENDING ORDER SET [{symbol}] {direction} @ {price:.5f}"
-        self.logger.log(message)
-        self.send_telegram(message)
-        return True
+        entry_price: float,
+        df: pd.DataFrame,
+        atr_value: float,
+    ) -> Tuple[float, float]:
+        info = mt5.symbol_info(symbol)
+        point = info.point if info else 0.0001
+        if self.sl_tp_mode == "Fixed pips":
+            pip_points = self._points_per_pip(symbol)
+            sl_delta = float(self.sl_value) * pip_points * point
+            tp_delta = float(self.tp_value) * pip_points * point
+        else:
+            atr_used = atr_value if atr_value else calc_atr(df)
+            sl_delta = float(self.sl_value) * atr_used
+            tp_delta = float(self.tp_value) * atr_used
+        if direction == "CALL":
+            sl_price = entry_price - sl_delta
+            tp_price = entry_price + tp_delta
+        else:
+            sl_price = entry_price + sl_delta
+            tp_price = entry_price - tp_delta
+        return float(sl_price), float(tp_price)
 
     def _evaluate_trade_result(self, symbol: str, direction: str) -> str:
         rates = mt5.copy_rates_from_pos(symbol, self.timeframe, 0, 3)
@@ -475,7 +538,7 @@ class BotEngine:
             try:
                 url = f"https://api.telegram.org/bot{token}/sendMessage"
                 requests.post(url, data={"chat_id": chat_id, "text": message}, timeout=5)
-            except Exception as exc:  # pragma: no cover - network issues
+            except Exception as exc:  # pragma: no cover
                 self.logger.log(f"Telegram send failed: {exc}")
 
         threading.Thread(target=_worker, daemon=True).start()

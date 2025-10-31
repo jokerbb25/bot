@@ -1,11 +1,9 @@
 symbols:
   - EURUSD
   - XAUUSD
-  - BTCUSD
-  - USDJPY
   - GBPUSD
-  - NAS100
-  - GER40
+  - USDJPY
+  - BTCUSD
 
 timeframe: M1
 
@@ -13,15 +11,18 @@ risk:
   lot_high: 0.10
   lot_low: 0.05
 
+sl_tp:
+  mode: "ATR x Multiplier"
+  sl_value: 0.5
+  tp_value: 1.0
+  apply_to_pending: true
+
 confidence:
   base_confidence: 0.70
   lower_confidence: 0.60
-  memory_boost: 0.10
+  memory_boost: 0.05
 
 telegram:
   enabled: false
   token: ""
   chat_id: ""
-
-poll_interval: 5
-history_bars: 500
