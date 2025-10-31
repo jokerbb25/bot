@@ -194,6 +194,18 @@ class BotAxiGUI(QWidget):
         self.precision_label = QLabel("Precisión: 0.0%")
         self.pnl_label = QLabel("PnL: 0.00")
 
+        config_path = Path(__file__).resolve().parent / "config.yaml"
+        memory_path = Path(__file__).resolve().parent / "memory.json"
+        self.engine = BotEngine(
+            gui_log=self.gui_log,
+            config_path=config_path,
+            memory_path=memory_path,
+            status_callback=self._status_from_engine,
+            confidence_callback=self._confidence_from_engine,
+            order_callback=self._order_from_engine,
+            stats_callback=self._stats_from_engine,
+        )
+
         general_tab = self._build_general_tab()
         strategies_tab = self._build_strategies_tab()
         summary_tab = self._build_summary_tab()
@@ -210,18 +222,6 @@ class BotAxiGUI(QWidget):
         layout = QVBoxLayout()
         layout.addWidget(self.tabs)
         self.setLayout(layout)
-
-        config_path = Path(__file__).resolve().parent / "config.yaml"
-        memory_path = Path(__file__).resolve().parent / "memory.json"
-        self.engine = BotEngine(
-            gui_log=self.gui_log,
-            config_path=config_path,
-            memory_path=memory_path,
-            status_callback=self._status_from_engine,
-            confidence_callback=self._confidence_from_engine,
-            order_callback=self._order_from_engine,
-            stats_callback=self._stats_from_engine,
-        )
 
         self._populate_config_controls()
         self._sync_sl_tp_labels()
