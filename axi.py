@@ -104,13 +104,15 @@ ADAPTIVE_STATE_PATH = Path("adaptive_ai_state.npz")
 STRATEGY_CONFIG_PATH = Path("strategies_config.json")
 ADVISORY_INTERVAL_SEC = 180
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
+logging.basicConfig(level=logging.ERROR, format="%(asctime)s %(levelname)s: %(message)s")
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 warnings.filterwarnings("ignore", category=RuntimeWarning, message="overflow encountered in exp")
 
 print("🧠 Axi module active — running strategies with MT5 market feed.")
 
-logger = logging.getLogger(__name__)
+log = logging.getLogger("AXI-BOT")
+log.setLevel(logging.INFO)
+logger = log
 
 
 def connect_axi(account_id: int, password: str, server: str) -> None:
@@ -3117,7 +3119,7 @@ class TradingEngine:
         self.failed_candle_count = 0
 
     def _log(self, message: str) -> None:
-        logging.info(message)
+        logger.info(message)
 
 
     def add_trade_listener(self, callback: Callable[[TradeRecord, Dict[str, float]], None]) -> None:
@@ -3511,7 +3513,6 @@ class TradingEngine:
             regime = "VOLATILE"
         else:
             regime = "CALM"
-        logging.info(f"📊 Market Regime Detected: {regime}{' @ ' + symbol if symbol else ''}")
         return regime
 
     def _apply_regime_adjustments(self, regime: str) -> None:
@@ -3656,9 +3657,7 @@ class TradingEngine:
             try:
                 candles = fetch_axi_candle_objects(symbol)
             except Exception as exc:
-                elapsed_candles = time.time() - t_candles
-                self._log(f"⏱️ MT5.copy_rates took {elapsed_candles:.3f}s for {symbol} (error)")
-                logging.warning(f"⚠️ Candle fetch error on {symbol}: {exc}")
+                logger.error(f"⚠️ Candle fetch error on {symbol}: {exc}")
                 self.failed_candle_count = failed_candle_count + 1
                 # logging.error("❌ 4 consecutive candle fetch errors — triggering safe restart")
                 # try:
@@ -3672,11 +3671,8 @@ class TradingEngine:
                 # time.sleep(2)
                 # safe_restart_windows()
                 return None
-            elapsed_candles = time.time() - t_candles
-            self._log(f"⏱️ MT5.copy_rates took {elapsed_candles:.3f}s for {symbol}")
             self.failed_candle_count = 0
             if not candles:
-                logging.warning(f"Sin velas disponibles para {symbol}, se omite del ciclo")
                 return None
             df = to_dataframe(candles)
             atr_series_calc = atr(df, 14) if not df.empty else pd.Series(dtype=float)
@@ -3687,25 +3683,16 @@ class TradingEngine:
             confidence = consensus['confidence']
             reasons = consensus['reasons']
             for nombre, resultado in results:
-                etiqueta = STRATEGY_DISPLAY_NAMES.get(nombre, nombre)
-                mensaje = resultado.reasons[0] if resultado.reasons else 'Sin comentario'
-                logging.info(f'[{symbol}] {etiqueta}: {mensaje} (señal {resultado.signal})')
-            active_total = consensus['active']
-            signals_total = consensus['signals']
-            etiqueta_conf = consensus['confidence_label'].lower()
-            if active_total == 0:
-                logging.info('⚠️ Sin estrategias activas configuradas')
-            elif signals_total == 0:
-                logging.info('⚠️ Ninguna de las estrategias activas generó señal')
-                logging.info(f"Estrategias activas: {active_total}/{TOTAL_STRATEGY_COUNT}")
-            elif signal == 'NONE':
-                logging.info(f"Estrategias activas: {active_total}/{TOTAL_STRATEGY_COUNT}")
-            else:
-                logging.info(f"Estrategias alineadas: {consensus['aligned']}/{MIN_ALIGNED_STRATEGIES}")
-                logging.info(f"Estrategias activas: {active_total}/{TOTAL_STRATEGY_COUNT}")
-                logging.info(
-                    f"✅ Señal final: {signal} | Confianza {confidence:.2f} | Estrategias activas: {active_total}/{TOTAL_STRATEGY_COUNT}"
-                )
+                if nombre == 'RSI':
+                    rsi_signal = resultado.signal
+                elif nombre == 'EMA Trend':
+                    ema_signal = resultado.signal
+                elif nombre == 'MACD':
+                    macd_signal = resultado.signal
+                elif nombre == 'Pullback':
+                    pullback_signal = resultado.signal
+                elif nombre == 'Bollinger Rebound':
+                    bollinger_signal = resultado.signal
             entry_price = float(df['close'].iloc[-1]) if not df.empty else 0.0
             evaluation: Dict[str, Any] = {
                 'symbol': symbol,
@@ -3752,24 +3739,15 @@ class TradingEngine:
                 ema_largo_valor = float(cache.get('ema_slow', 0.0))
                 boll_width = float(cache.get('boll_width', 0.0))
                 ema_prev_fast = float(cache.get('ema_fast_prev', cache.get('ema_fast', 0.0)))
-                self._log("   RSI done in 0.000s (cache)")
-                self._log("   EMA done in 0.000s (cache)")
-                self._log("   Bollinger done in 0.000s (cache)")
             else:
-                t_rsi = time.time()
                 latest_rsi_series = rsi(df['close'])
                 latest_rsi = float(latest_rsi_series.iloc[-1]) if not latest_rsi_series.empty else 0.0
-                self._log(f"   RSI done in {time.time() - t_rsi:.3f}s")
-                t_ema = time.time()
                 ema_fast_series = ema(df['close'], 9) if len(df) else pd.Series(dtype=float)
                 ema_slow_series = ema(df['close'], 21) if len(df) else pd.Series(dtype=float)
                 ema_corto_valor = float(ema_fast_series.iloc[-1]) if not ema_fast_series.empty else 0.0
                 ema_largo_valor = float(ema_slow_series.iloc[-1]) if not ema_slow_series.empty else 0.0
-                self._log(f"   EMA done in {time.time() - t_ema:.3f}s")
-                t_boll = time.time()
                 bandas_inferior, bandas_superior = bollinger_bands(df['close'])
                 boll_width = float(bandas_superior.iloc[-1] - bandas_inferior.iloc[-1]) if len(bandas_superior) else 0.0
-                self._log(f"   Bollinger done in {time.time() - t_boll:.3f}s")
                 ema_prev_fast = float(cache.get('ema_fast', ema_corto_valor))
                 cache.update({
                     'epoch': last_epoch,
@@ -3794,12 +3772,8 @@ class TradingEngine:
             historial_vol = self._volatility_history.setdefault(symbol, deque(maxlen=5))
             historial_vol.append(volatilidad_actual)
             smoothed_volatility = float(sum(historial_vol) / len(historial_vol)) if historial_vol else volatilidad_actual
-            t_adx = time.time()
             adx_value = auto_learn.calculate_adx(symbol, df['high'].values, df['low'].values, df['close'].values)
-            self._log(f"   ADX done in {time.time() - t_adx:.3f}s")
-            t_macd = time.time()
             macd_value = auto_learn.calculate_macd(df['close'].values)
-            self._log(f"   MACD done in {time.time() - t_macd:.3f}s")
             rsi_signal = next((out.signal for name, out in results if name == 'RSI'), 'NONE')
             ema_signal = next((out.signal for name, out in results if name == 'EMA Trend'), 'NONE')
             bollinger_result = next(
@@ -4096,9 +4070,6 @@ class TradingEngine:
                 final_confidence = 1.0
             else:
                 final_confidence = float(min(final_confidence, 0.95))
-            logging.debug(
-                f"[Fusion] base={confidence:.3f} indicador={indicator_conf:.3f} IA={ai_confidence:.3f} final={final_confidence:.3f}"
-            )
             if final_confidence >= 0.75:
                 evaluation['strong'] = 1
             adx_threshold = auto_learn.get_adx_min_threshold()
@@ -4156,26 +4127,43 @@ class TradingEngine:
             strategies_aligned = aligned_count
             confidence = confidence_value
 
+            logger.info(f"[{symbol}] RSI: {rsi_signal}")
+            logger.info(f"[{symbol}] EMA: {ema_signal}")
+            logger.info(f"[{symbol}] MACD: {macd_signal}")
+            logger.info(f"[{symbol}] Pullback: {pullback_signal}")
+            logger.info(f"[{symbol}] Bollinger: {bollinger_signal}")
+
+            active_total = consensus['active']
+            logger.info(f"📊 Estrategias activas: {active_total}/{TOTAL_STRATEGY_COUNT}")
+
+            required_confluence = 2
+            required_confidence = 0.65
+
             logger.info(
-                f"[{symbol}] ✅ Confluence: {aligned_count}/{total_strategies} | "
-                f"Confidence={confidence_value:.2f} | Action={final_action}"
+                f"✅ Estrategias Alineadas {strategies_aligned}/{required_confluence} | Confianza: {confidence:.2f} | Action: {final_action}"
             )
 
-            MIN_CONFIDENCE = 0.65
-            MIN_STRATEGIES = 2
-
             if final_action not in {'CALL', 'PUT'}:
-                return skip('NO_SIGNAL', f'symbol={symbol}')
+                logger.info("❌ SKIPPED: por ausencia de señal válida")
+                logger.info("-----------------------------------------------")
+                return None
 
-            if strategies_aligned < MIN_STRATEGIES:
-                return skip('NO_CONFLUENCE', f'aligned={strategies_aligned}/{MIN_STRATEGIES}')
+            if strategies_aligned < required_confluence:
+                logger.info(f"❌ SKIPPED: por confluencia insuficiente ({strategies_aligned}/{required_confluence} requeridas)")
+                logger.info("-----------------------------------------------")
+                return None
 
-            if confidence < MIN_CONFIDENCE:
-                return skip('LOW_CONF', f'conf={confidence:.2f}')
+            if confidence < required_confidence:
+                logger.info(f"❌ SKIPPED: por confianza insuficiente {confidence:.2f} / {required_confidence}")
+                logger.info("-----------------------------------------------")
+                return None
+
+            logger.info(f"🚀 OPERACIÓN EJECUTADA → {final_action} ({symbol})")
+            logger.info("-----------------------------------------------")
 
             return evaluation
         except Exception as exc:
-            logging.warning(f"Error en ciclo para {symbol}: {exc}")
+            logger.error(f"Error en ciclo para {symbol}: {exc}")
             return None
         finally:
             if combined_base_action is None:
@@ -4414,7 +4402,6 @@ class TradingEngine:
         return True
 
     def scan_market(self) -> None:
-        logging.warning(f"🔍 scan_market() CALLED — Thread={threading.get_ident()}")
         if not self._cycle_lock.acquire(blocking=False):
             return
         self._cycle_running = True
@@ -4441,8 +4428,6 @@ class TradingEngine:
             return
         self._cycle_id_counter += 1
         self._current_cycle_id = self._cycle_id_counter
-        start_cycle = time.time()
-        self._log(f"⏳ start cycle @ {start_cycle}")
         trade_executed = False
         symbols = list(SYMBOLS)
         def _cycle_pause(delay: float = 0.5) -> None:
@@ -4457,19 +4442,10 @@ class TradingEngine:
             time.sleep(0.001)
             if not self.running.is_set():
                 break
-            start_ts = time.time()
             evaluation = self._evaluate_symbol(symbol)
             if not self.running.is_set():
                 break
             if evaluation is None:
-                self._log(
-                    f"⚠️ No valid signal on {symbol}, moving to next symbol."
-                )
-                self._log(
-                    f"✅ Finished {symbol}, switching to next symbol."
-                )
-                self._log("➡️ Next symbol...")
-                self._log(f"✅ finished {symbol} total {time.time() - start_cycle:.3f}s\n")
                 QThread.msleep(1)
                 continue
 
@@ -4482,46 +4458,19 @@ class TradingEngine:
             else:
                 signal = evaluation.get('signal')
                 if signal not in {'CALL', 'PUT'}:
-                    self._log(
-                        f"⚠️ No valid signal on {symbol}, moving to next symbol."
-                    )
-                else:
-                    is_strong = int(evaluation.get('strong', 0)) == 1
-                    confidence_raw = evaluation.get('final_confidence')
-                    confidence_value = float(confidence_raw) if confidence_raw is not None else 0.0
-                    if not is_strong and confidence_value < min_required:
-                        self._log(
-                            f"⚠️ Confidence too low for {symbol} ({confidence_value:.2f}) — skipping."
-                        )
-                    else:
-                        volatility_value_raw = evaluation.get('volatility')
-                        volatility_value: Optional[float] = None
-                        if volatility_value_raw is not None:
-                            try:
-                                volatility_value = float(volatility_value_raw)
-                            except (TypeError, ValueError):
-                                volatility_value = None
-                        volatility_display = f"{volatility_value:.4f}" if volatility_value is not None else "N/A"
-                        logging.info(
-                            f"📊 Final confidence {symbol}: {confidence_value:.2f} | Volatility: {volatility_display} | Action: {signal}"
-                        )
-                        logging.info(
-                            f"🚀 Executing trade on {symbol} | Confidence={confidence_value:.2f}"
-                        )
-                        if self._execute_selected_trade(evaluation):
-                            trade_executed = True
+                    QThread.msleep(1)
+                    continue
+                confidence_raw = evaluation.get('final_confidence')
+                confidence_value = float(confidence_raw) if confidence_raw is not None else 0.0
+                is_strong = int(evaluation.get('strong', 0)) == 1
+                if not is_strong and confidence_value < min_required:
+                    QThread.msleep(1)
+                    continue
+                if self._execute_selected_trade(evaluation):
+                    trade_executed = True
 
-            self._log(
-                f"✅ Finished {symbol}, switching to next symbol."
-            )
-            self._log(f"✅ finished {symbol} total {time.time() - start_cycle:.3f}s\n")
-            if time.time() - start_ts > 2.0:
-                self._log(
-                    f"⏱️ Timeout evaluating {symbol}, moving on."
-                )
             if trade_executed:
                 break
-            self._log("➡️ Next symbol...")
             QThread.msleep(1)
 
         if not self.running.is_set():
