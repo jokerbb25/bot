@@ -4454,18 +4454,11 @@ class TradingEngine:
         min_required = auto_learn.get_min_confidence()
 
         for symbol in symbols:
-            # ✅ prevent UI starvation
             time.sleep(0.001)
             if not self.running.is_set():
                 break
             start_ts = time.time()
-            evaluation: Optional[Dict[str, Any]] = None
-            for _ in range(2):
-                if not self.running.is_set():
-                    break
-                evaluation = self._evaluate_symbol(symbol)
-                if evaluation is not None:
-                    break
+            evaluation = self._evaluate_symbol(symbol)
             if not self.running.is_set():
                 break
             if evaluation is None:
