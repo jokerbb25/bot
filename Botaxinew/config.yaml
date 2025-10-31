@@ -2,25 +2,26 @@ symbols:
   - EURUSD
   - XAUUSD
   - BTCUSD
+  - USDJPY
+  - GBPUSD
+  - NAS100
+  - GER40
 
 timeframe: M1
 
-risk_management:
-  base_confidence: 0.70
-  lower_confidence: 0.60
+risk:
   lot_high: 0.10
   lot_low: 0.05
 
-volatility:
-  atr_percent:
-    forex: 0.15
-    metals: 0.25
-    crypto: 0.40
+confidence:
+  base_confidence: 0.70
+  lower_confidence: 0.60
+  memory_boost: 0.10
 
 telegram:
-  enabled: true
-  token: "YOUR_BOT_TOKEN"
-  chat_id: "YOUR_CHAT_ID"
+  enabled: false
+  token: ""
+  chat_id: ""
 
 poll_interval: 5
 history_bars: 500

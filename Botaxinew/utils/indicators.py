@@ -1,12 +1,12 @@
 from __future__ import annotations
 
-from typing import Any, Dict
+from typing import Any, Dict, Optional
 
 import numpy as np
 import pandas as pd
 
 
-def calc_rsi(df: pd.DataFrame, period: int = 14) -> Dict[str, Any]:
+def calc_rsi(df: pd.DataFrame, period: int = 14) -> Dict[str, float]:
     close = df["close"].astype(float)
     delta = close.diff()
     gain = np.where(delta > 0, delta, 0.0)
@@ -25,7 +25,7 @@ def calc_rsi(df: pd.DataFrame, period: int = 14) -> Dict[str, Any]:
     return {"value": value, "signal": signal}
 
 
-def calc_ema(df: pd.DataFrame, short_period: int = 12, long_period: int = 26) -> Dict[str, Any]:
+def calc_ema(df: pd.DataFrame, short_period: int = 12, long_period: int = 26) -> Dict[str, float]:
     close = df["close"].astype(float)
     ema_short = close.ewm(span=short_period, adjust=False).mean()
     ema_long = close.ewm(span=long_period, adjust=False).mean()
@@ -53,7 +53,7 @@ def calc_macd(
     fast: int = 12,
     slow: int = 26,
     signal_period: int = 9,
-) -> Dict[str, Any]:
+) -> Dict[str, float]:
     close = df["close"].astype(float)
     ema_fast = close.ewm(span=fast, adjust=False).mean()
     ema_slow = close.ewm(span=slow, adjust=False).mean()
@@ -79,23 +79,26 @@ def calc_bollinger(
     df: pd.DataFrame,
     period: int = 20,
     deviation: float = 2.0,
-) -> Dict[str, Any]:
+) -> Dict[str, float]:
     close = df["close"].astype(float)
     sma = close.rolling(window=period).mean()
     std = close.rolling(window=period).std()
     upper_band = sma + deviation * std
     lower_band = sma - deviation * std
     price = float(close.iloc[-1])
-    if price >= float(upper_band.iloc[-1]):
+    upper_value = float(upper_band.iloc[-1]) if not np.isnan(upper_band.iloc[-1]) else price
+    lower_value = float(lower_band.iloc[-1]) if not np.isnan(lower_band.iloc[-1]) else price
+    middle_value = float(sma.iloc[-1]) if not np.isnan(sma.iloc[-1]) else price
+    if price >= upper_value:
         position = "upper"
-    elif price <= float(lower_band.iloc[-1]):
+    elif price <= lower_value:
         position = "lower"
     else:
         position = "middle"
     return {
-        "upper": float(upper_band.iloc[-1]),
-        "lower": float(lower_band.iloc[-1]),
-        "middle": float(sma.iloc[-1]),
+        "upper": upper_value,
+        "lower": lower_value,
+        "middle": middle_value,
         "position": position,
         "price": price,
     }
@@ -106,77 +109,89 @@ def calc_atr(df: pd.DataFrame, period: int = 14) -> float:
     low = df["low"].astype(float)
     close = df["close"].astype(float)
     prev_close = close.shift(1)
-    tr_components = pd.DataFrame(
-        {
-            "high_low": high - low,
-            "high_close": (high - prev_close).abs(),
-            "low_close": (low - prev_close).abs(),
-        }
-    )
-    tr = tr_components.max(axis=1)
-    atr = tr.rolling(window=period).mean()
-    return float(atr.iloc[-1])
+    tr_high_low = high - low
+    tr_high_close = (high - prev_close).abs()
+    tr_low_close = (low - prev_close).abs()
+    tr = pd.concat([tr_high_low, tr_high_close, tr_low_close], axis=1).max(axis=1)
+    atr = tr.rolling(window=period, min_periods=period).mean()
+    return float(atr.iloc[-1]) if not atr.empty else 0.0
 
 
-def detect_pullback(df: pd.DataFrame, bollinger: Dict[str, Any], lookback: int = 5) -> bool:
+def detect_pullback(df: pd.DataFrame, bollinger: Dict[str, float], lookback: int = 5) -> bool:
     close = df["close"].astype(float)
     recent = close.iloc[-lookback:]
+    if recent.empty:
+        return False
     price = float(recent.iloc[-1])
     max_price = float(recent.max())
     min_price = float(recent.min())
     range_span = max_price - min_price
-    if range_span == 0:
+    if range_span <= 0:
         return False
-    retracement = (max_price - price) / range_span if bollinger["position"] == "upper" else (price - min_price) / range_span
-    return retracement > 0.5
+    if bollinger["position"] == "upper":
+        retracement = (max_price - price) / range_span
+    elif bollinger["position"] == "lower":
+        retracement = (price - min_price) / range_span
+    else:
+        return False
+    return bool(retracement > 0.5)
 
 
-def evaluate_indicators(df: pd.DataFrame) -> Dict[str, Any]:
-    rsi = calc_rsi(df)
-    ema = calc_ema(df)
-    macd = calc_macd(df)
+def evaluate_indicators(
+    df: pd.DataFrame,
+    strategies: Optional[Dict[str, bool]] = None,
+) -> Dict[str, Any]:
+    flags = {
+        "rsi": True,
+        "ema": True,
+        "macd": True,
+        "pullback": True,
+    }
+    if strategies:
+        for key in flags:
+            flags[key] = bool(strategies.get(key, True))
+
+    rsi_data = calc_rsi(df)
+    ema_data = calc_ema(df)
+    macd_data = calc_macd(df)
     bollinger = calc_bollinger(df)
-    atr = calc_atr(df)
-    pullback = detect_pullback(df, bollinger)
+    atr_value = calc_atr(df)
+    pullback_active = detect_pullback(df, bollinger) if flags["pullback"] else False
 
     votes = []
-    if rsi["signal"] in ("CALL", "PUT"):
-        votes.append(rsi["signal"])
-    if ema["signal"] in ("CALL", "PUT"):
-        votes.append(ema["signal"])
-    if macd["signal"] in ("CALL", "PUT"):
-        votes.append(macd["signal"])
+    confidence = 0.0
+    if flags["rsi"] and rsi_data["signal"] in ("CALL", "PUT"):
+        votes.append(rsi_data["signal"])
+        confidence += 0.25
+    if flags["ema"] and ema_data["signal"] in ("CALL", "PUT"):
+        votes.append(ema_data["signal"])
+        confidence += 0.25
+    if flags["macd"] and macd_data["signal"] in ("CALL", "PUT"):
+        votes.append(macd_data["signal"])
+        confidence += 0.25
+    if flags["pullback"] and pullback_active:
+        confidence += 0.15
+    if bollinger["position"] in ("upper", "lower"):
+        confidence += 0.1
 
     if votes:
         direction = max(set(votes), key=votes.count)
     else:
         direction = "NONE"
 
-    score = 0.5
-    if rsi["signal"] in ("CALL", "PUT"):
-        score += 0.15
-    if ema["signal"] in ("CALL", "PUT"):
-        score += 0.15
-    if macd["signal"] in ("CALL", "PUT"):
-        score += 0.15
-    if pullback:
-        score += 0.1
-    if bollinger["position"] in ("upper", "lower"):
-        score += 0.1
-
-    score = max(0.0, min(score, 1.0))
-
-    if direction == "NONE" and score < 0.65:
-        score = min(score, 0.6)
+    confidence = max(0.0, min(confidence, 1.0))
 
     return {
-        "rsi_signal": rsi["signal"],
-        "ema_trend": ema["trend"],
-        "macd_signal": macd["signal"],
-        "pullback": pullback,
-        "confidence": float(score),
-        "direction": direction,
+        "rsi_signal": rsi_data["signal"],
+        "rsi_value": rsi_data["value"],
+        "ema_trend": ema_data["trend"],
+        "ema_short": ema_data["short"],
+        "ema_long": ema_data["long"],
+        "macd_signal": macd_data["signal"],
+        "macd_hist": macd_data["histogram"],
+        "pullback": bool(pullback_active),
         "bollinger_position": bollinger["position"],
-        "atr": atr,
-        "rsi_value": rsi["value"],
+        "atr": float(atr_value),
+        "confidence": float(confidence),
+        "direction": direction,
     }
