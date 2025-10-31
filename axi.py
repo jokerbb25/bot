@@ -64,6 +64,9 @@ MIN_CONFIDENCE = 0.0
 MIN_VOLATILITY = 0.0
 LOT_SIZE = 0.01  # configurable, equivalent to $1 per pip depending on broker leverage
 
+MIN_ALIGNMENT = 2
+CONFIDENCE_THRESHOLD = 0.65
+
 WEIGHT_BOOST = {
     "XAUUSD": {"trend": 0.03, "range": -0.02},
     "USDJPY": {"trend": 0.01, "range": -0.01},
@@ -2474,6 +2477,19 @@ STRATEGY_WEIGHTS: Dict[str, float] = {
 
 TOTAL_STRATEGY_COUNT = len(STRATEGY_WEIGHTS)
 
+STRATEGY_LOG_ORDER: List[Tuple[str, str]] = [
+    ('RSI', 'RSI'),
+    ('EMA Trend', 'EMA'),
+    ('MACD', 'MACD'),
+    ('Pullback', 'Pullback'),
+    ('Bollinger Rebound', 'Bollinger'),
+    ('ADX', 'ADX'),
+    ('Candle Momentum', 'Candle Momentum'),
+    ('Range Breakout', 'Breakout'),
+    ('Divergence', 'Divergence'),
+    ('Volatility Filter', 'Volatility'),
+]
+
 MAX_STRATEGY_SCORE = 3.0
 
 STRATEGY_DISPLAY_NAMES: Dict[str, str] = {
@@ -3088,7 +3104,11 @@ class TradingEngine:
         )
         total_loaded = len(self.learning_memory)
         logging.info(
-            "🧠 Memory loaded with %d WIN and %d LOSS patterns (%d total).",
+            "✅ Learning data loaded (%s operations)",
+            total_loaded,
+        )
+        logging.info(
+            "🧠 Learning memory loaded (%d WIN / %d LOSS, total=%d)",
             wins_loaded,
             losses_loaded,
             total_loaded,
@@ -3100,9 +3120,15 @@ class TradingEngine:
             self.session_wins,
             self.session_losses,
         )
+        accuracy_value = 0.0
+        if isinstance(accuracy_text, str) and accuracy_text.endswith('%'):
+            try:
+                accuracy_value = float(accuracy_text.strip('%'))
+            except ValueError:
+                accuracy_value = 0.0
         logging.info(
-            "📊 Inicio de sesión → precisión histórica %s (registros=%d)",
-            accuracy_text,
+            "📊 Session started → accuracy %.2f%% (records=%d)",
+            accuracy_value,
             reference_ops,
         )
         startup_message = (
@@ -3375,6 +3401,7 @@ class TradingEngine:
         if self.telegram_controller.enabled and not self._telegram_started:
             self._telegram_started = True
             logging.info("📨 Telegram polling enabled on main worker thread.")
+            logging.info("🤖 Telegram bot active and listening commands...")
         for base_symbol in SYMBOLS:
             resolved_symbol = resolve_symbol(base_symbol)
             try:
@@ -3678,6 +3705,12 @@ class TradingEngine:
             atr_series_calc = atr(df, 14) if not df.empty else pd.Series(dtype=float)
             atr_latest_value = float(atr_series_calc.iloc[-1]) if not atr_series_calc.empty else 0.0
             results, consensus = self._evaluate_strategies(df)
+            strategy_details: Dict[str, Tuple[str, str]] = {}
+            for strategy_name, outcome in results:
+                signal_value = str(getattr(outcome, 'signal', 'NONE') or 'NONE').upper()
+                reasons_list = list(getattr(outcome, 'reasons', []) or [])
+                description = reasons_list[0] if reasons_list else "Sin descripción disponible"
+                strategy_details[strategy_name] = (signal_value, description)
             self._notify_summary(symbol, consensus)
             signal = consensus['signal']
             confidence = consensus['confidence']
@@ -3693,6 +3726,16 @@ class TradingEngine:
                     pullback_signal = resultado.signal
                 elif nombre == 'Bollinger Rebound':
                     bollinger_signal = resultado.signal
+            volatility_result = next(
+                (
+                    out
+                    for name, out in results
+                    if name == 'Volatility Filter'
+                ),
+                None,
+            )
+            if volatility_result is not None:
+                volatility_signal = volatility_result.signal or 'NONE'
             entry_price = float(df['close'].iloc[-1]) if not df.empty else 0.0
             evaluation: Dict[str, Any] = {
                 'symbol': symbol,
@@ -4128,25 +4171,20 @@ class TradingEngine:
             confidence = confidence_value
 
             logger.info(f"----------- {symbol} -----------")
-            logger.info(f"[{symbol}] RSI: {rsi_signal}")
-            logger.info(f"[{symbol}] EMA: {ema_signal}")
-            logger.info(f"[{symbol}] MACD: {macd_signal}")
-            logger.info(f"[{symbol}] Pullback: {pullback_signal}")
-            logger.info(f"[{symbol}] Bollinger: {bollinger_signal}")
-            logger.info(f"[{symbol}] ADX: {adx_signal}")
-            logger.info(f"[{symbol}] Candle Momentum: {candle_signal}")
-            logger.info(f"[{symbol}] Breakout: {range_break_signal}")
-            logger.info(f"[{symbol}] Divergence: {divergence_signal}")
-            logger.info(f"[{symbol}] Volatility: {volatility_signal}")
+            for strategy_key, display_name in STRATEGY_LOG_ORDER:
+                signal_text, description_text = strategy_details.get(
+                    strategy_key,
+                    ('NONE', 'Sin datos disponibles'),
+                )
+                logger.info(
+                    f"[{symbol}] {display_name}: {description_text} (señal {signal_text})"
+                )
 
             total_enabled = consensus['active']
             logger.info(f"📊 Estrategias activas: {total_enabled}/{TOTAL_STRATEGY_COUNT}")
 
-            required_confluence = 2
-            required_confidence = 0.65
-
             logger.info(
-                f"✅ Estrategias alineadas: {strategies_aligned}/{required_confluence} | Confianza: {confidence:.2f} | Acción: {final_action}"
+                f"✅ Estrategias alineadas: {strategies_aligned}/{MIN_ALIGNMENT} | Confianza: {confidence:.2f} | Acción: {final_action}"
             )
 
             if final_action not in {'CALL', 'PUT'}:
@@ -4154,16 +4192,16 @@ class TradingEngine:
                 logger.info("-----------------------------------------------")
                 return None
 
-            if strategies_aligned < required_confluence:
+            if strategies_aligned < MIN_ALIGNMENT:
                 logger.info(
-                    f"❌ SKIPPED: confluencia detectada {strategies_aligned}/{required_confluence} (mínimo requerido {required_confluence})"
+                    f"❌ SKIPPED: confluencia insuficiente ({strategies_aligned}/{MIN_ALIGNMENT})"
                 )
                 logger.info("-----------------------------------------------")
                 return None
 
-            if confidence < required_confidence:
+            if confidence < CONFIDENCE_THRESHOLD:
                 logger.info(
-                    f"❌ SKIPPED: confianza insuficiente ({confidence:.2f}/{required_confidence:.2f})"
+                    f"❌ SKIPPED: confianza insuficiente ({confidence:.2f}/{CONFIDENCE_THRESHOLD:.2f})"
                 )
                 logger.info("-----------------------------------------------")
                 return None
@@ -4876,6 +4914,20 @@ class TradingEngine:
             logger.info(
                 f"🚀 EXECUTED MARKET ORDER {symbol} → {final_action} | Confidence={confidence_value:.2f}"
             )
+            try:
+                send_telegram_message(
+                    (
+                        "✅ Operación ejecutada\n"
+                        f"Símbolo: {symbol}\n"
+                        f"Acción: {final_action}\n"
+                        f"Confianza: {confidence_value:.2f}"
+                    )
+                )
+            except Exception:
+                logging.debug(
+                    "No se pudo enviar notificación de operación ejecutada por Telegram",
+                    exc_info=True,
+                )
         except Exception as exc:
             logging.warning(f"No se pudo enviar la orden MT5: {exc}")
             self._notify_trade_state("ready")

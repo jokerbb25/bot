@@ -221,9 +221,21 @@ def execute_trade(
         sl_price = entry_price - price_offset
     else:
         sl_price = entry_price + price_offset
-    result = mt5_send_order(symbol, direction, lot, sl_price=sl_price, tp_price=None, magic=trade_state["magic"])
-    if result is None or getattr(result, "retcode", None) != mt5.TRADE_RETCODE_DONE:
-        logger.error("ORDER_REJECTED")
+    result = mt5_send_order(
+        symbol,
+        direction,
+        lot,
+        sl_price=sl_price,
+        tp_price=None,
+        magic=trade_state["magic"],
+    )
+    if result is None:
+        gui.push_status("ORDER_REJECTED")
+        return None, None
+    retcode = getattr(result, "retcode", None)
+    if retcode != mt5.TRADE_RETCODE_DONE:
+        comment = getattr(result, "comment", "")
+        logger.error(f"ORDER_REJECTED ({retcode}) {comment}")
         gui.push_status("ORDER_REJECTED")
         return result, None
     ticket = getattr(result, "order", 0) or getattr(result, "deal", 0) or getattr(result, "position", 0)
@@ -240,6 +252,10 @@ def execute_trade(
         )
     gui.mark_open(symbol, direction, confidence=confidence, entry=entry_price, sl_pips=sl_pips)
     gui.push_status(f"TRADE_OPEN_{symbol}_{direction}")
+    confidence_value = confidence if confidence is not None else 0.0
+    logger.info(
+        f"🚀 EXECUTED MARKET ORDER {symbol} → {direction} | Confidence={confidence_value:.2f}"
+    )
     if RISK_CFG.get("slp_enable"):
         reset_slp_state()
         _SLP_STATE.update(
