@@ -2,6 +2,7 @@ import sys
 import time
 import json
 import threading
+from threading import Lock
 import logging
 import warnings
 import csv
@@ -10,7 +11,6 @@ import shutil
 import os
 import subprocess
 from collections import defaultdict, deque
-from concurrent.futures import ThreadPoolExecutor
 from dataclasses import dataclass, field
 from datetime import datetime, timezone, timedelta
 from pathlib import Path
@@ -36,9 +36,14 @@ except ImportError:  # pragma: no cover
     gp_minimize = None  # type: ignore
 
 from PyQt5 import QtCore, QtGui, QtWidgets
-from PyQt5.QtCore import QThread, pyqtSignal
+from PyQt5.QtCore import QThread, pyqtSignal, pyqtSlot
 from aprendizaje import Aprendizaje
-from telegram_bot import BOT_ACTIVE, telegram_listener
+import gui
+import ui_bus
+from engine.close import on_order_closed
+from engine.execute import maybe_execute, price_to_pips, resolve_symbol, slp_tick
+from engine.state import BotState, position_lock, trade_state
+from utils.logwrap import skip
 
 # ===============================================================
 # CONFIG & CONSTANTS
@@ -59,6 +64,9 @@ MIN_CONFIDENCE = 0.0
 MIN_VOLATILITY = 0.0
 LOT_SIZE = 0.01  # configurable, equivalent to $1 per pip depending on broker leverage
 
+MIN_ALIGNMENT = 2
+CONFIDENCE_THRESHOLD = 0.65
+
 WEIGHT_BOOST = {
     "XAUUSD": {"trend": 0.03, "range": -0.02},
     "USDJPY": {"trend": 0.01, "range": -0.01},
@@ -76,10 +84,14 @@ POST_LOSS_COOLDOWN_SEC = 120
 MAX_TRADES_PER_HOUR = 20
 KEEP_WIN_MIN_CONF = 0.70
 MAINTENANCE_EVERY = 50
+CYCLE_TIMEOUT = 15  # increased from 4 to prevent forced timeout
 
 # === TELEGRAM BOT CONFIGURATION ===
 TELEGRAM_TOKEN = "8300367826:AAGzaMCJRY6pzZEqzjqgzAaRUXC_19KcB60"
 TELEGRAM_CHAT_ID = "8364256476"
+
+BOT_ACTIVE = True
+BOT_WORKER_STARTED = False
 
 AI_ENABLED = True
 AI_PASSIVE_MODE = True
@@ -95,13 +107,15 @@ ADAPTIVE_STATE_PATH = Path("adaptive_ai_state.npz")
 STRATEGY_CONFIG_PATH = Path("strategies_config.json")
 ADVISORY_INTERVAL_SEC = 180
 
-logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s: %(message)s")
+logging.basicConfig(level=logging.ERROR, format="%(asctime)s %(levelname)s: %(message)s")
 warnings.filterwarnings("ignore", category=DeprecationWarning)
 warnings.filterwarnings("ignore", category=RuntimeWarning, message="overflow encountered in exp")
 
 print("🧠 Axi module active — running strategies with MT5 market feed.")
 
-logger = logging.getLogger(__name__)
+log = logging.getLogger("AXI-BOT")
+log.setLevel(logging.INFO)
+logger = log
 
 
 def connect_axi(account_id: int, password: str, server: str) -> None:
@@ -110,19 +124,21 @@ def connect_axi(account_id: int, password: str, server: str) -> None:
     print("✅ Connected to Axi MT5")
 
 
-def execute_market_order(symbol: str, action: str, atr_value: float, lot_size: float = LOT_SIZE) -> Tuple[Any, Optional[float]]:
-    """Execute a market order on MT5 using ATR-based dynamic stops."""
+def execute_market_order(symbol: str, action: str, atr_value: float, lot_size: float = LOT_SIZE, confidence: Optional[float] = None) -> Tuple[Any, Optional[float]]:
+    """Execute a market order on MT5 using ATR-based dynamic stops and SLP."""
 
-    symbol_info = mt5.symbol_info(symbol)
+    mt5_symbol = resolve_symbol(symbol)
+    mt5.symbol_select(mt5_symbol, True)
+    symbol_info = mt5.symbol_info(mt5_symbol)
     if symbol_info is None:
         raise RuntimeError(f"Symbol {symbol} is not available in MT5")
 
-    tick = mt5.symbol_info_tick(symbol)
+    tick = mt5.symbol_info_tick(mt5_symbol)
     if tick is None:
         raise RuntimeError(f"No tick data for {symbol}")
 
     direction = str(action or "CALL").upper()
-    order_type = mt5.ORDER_TYPE_BUY if direction == "CALL" else mt5.ORDER_TYPE_SELL
+    trade_direction = "BUY" if direction == "CALL" else "SELL"
     price = tick.ask if direction == "CALL" else tick.bid
     point = float(getattr(symbol_info, "point", 0.0) or 0.0)
     if point <= 0.0:
@@ -130,49 +146,29 @@ def execute_market_order(symbol: str, action: str, atr_value: float, lot_size: f
 
     lot = float(lot_size)
     atr = float(max(atr_value, 0.0))
-    atr_pips = atr / point if point else 0.0
-    stop_level = int(getattr(symbol_info, "trade_stops_level", 0) or 0)
-    sl_points = max(stop_level, int(max(1.0, atr_pips * 1.2)))
-    tp_points = max(stop_level, int(max(1.0, atr_pips * 2.5)))
+    atr_pips = price_to_pips(symbol, atr)
+    if atr_pips == 0.0 and point:
+        atr_pips = atr / point
 
-    request = {
-        "action": mt5.TRADE_ACTION_DEAL,
-        "symbol": symbol,
-        "volume": lot,
-        "type": order_type,
-        "price": price,
-        "sl": price - sl_points * point if direction == "CALL" else price + sl_points * point,
-        "tp": price + tp_points * point if direction == "CALL" else price - tp_points * point,
-        "magic": 1001,
-        "comment": "axi-bot",
-        "type_time": mt5.ORDER_TIME_GTC,
-        "type_filling": mt5.ORDER_FILLING_IOC,
-    }
-
-    result = mt5.order_send(request)
-
-    if result is None or getattr(result, "retcode", None) != mt5.TRADE_RETCODE_DONE:
-        logger.error(
-            f"[{symbol}] ❌ Order failed: retcode={getattr(result, 'retcode', None)}"
-        )
-        if BOT_ACTIVE:
-            reason = getattr(result, "comment", "No response from MT5" if result is None else "Unknown error")
+    result, ticket = maybe_execute(symbol, trade_direction, lot, atr_pips, price, confidence)
+    if result is None or ticket is None:
+        if BOT_ACTIVE and result is not None:
+            reason = getattr(result, "comment", "Unknown error")
             telegram_send(
-                "❌ ORDER FAILED\n"
+                "❌ ORDER FAILED\n",
                 f"{symbol}\nReason: {reason}"
             )
         return result, None
 
     logger.info(
-        f"[{symbol}] ✅ Order placed #{getattr(result, 'order', 0)} {direction} @ {price:.5f}"
+        f"[{symbol}] ✅ Order placed #{ticket} {direction} @ {price:.5f}"
     )
     if BOT_ACTIVE:
         telegram_send(
-            "✅ MARKET ORDER EXECUTED\n"
+            "✅ MARKET ORDER EXECUTED\n",
             f"{symbol}\nAction: {direction}\nLot: {lot}"
         )
 
-    ticket = getattr(result, "order", 0) or getattr(result, "deal", 0) or 0
     profit: Optional[float] = None
     if ticket:
         try:
@@ -181,9 +177,7 @@ def execute_market_order(symbol: str, action: str, atr_value: float, lot_size: f
         except Exception:
             pass
         time.sleep(0.5)
-        deals = mt5.history_deals_get(position=ticket)
-        if not deals:
-            deals = mt5.history_deals_get(ticket=ticket)
+        deals = mt5.history_deals_get(position=ticket) or mt5.history_deals_get(ticket=ticket)
         if deals:
             last_deal = deals[-1]
             profit = float(getattr(last_deal, "profit", 0.0))
@@ -193,7 +187,7 @@ def execute_market_order(symbol: str, action: str, atr_value: float, lot_size: f
         logger.info(f"[{symbol}] 📊 MT5 result → Profit={profit:.2f} → {status}")
         if BOT_ACTIVE:
             telegram_send(
-                "📊 MT5 RESULT\n"
+                "📊 MT5 RESULT\n",
                 f"{symbol}\nProfit: {profit:.2f}\nEstado: {status}"
             )
     else:
@@ -202,11 +196,18 @@ def execute_market_order(symbol: str, action: str, atr_value: float, lot_size: f
     return result, profit
 
 
+
+
+
 def get_candles(symbol: str, timeframe: int = mt5.TIMEFRAME_M1, count: int = 100) -> List[Dict[str, Any]]:
-    rates = mt5.copy_rates_from_pos(symbol, timeframe, 0, count)
+    resolved = resolve_symbol(symbol)
+    try:
+        rates = mt5.copy_rates_from_pos(resolved, timeframe, 0, count)
+    except Exception as exc:
+        logging.debug(f"Failed to retrieve candles for {symbol}: {exc}")
+        raise RuntimeError(f"MT5 candle fetch failed: {exc}") from exc
     if rates is None or len(rates) == 0:
-        print(f"[WARN] No candles for {symbol}")
-        return []
+        raise RuntimeError("No candles received from MT5")
     return [
         {
             "time": rate["time"],
@@ -650,62 +651,62 @@ def update_stats_persist(win: bool) -> None:
 global_engine = None
 
 
-def telegram_bot() -> None:
-    global BOT_ACTIVE, global_engine
-    logging.info("🤖 Bot de Telegram activo y escuchando comandos...")
+class TelegramController:
+    def __init__(self, token: str, chat_id: str) -> None:
+        self.token = token
+        self.chat_id = chat_id
+        self.offset: Optional[int] = None
+        self.enabled = bool(token)
 
-    def _send_text(text: str) -> None:
-        send_telegram_message(text)
-
-    offset: Optional[int] = None
-    while True:
+    def poll(self, engine: "TradingEngine") -> None:
+        if not self.enabled:
+            return
+        params: Dict[str, Any] = {"timeout": 0, "limit": 25}
+        if self.offset is not None:
+            params["offset"] = self.offset
         try:
-            params: Dict[str, Any] = {"timeout": 10}
-            if offset is not None:
-                params["offset"] = offset
             response = requests.get(
-                f"https://api.telegram.org/bot{TELEGRAM_TOKEN}/getUpdates",
+                f"https://api.telegram.org/bot{self.token}/getUpdates",
                 params=params,
-                timeout=15,
+                timeout=5,
             )
             payload = response.json()
-            if not payload.get("ok"):
-                time.sleep(5)
-                continue
-            for update in payload.get("result", []):
-                offset = update.get("update_id", 0) + 1
-                message = (update.get("message") or {}).get("text", "")
-                if not message:
-                    continue
-                command = message.lower()
-                if any(keyword in command for keyword in ("pause", "stop", "pausar")):
-                    BOT_ACTIVE = False
-                    _send_text("⏸ Bot detenido manualmente.")
-                elif any(keyword in command for keyword in ("resume", "start", "reanudar")):
-                    BOT_ACTIVE = True
-                    _send_text("▶️ Bot reanudado.")
-                elif any(keyword in command for keyword in ("status", "estado")):
-                    engine_ref = global_engine
-                    if engine_ref is not None:
-                        precision = engine_ref.get_accuracy()
-                        operations = engine_ref.total_operations
-                        _send_text(
-                            f"📊 Precisión: {precision:.2f}%\nOperaciones: {int(operations)}"
-                        )
-                    else:
-                        _send_text("ℹ️ Motor no disponible todavía.")
-                elif any(keyword in command for keyword in ("help", "ayuda")):
-                    _send_text("🧠 Comandos:\n- pausar\n- reanudar\n- estado\n- info")
-                elif "info" in command:
-                    engine_ref = global_engine
-                    if engine_ref is not None:
-                        _send_text(f"📄 Último ticket: {engine_ref.get_last_contract_info()}")
-                    else:
-                        _send_text("ℹ️ No hay información de tickets disponible.")
         except Exception as exc:
-            logging.error(f"❌ Telegram bot error: {exc}")
-            time.sleep(5)
-        time.sleep(3)
+            logging.error(f"❌ Telegram poll error: {exc}")
+            return
+        if not payload.get("ok"):
+            return
+        for update in payload.get("result", []):
+            self.offset = update.get("update_id", 0) + 1
+            message = (update.get("message") or {}).get("text", "") or ""
+            if not message:
+                continue
+            self._handle_command(message.lower(), engine)
+
+    def _handle_command(self, command: str, engine: "TradingEngine") -> None:
+        global BOT_ACTIVE
+        if any(keyword in command for keyword in ("pause", "stop", "pausar")):
+            BOT_ACTIVE = False
+            send_telegram_message("⏸ Bot detenido manualmente.")
+            return
+        if any(keyword in command for keyword in ("resume", "start", "reanudar")):
+            BOT_ACTIVE = True
+            send_telegram_message("▶️ Bot reanudado.")
+            return
+        if any(keyword in command for keyword in ("status", "estado")):
+            precision = engine.get_accuracy()
+            operations = engine.total_operations
+            send_telegram_message(
+                f"📊 Precisión: {precision:.2f}%\nOperaciones: {int(operations)}"
+            )
+            return
+        if any(keyword in command for keyword in ("help", "ayuda")):
+            send_telegram_message("🧠 Comandos:\n- pausar\n- reanudar\n- estado\n- info")
+            return
+        if "info" in command:
+            send_telegram_message(
+                f"📄 Último ticket: {engine.get_last_contract_info()}"
+            )
 
 
 # ===============================================================
@@ -920,7 +921,7 @@ class auto_learning:
         self.model_lock = threading.Lock()
         self.bias_lock = threading.Lock()
         self.memory_lock = threading.Lock()
-        self.executor = ThreadPoolExecutor(max_workers=2)
+        self.executor = None
         self.asset_stats: Dict[str, Dict[str, int]] = defaultdict(lambda: {"wins": 0, "total": 0})
         self.global_totals = {"wins": 0, "total": 0}
         self.last_trades: deque = deque(maxlen=50)
@@ -964,7 +965,7 @@ class auto_learning:
         self.reinforce_batches = 0
         self.optimize_batches = 0
         self.learning_event = threading.Event()
-        self.learning_thread: Optional[threading.Thread] = None
+        self.learning_thread = None
         self._pending_context: Dict[str, Dict[str, float]] = {}
         self.symbol_profiles: Dict[str, Dict[str, Any]] = {
             symbol: self._default_symbol_profile() for symbol in SYMBOLS
@@ -974,6 +975,9 @@ class auto_learning:
         self._current_symbol: Optional[str] = None
         self._ensure_csv()
         self._load_bias_storage()
+
+    def _run_task(self, func: Callable[..., None], *args: Any, **kwargs: Any) -> None:
+        func(*args, **kwargs)
     def _ensure_csv(self) -> None:
         if self.csv_path.exists():
             return
@@ -1012,19 +1016,7 @@ class auto_learning:
             save_biases(self.biases)
 
     def start_background_services(self) -> None:
-        if self.learning_thread is None or not self.learning_thread.is_alive():
-            self.learning_thread = threading.Thread(
-                target=self._learning_loop,
-                daemon=True,
-            )
-            self.learning_thread.start()
-        if self._telegram_thread is None or not self._telegram_thread.is_alive():
-            self._telegram_thread = threading.Thread(
-                target=telegram_listener,
-                args=(self,),
-                daemon=True,
-            )
-            self._telegram_thread.start()
+        return
 
     def _default_symbol_profile(self) -> Dict[str, Any]:
         return {
@@ -1190,7 +1182,7 @@ class auto_learning:
             else:
                 batch = None
         if batch:
-            self.executor.submit(self.process_batch, batch)
+            self._run_task(self.process_batch, batch)
 
     def process_batch(self, entries: Optional[List[Tuple[str, str, str, float, str]]] = None) -> None:
         if entries is None:
@@ -1425,7 +1417,7 @@ class auto_learning:
         volatility_value: float,
         price_change: float,
     ) -> None:
-        self.executor.submit(
+        self._run_task(
             self._update_history_sync,
             result,
             asset,
@@ -1561,7 +1553,7 @@ class auto_learning:
         except Exception as exc:  # pragma: no cover
             logging.debug(f"No se pudo registrar historial de autoaprendizaje: {exc}")
         if should_train:
-            self.executor.submit(self._train_model)
+            self._run_task(self._train_model)
         total_trades = self.global_totals['total']
         if total_trades and total_trades % 150 == 0:
             accuracy = self.global_totals['wins'] / max(1, total_trades)
@@ -1803,7 +1795,7 @@ class auto_learning:
             if trigger_optimize:
                 self.optimize_batches = optimize_batches
         if trigger_reinforce or trigger_optimize:
-            self.executor.submit(self._run_periodic_learning, trigger_optimize)
+            self._run_task(self._run_periodic_learning, trigger_optimize)
 
     def _run_periodic_learning(self, optimize: bool) -> None:
         try:
@@ -2102,7 +2094,7 @@ class auto_learning:
         return resumen
 
     def reset_history(self) -> None:
-        self.executor.submit(self._reset_history_sync)
+        self._run_task(self._reset_history_sync)
 
     def _reset_history_sync(self) -> None:
         with self.lock:
@@ -2485,6 +2477,19 @@ STRATEGY_WEIGHTS: Dict[str, float] = {
 
 TOTAL_STRATEGY_COUNT = len(STRATEGY_WEIGHTS)
 
+STRATEGY_LOG_ORDER: List[Tuple[str, str]] = [
+    ('RSI', 'RSI'),
+    ('EMA Trend', 'EMA'),
+    ('MACD', 'MACD'),
+    ('Pullback', 'Pullback'),
+    ('Bollinger Rebound', 'Bollinger'),
+    ('ADX', 'ADX'),
+    ('Candle Momentum', 'Candle Momentum'),
+    ('Range Breakout', 'Breakout'),
+    ('Divergence', 'Divergence'),
+    ('Volatility Filter', 'Volatility'),
+]
+
 MAX_STRATEGY_SCORE = 3.0
 
 STRATEGY_DISPLAY_NAMES: Dict[str, str] = {
@@ -2751,10 +2756,9 @@ class AdaptiveAIManager:
         self.bias: float = 0.0
         self.learning_rate = 0.05
         self.learning_decay = 0.999
-        self.stop_event = threading.Event()
-        self.offline_thread = threading.Thread(target=self._advisory_loop, daemon=True)
+        self.offline_thread = None
+        self._next_advisory_check = time.time()
         self._load_state()
-        self.offline_thread.start()
 
     def _phase(self) -> str:
         if self.trade_counter >= AI_AUTONOMOUS_THRESHOLD and self.accuracy() >= AI_AUTONOMOUS_ACCURACY:
@@ -2829,30 +2833,29 @@ class AdaptiveAIManager:
             return min(0.98, technical_conf * 0.8 + ai_prob * 0.2)
         return min(0.98, 0.5 + (ai_prob - 0.5) * 0.8)
 
-    def _advisory_loop(self) -> None:
+    def advisory_tick(self) -> None:
         interval = max(30, ADVISORY_INTERVAL_SEC)
-        while not self.stop_event.is_set():
-            try:
-                acc = self.accuracy() * 100
-                phase = self._phase()
-                phase_text = {
-                    "passive": "pasiva",
-                    "semi-active": "semi-activa",
-                    "autonomous": "autónoma",
-                }.get(phase, phase)
-                logging.info(
-                    f"📊 Aviso IA → fase={phase_text} precisión={acc:.2f}% operaciones={self.trade_counter}"
-                )
-                self._train_model()
-            except Exception as exc:  # pragma: no cover
-                logging.error(exc)
-            if self.stop_event.wait(interval):
-                break
+        now = time.time()
+        if now < self._next_advisory_check:
+            return
+        self._next_advisory_check = now + interval
+        try:
+            acc = self.accuracy() * 100
+            phase = self._phase()
+            phase_text = {
+                "passive": "pasiva",
+                "semi-active": "semi-activa",
+                "autonomous": "autónoma",
+            }.get(phase, phase)
+            logging.info(
+                f"📊 Aviso IA → fase={phase_text} precisión={acc:.2f}% operaciones={self.trade_counter}"
+            )
+            self._train_model()
+        except Exception as exc:  # pragma: no cover
+            logging.error(exc)
 
     def shutdown(self) -> None:
-        self.stop_event.set()
-        if self.offline_thread.is_alive():
-            self.offline_thread.join(timeout=1.0)
+        return
 
     def _ensure_weight_dim(self, dim: int) -> None:
         with self.lock:
@@ -3066,6 +3069,8 @@ class TradingEngine:
         self._indicator_cache: Dict[str, Dict[str, Any]] = {symbol: {} for symbol in SYMBOLS}
         self._volatility_history: Dict[str, deque] = {symbol: deque(maxlen=5) for symbol in SYMBOLS}
         self._cycle_id_counter = 0
+        self._cycle_lock = Lock()
+        self._cycle_running = False
         self._last_regime_cycle = -1
         self._current_cycle_id = 0
         self._latest_regime_inputs: Dict[str, Any] = {}
@@ -3099,7 +3104,11 @@ class TradingEngine:
         )
         total_loaded = len(self.learning_memory)
         logging.info(
-            "🧠 Memory loaded with %d WIN and %d LOSS patterns (%d total).",
+            "✅ Learning data loaded (%s operations)",
+            total_loaded,
+        )
+        logging.info(
+            "🧠 Learning memory loaded (%d WIN / %d LOSS, total=%d)",
             wins_loaded,
             losses_loaded,
             total_loaded,
@@ -3111,9 +3120,15 @@ class TradingEngine:
             self.session_wins,
             self.session_losses,
         )
+        accuracy_value = 0.0
+        if isinstance(accuracy_text, str) and accuracy_text.endswith('%'):
+            try:
+                accuracy_value = float(accuracy_text.strip('%'))
+            except ValueError:
+                accuracy_value = 0.0
         logging.info(
-            "📊 Inicio de sesión → precisión histórica %s (registros=%d)",
-            accuracy_text,
+            "📊 Session accuracy: %.2f%% (records=%d)",
+            accuracy_value,
             reference_ops,
         )
         startup_message = (
@@ -3124,10 +3139,14 @@ class TradingEngine:
             send_telegram_message(startup_message)
         except Exception:
             logging.debug("No se pudo notificar la carga de memoria de aprendizaje")
-        self._telegram_thread: Optional[threading.Thread] = None
-        self.telegram_bot = telegram_bot
+        self.telegram_controller = TelegramController(TELEGRAM_TOKEN, TELEGRAM_CHAT_ID)
+        self._telegram_started = False
         self.last_volatility: float = 0.0
         self.failed_candle_count = 0
+
+    def _log(self, message: str) -> None:
+        logger.info(message)
+
 
     def add_trade_listener(self, callback: Callable[[TradeRecord, Dict[str, float]], None]) -> None:
         self._trade_listeners.append(callback)
@@ -3335,19 +3354,7 @@ class TradingEngine:
         self._persist_learning_memory()
 
     def start_background_services(self) -> None:
-        try:
-            if hasattr(self, "telegram_bot") and callable(self.telegram_bot):
-                if self._telegram_thread is None or not self._telegram_thread.is_alive():
-                    self._telegram_thread = threading.Thread(
-                        target=self.telegram_bot,
-                        daemon=True,
-                    )
-                    self._telegram_thread.start()
-                    logging.info("📨 Telegram bot service started in background.")
-            else:
-                logging.info("ℹ️ Telegram bot not configured in this version.")
-        except Exception as exc:
-            logging.error(f"❌ Error starting background services: {exc}")
+        return
 
     def save_learning_data(self) -> None:
         try:
@@ -3366,6 +3373,15 @@ class TradingEngine:
         if self.running.is_set():
             return
         self.running.set()
+        with position_lock:
+            trade_state.update({
+                "state": BotState.IDLE,
+                "ticket": None,
+                "symbol": None,
+                "direction": None,
+                "entry_price": None,
+                "open_time": None,
+            })
         self._notify_status("connecting")
         try:
             if not mt5.initialize():
@@ -3382,12 +3398,23 @@ class TradingEngine:
         self._notify_status("running")
         operation_active = False
         self._notify_trade_state("ready")
+        if self.telegram_controller.enabled and not self._telegram_started:
+            self._telegram_started = True
+            logging.info("📨 Telegram polling enabled on main worker thread.")
+            logging.info("🤖 Telegram bot active and listening commands...")
+        for base_symbol in SYMBOLS:
+            resolved_symbol = resolve_symbol(base_symbol)
+            try:
+                mt5.symbol_select(resolved_symbol, True)
+            except Exception:
+                logging.debug(f"Failed to select symbol {resolved_symbol}")
         with self._processed_lock:
             self._processed_contracts.clear()
         with self._closed_lock:
             self._closed_contracts.clear()
         CSV_LOGGED_CONTRACTS.clear()
 
+        
     def is_running(self) -> bool:
         return self.running.is_set()
 
@@ -3513,7 +3540,6 @@ class TradingEngine:
             regime = "VOLATILE"
         else:
             regime = "CALM"
-        logging.info(f"📊 Market Regime Detected: {regime}{' @ ' + symbol if symbol else ''}")
         return regime
 
     def _apply_regime_adjustments(self, regime: str) -> None:
@@ -3653,61 +3679,63 @@ class TradingEngine:
         confidence = 0.0
         stake = 0.0
         try:
+            failed_candle_count = getattr(self, "failed_candle_count", 0)
+            t_candles = time.time()
             try:
                 candles = fetch_axi_candle_objects(symbol)
             except Exception as exc:
-                logging.warning(f"Error al obtener velas de {symbol}: {exc}")
-                candles = []
-            candle_data = candles
-            failed_candle_count = getattr(self, "failed_candle_count", 0)
-            if not candle_data or "Error" in str(candle_data):
+                logger.error(f"⚠️ Candle fetch error on {symbol}: {exc}")
                 self.failed_candle_count = failed_candle_count + 1
-            else:
-                self.failed_candle_count = 0
-            if self.failed_candle_count >= 4:
-                logging.error("❌ 4 consecutive candle fetch errors — triggering safe restart")
-                try:
-                    self.save_learning_data()
-                    self.save_learning_memory()
-                    send_telegram_message(
-                        "⚠️ Error de conexión detectado en los 4 símbolos.\n♻️ Reinicio automático del bot ejecutado correctamente."
-                    )
-                except Exception as e:
-                    logging.error(f"Error during pre-restart saving: {e}")
-
-                time.sleep(2)
-                safe_restart_windows()
+                # logging.error("❌ 4 consecutive candle fetch errors — triggering safe restart")
+                # try:
+                #     self.save_learning_data()
+                #     self.save_learning_memory()
+                #     send_telegram_message(
+                #         "⚠️ Error de conexión detectado en los 4 símbolos.\n♻️ Reinicio automático del bot ejecutado correctamente."
+                #     )
+                # except Exception as e:
+                #     logging.error(f"Error during pre-restart saving: {e}")
+                # time.sleep(2)
+                # safe_restart_windows()
+                return None
+            self.failed_candle_count = 0
             if not candles:
-                logging.warning(f"Sin velas disponibles para {symbol}, se omite del ciclo")
                 return None
             df = to_dataframe(candles)
             atr_series_calc = atr(df, 14) if not df.empty else pd.Series(dtype=float)
             atr_latest_value = float(atr_series_calc.iloc[-1]) if not atr_series_calc.empty else 0.0
             results, consensus = self._evaluate_strategies(df)
+            strategy_details: Dict[str, Tuple[str, str]] = {}
+            for strategy_name, outcome in results:
+                signal_value = str(getattr(outcome, 'signal', 'NONE') or 'NONE').upper()
+                reasons_list = list(getattr(outcome, 'reasons', []) or [])
+                description = reasons_list[0] if reasons_list else "Sin descripción disponible"
+                strategy_details[strategy_name] = (signal_value, description)
             self._notify_summary(symbol, consensus)
             signal = consensus['signal']
             confidence = consensus['confidence']
             reasons = consensus['reasons']
             for nombre, resultado in results:
-                etiqueta = STRATEGY_DISPLAY_NAMES.get(nombre, nombre)
-                mensaje = resultado.reasons[0] if resultado.reasons else 'Sin comentario'
-                logging.info(f'[{symbol}] {etiqueta}: {mensaje} (señal {resultado.signal})')
-            active_total = consensus['active']
-            signals_total = consensus['signals']
-            etiqueta_conf = consensus['confidence_label'].lower()
-            if active_total == 0:
-                logging.info('⚠️ Sin estrategias activas configuradas')
-            elif signals_total == 0:
-                logging.info('⚠️ Ninguna de las estrategias activas generó señal')
-                logging.info(f"Estrategias activas: {active_total}/{TOTAL_STRATEGY_COUNT}")
-            elif signal == 'NONE':
-                logging.info(f"Estrategias activas: {active_total}/{TOTAL_STRATEGY_COUNT}")
-            else:
-                logging.info(f"Estrategias alineadas: {consensus['aligned']}/{MIN_ALIGNED_STRATEGIES}")
-                logging.info(f"Estrategias activas: {active_total}/{TOTAL_STRATEGY_COUNT}")
-                logging.info(
-                    f"✅ Señal final: {signal} | Confianza {confidence:.2f} | Estrategias activas: {active_total}/{TOTAL_STRATEGY_COUNT}"
-                )
+                if nombre == 'RSI':
+                    rsi_signal = resultado.signal
+                elif nombre == 'EMA Trend':
+                    ema_signal = resultado.signal
+                elif nombre == 'MACD':
+                    macd_signal = resultado.signal
+                elif nombre == 'Pullback':
+                    pullback_signal = resultado.signal
+                elif nombre == 'Bollinger Rebound':
+                    bollinger_signal = resultado.signal
+            volatility_result = next(
+                (
+                    out
+                    for name, out in results
+                    if name == 'Volatility Filter'
+                ),
+                None,
+            )
+            if volatility_result is not None:
+                volatility_signal = volatility_result.signal or 'NONE'
             entry_price = float(df['close'].iloc[-1]) if not df.empty else 0.0
             evaluation: Dict[str, Any] = {
                 'symbol': symbol,
@@ -3753,7 +3781,7 @@ class TradingEngine:
                 ema_corto_valor = float(cache.get('ema_fast', 0.0))
                 ema_largo_valor = float(cache.get('ema_slow', 0.0))
                 boll_width = float(cache.get('boll_width', 0.0))
-                ema_prev_fast = float(cache.get('ema_fast_prev', ema_corto_valor))
+                ema_prev_fast = float(cache.get('ema_fast_prev', cache.get('ema_fast', 0.0)))
             else:
                 latest_rsi_series = rsi(df['close'])
                 latest_rsi = float(latest_rsi_series.iloc[-1]) if not latest_rsi_series.empty else 0.0
@@ -3772,6 +3800,7 @@ class TradingEngine:
                     'ema_slow': ema_largo_valor,
                     'boll_width': boll_width,
                 })
+
             ema_slope = ema_corto_valor - ema_prev_fast
             cache['ema_fast_prev'] = ema_corto_valor
             cache['ema_fast'] = ema_corto_valor
@@ -4084,9 +4113,6 @@ class TradingEngine:
                 final_confidence = 1.0
             else:
                 final_confidence = float(min(final_confidence, 0.95))
-            logging.debug(
-                f"[Fusion] base={confidence:.3f} indicador={indicator_conf:.3f} IA={ai_confidence:.3f} final={final_confidence:.3f}"
-            )
             if final_confidence >= 0.75:
                 evaluation['strong'] = 1
             adx_threshold = auto_learn.get_adx_min_threshold()
@@ -4144,35 +4170,48 @@ class TradingEngine:
             strategies_aligned = aligned_count
             confidence = confidence_value
 
+            logger.info(f"----------- {symbol} -----------")
+            for strategy_key, display_name in STRATEGY_LOG_ORDER:
+                signal_text, description_text = strategy_details.get(
+                    strategy_key,
+                    ('NONE', 'Sin datos disponibles'),
+                )
+                logger.info(
+                    f"[{symbol}] {display_name}: {description_text} (señal {signal_text})"
+                )
+
+            total_enabled = consensus['active']
+            logger.info(f"📊 Estrategias activas: {total_enabled}/{TOTAL_STRATEGY_COUNT}")
+
             logger.info(
-                f"[{symbol}] ✅ Confluence: {aligned_count}/{total_strategies} | "
-                f"Confidence={confidence_value:.2f} | Action={final_action}"
+                f"✅ Estrategias alineadas: {strategies_aligned}/{MIN_ALIGNMENT} | Confianza: {confidence:.2f} | Acción: {final_action}"
             )
 
-            MIN_CONFIDENCE = 0.65
-            MIN_STRATEGIES = 2
-
             if final_action not in {'CALL', 'PUT'}:
-                logger.info(
-                    f"[{symbol}] 🚫 Skipped — no actionable direction detected"
-                )
+                logger.info("❌ SKIPPED: por ausencia de señal válida")
+                logger.info("-----------------------------------------------")
                 return None
 
-            if strategies_aligned < MIN_STRATEGIES:
+            if strategies_aligned < MIN_ALIGNMENT:
                 logger.info(
-                    f"[{symbol}] 🚫 Skipped — insufficient confluence ({strategies_aligned}/{MIN_STRATEGIES})"
+                    f"❌ SKIPPED: confluencia insuficiente ({strategies_aligned}/{MIN_ALIGNMENT})"
                 )
+                logger.info("-----------------------------------------------")
                 return None
 
-            if confidence < MIN_CONFIDENCE:
+            if confidence < CONFIDENCE_THRESHOLD:
                 logger.info(
-                    f"[{symbol}] 🚫 Skipped — confidence {confidence:.2f} < {MIN_CONFIDENCE}"
+                    f"❌ SKIPPED: confianza insuficiente ({confidence:.2f}/{CONFIDENCE_THRESHOLD:.2f})"
                 )
+                logger.info("-----------------------------------------------")
                 return None
+
+            logger.info(f"🚀 OPERACIÓN EJECUTADA → {final_action} ({symbol})")
+            logger.info("-----------------------------------------------")
 
             return evaluation
         except Exception as exc:
-            logging.warning(f"Error en ciclo para {symbol}: {exc}")
+            logger.error(f"Error en ciclo para {symbol}: {exc}")
             return None
         finally:
             if combined_base_action is None:
@@ -4411,69 +4450,76 @@ class TradingEngine:
         return True
 
     def scan_market(self) -> None:
+        if not self._cycle_lock.acquire(blocking=False):
+            return
+        self._cycle_running = True
+        try:
+            self._scan_market_impl()
+        finally:
+            self._cycle_running = False
+            self._cycle_lock.release()
+
+    def _scan_market_impl(self) -> None:
         if not self.running.is_set():
             return
+        if self._telegram_started:
+            self.telegram_controller.poll(self)
+        self.ai.advisory_tick()
+        slp_tick()
         if not BOT_ACTIVE:
             logging.info("⏸ Bot paused — waiting for Telegram resume command.")
             time.sleep(5)
             return
         now = time.time()
         if now < self._next_cycle_time:
-            QtWidgets.QApplication.processEvents(QtCore.QEventLoop.AllEvents, 50)
+            time.sleep(0.05)
             return
         self._cycle_id_counter += 1
         self._current_cycle_id = self._cycle_id_counter
         trade_executed = False
         symbols = list(SYMBOLS)
         def _cycle_pause(delay: float = 0.5) -> None:
-            QtWidgets.QApplication.processEvents(QtCore.QEventLoop.AllEvents, 50)
             self._next_cycle_time = time.time() + delay
+            if delay > 0:
+                time.sleep(min(delay, 0.5))
 
         evaluations_found = False
         min_required = auto_learn.get_min_confidence()
 
         for symbol in symbols:
+            time.sleep(0.001)
             if not self.running.is_set():
                 break
             evaluation = self._evaluate_symbol(symbol)
+            if not self.running.is_set():
+                break
             if evaluation is None:
+                QThread.msleep(1)
                 continue
+
             evaluations_found = True
             probability = float(evaluation.get('predicted_probability', 0.5))
             evaluation['stake'] = self._calculate_kelly_stake(probability)
-            if evaluation.get('confluence_confirmed'):
-                if self.confirm_and_execute(evaluation):
-                    trade_executed = True
-                    break
 
-            signal = evaluation.get('signal')
-            if signal not in {'CALL', 'PUT'}:
-                continue
-
-            is_strong = int(evaluation.get('strong', 0)) == 1
-            confidence_raw = evaluation.get('final_confidence')
-            confidence_value = float(confidence_raw) if confidence_raw is not None else 0.0
-            if not is_strong and confidence_value < min_required:
-                continue
-
-            volatility_value_raw = evaluation.get('volatility')
-            volatility_value: Optional[float] = None
-            if volatility_value_raw is not None:
-                try:
-                    volatility_value = float(volatility_value_raw)
-                except (TypeError, ValueError):
-                    volatility_value = None
-            volatility_display = f"{volatility_value:.4f}" if volatility_value is not None else "N/A"
-            logging.info(
-                f"📊 Final confidence {symbol}: {confidence_value:.2f} | Volatility: {volatility_display} | Action: {signal}"
-            )
-
-            logging.info(
-                f"🚀 Executing trade on {symbol} | Confidence={confidence_value:.2f}"
-            )
-            if self._execute_selected_trade(evaluation):
+            if evaluation.get('confluence_confirmed') and self.confirm_and_execute(evaluation):
                 trade_executed = True
+            else:
+                signal = evaluation.get('signal')
+                if signal not in {'CALL', 'PUT'}:
+                    QThread.msleep(1)
+                    continue
+                confidence_raw = evaluation.get('final_confidence')
+                confidence_value = float(confidence_raw) if confidence_raw is not None else 0.0
+                is_strong = int(evaluation.get('strong', 0)) == 1
+                if not is_strong and confidence_value < min_required:
+                    QThread.msleep(1)
+                    continue
+                if self._execute_selected_trade(evaluation):
+                    trade_executed = True
+
+            if trade_executed:
                 break
+            QThread.msleep(1)
 
         if not self.running.is_set():
             _cycle_pause()
@@ -4792,7 +4838,9 @@ class TradingEngine:
             fallback_atr = compute_atr_for_symbol(symbol)
             if fallback_atr > 0.0:
                 atr_value = fallback_atr
-        symbol_info = mt5.symbol_info(symbol)
+        resolved_symbol = resolve_symbol(symbol)
+        mt5.symbol_select(resolved_symbol, True)
+        symbol_info = mt5.symbol_info(resolved_symbol)
         if symbol_info is None:
             logger.error(f"[{symbol}] ❌ Cannot get symbol info")
             return False
@@ -4861,11 +4909,25 @@ class TradingEngine:
         trade_profit: Optional[float] = None
         try:
             order_result, trade_profit = execute_market_order(
-                symbol, final_action, atr_value, LOT_SIZE
+                symbol, final_action, atr_value, LOT_SIZE, confidence_value
             )
             logger.info(
                 f"🚀 EXECUTED MARKET ORDER {symbol} → {final_action} | Confidence={confidence_value:.2f}"
             )
+            try:
+                send_telegram_message(
+                    (
+                        "✅ Operación ejecutada\n"
+                        f"Símbolo: {symbol}\n"
+                        f"Acción: {final_action}\n"
+                        f"Confianza: {confidence_value:.2f}"
+                    )
+                )
+            except Exception:
+                logging.debug(
+                    "No se pudo enviar notificación de operación ejecutada por Telegram",
+                    exc_info=True,
+                )
         except Exception as exc:
             logging.warning(f"No se pudo enviar la orden MT5: {exc}")
             self._notify_trade_state("ready")
@@ -4897,6 +4959,8 @@ class TradingEngine:
                 logging.debug(f"Ticket #{contract_id} ya procesado, omitiendo duplicado de resultados")
                 return trade_initiated
             self.risk.register_trade(pnl)
+            if contract_id is not None:
+                on_order_closed(contract_id, trade_result, pnl)
             if features is not None:
                 self.ai.log_trade(features, 1 if trade_result == 'WIN' else 0)
             strategy_details = {
@@ -5130,20 +5194,9 @@ class TradingEngine:
             self._notify_trade_state("ready")
         return trade_initiated
 
-    def run(self) -> None:
-        self.start_engine()
-        try:
-            while self.running.is_set():
-                cycle_start = time.time()
-                self.scan_market()
-                if not self.running.is_set():
-                    break
-                elapsed = time.time() - cycle_start
-                if elapsed > 3.0:
-                    logging.warning(f"⚠️ Cycle timeout ({elapsed:.2f}s) — forcing next iteration")
-                QtCore.QThread.msleep(100)
-        finally:
-            self.stop()
+    def run_unused_do_not_call(self) -> None:
+        """[DEPRECATED] BotWorker drives the trading cycle."""
+        return
 
     def stop(self) -> None:
         global operation_active
@@ -5151,6 +5204,7 @@ class TradingEngine:
         operation_active = False
         self.active_trade_symbol = None
         self._notify_trade_state("ready")
+        self._telegram_started = False
         self.ai.shutdown()
         try:
             mt5.shutdown()
@@ -5161,6 +5215,16 @@ class TradingEngine:
         with self._closed_lock:
             self._closed_contracts.clear()
         CSV_LOGGED_CONTRACTS.clear()
+
+        with position_lock:
+            trade_state.update({
+                "state": BotState.IDLE,
+                "ticket": None,
+                "symbol": None,
+                "direction": None,
+                "entry_price": None,
+                "open_time": None,
+            })
 
 
 # ===============================================================
@@ -5193,18 +5257,19 @@ class QtLogHandler(logging.Handler):
         self.emitter.message.emit(message)
 
 
-class BotThread(QThread):
+class BotWorker(QtCore.QThread):
     log_signal = pyqtSignal(str)
     result_signal = pyqtSignal(dict)
 
     def __init__(self, engine: TradingEngine) -> None:
         super().__init__()
         self.engine = engine
-        self._active = True
+        self.running = threading.Event()
+        self._cycle_running = False
+        self._market_locked = False
         self._closed_contracts: Set[int] = set()
         self.logged_contracts: Set[int] = set()
         self._result_callback = self._handle_trade_result
-        self.engine.add_result_listener(self._result_callback)
 
     def _normalize_contract_id(self, value: Any) -> Optional[int]:
         if value is None:
@@ -5217,7 +5282,6 @@ class BotThread(QThread):
     def _handle_trade_result(self, data: Dict[str, Any]) -> None:
         contract_id = self._normalize_contract_id(data.get("ticket") or data.get("contract_id"))
         if contract_id is not None:
-            self.logged_contracts = getattr(self, "logged_contracts", set())
             logged_contracts = self.logged_contracts
             if contract_id in logged_contracts:
                 logging.debug(f"Duplicate ticket {contract_id} ignored.")
@@ -5230,48 +5294,69 @@ class BotThread(QThread):
             mensaje = f"✅ Ticket #{ticket} {resultado}"
         else:
             mensaje = f"✅ Ticket {resultado}"
-        self.log_signal.emit(mensaje)
+        self.log_signal.emit(str(mensaje))
         self.result_signal.emit(dict(data))
 
-    def run(self) -> None:  # type: ignore[override]
-        logging.info("🚀 BotThread started successfully.")
-        self._active = True
+    @pyqtSlot()
+    def run(self) -> None:
+        import threading
+        logging.warning(f"🚨 BotWorker RUN STARTED — THREAD ID: {threading.get_ident()}")
+        if getattr(self, "_cycle_running", False):
+            logging.warning("⛔ run() ignored — cycle already running")
+            return
+
+        self._cycle_running = True
+        self.running.set()
+        logging.info("🚀 BotWorker started successfully.")
+        logging.info("🟢 AXIBOT STARTED — Single worker thread active")
         self._closed_contracts.clear()
         self.logged_contracts.clear()
+        self.engine.add_result_listener(self._result_callback)
         try:
-            self.engine.start_engine()
-        except Exception as exc:
-            logging.error(f"Thread error: {exc}")
-            self._active = False
-            return
-        try:
-            while self._active and self.engine.is_running():
+            try:
+                self.engine.start_engine()
+            except Exception as exc:
+                logging.error(f"Thread error: {exc}")
+                self.running.clear()
+                return
+            while self.running.is_set() and self.engine.is_running():
                 start_time = time.time()
+                if getattr(self, "_market_locked", False):
+                    time.sleep(0.05)
+                    continue
+                self._market_locked = True
                 try:
                     self.engine.scan_market()
                 except Exception as exc:
                     logging.error(f"Thread error: {exc}")
+                    try:
+                        self.log_signal.emit(f"❌ Worker error: {exc}")
+                    except Exception:
+                        logging.debug("Failed to emit worker error", exc_info=True)
                     break
+                finally:
+                    self._market_locked = False
                 elapsed = time.time() - start_time
-                if elapsed > 3.0:
+                if elapsed > CYCLE_TIMEOUT:
                     logging.warning(f"⚠️ Cycle timeout ({elapsed:.2f}s) — forcing next iteration")
-                if not self._active or not self.engine.is_running():
+                if not self.running.is_set() or not self.engine.is_running():
                     break
-                QThread.msleep(100)
+                time.sleep(0.1)
         finally:
-            self.engine.stop()
-            self.engine.remove_result_listener(self._result_callback)
-            logging.info("🧩 BotThread stopped.")
-            self._active = False
+            self.running.clear()
+            self._cycle_running = False
+            try:
+                self.engine.stop()
+            finally:
+                self.engine.remove_result_listener(self._result_callback)
+                logging.info("🧩 BotWorker stopped.")
 
+    @pyqtSlot()
     def stop(self) -> None:
-        self._active = False
+        self.running.clear()
         self.engine.stop()
-        self.engine.remove_result_listener(self._result_callback)
         self._closed_contracts.clear()
         self.logged_contracts.clear()
-
-
 class BotWindow(QtWidgets.QWidget):
     def __init__(self) -> None:
         super().__init__()
@@ -5299,6 +5384,8 @@ class BotWindow(QtWidgets.QWidget):
         self.log_view = QtWidgets.QPlainTextEdit()
         self.log_view.setReadOnly(True)
 
+        ui_bus.bridge.log_signal.connect(self.append_log, type=QtCore.Qt.QueuedConnection)
+
         self.bridge = EngineBridge()
         self.bridge.trade.connect(self._on_trade)
         self.bridge.status.connect(self._on_status)
@@ -5309,11 +5396,11 @@ class BotWindow(QtWidgets.QWidget):
         existing_handler = next((h for h in logger.handlers if isinstance(h, QtLogHandler)), None)
         if existing_handler is None:
             self.log_handler = QtLogHandler()
-            self.log_handler.emitter.message.connect(self._append_log)
+            self.log_handler.emitter.message.connect(self.append_log)
             logger.addHandler(self.log_handler)
         else:
             self.log_handler = existing_handler
-            self.log_handler.emitter.message.connect(self._append_log)
+            self.log_handler.emitter.message.connect(self.append_log)
 
         self.engine = TradingEngine()
         global global_engine
@@ -5322,11 +5409,14 @@ class BotWindow(QtWidgets.QWidget):
         self.engine.add_status_listener(lambda status: self.bridge.status.emit(status))
         self.engine.add_summary_listener(lambda symbol, data: self.bridge.summary.emit(symbol, data))
         self.engine.add_trade_state_listener(lambda state: self.bridge.trade_state.emit(state))
+        gui.register_open_callback(self._dispatch_gui_open)
+        gui.register_close_callback(self._dispatch_gui_close)
         self.strategy_initial_state = self._load_strategy_config()
         for name, enabled in self.strategy_initial_state.items():
             self.engine.set_strategy_state(name, enabled)
 
-        self.bot_thread: Optional[BotThread] = None
+        self.worker: Optional[BotWorker] = None
+        self._worker_started = False
         self.latest_stats: Dict[str, float] = {
             "operations": 0.0,
             "wins": 0.0,
@@ -5729,23 +5819,36 @@ class BotWindow(QtWidgets.QWidget):
             engine.set_learning_enabled(enabled)
 
     def start_trading(self) -> None:
-        if self.bot_thread is not None and self.bot_thread.isRunning():
+        global BOT_WORKER_STARTED
+        if BOT_WORKER_STARTED:
+            logging.warning("🚫 Global guard: BotWorker already started.")
             return
+        if hasattr(self, "worker") and self.worker is not None and self.worker.isRunning():
+            logging.warning("🚫 Worker already running — second worker creation blocked.")
+            return
+        self._worker_started = True
         self.auto_shutdown_active = False
         self.engine.auto_shutdown_triggered = False
         self.logged_contracts.clear()
         self.pending_contracts.clear()
-        self.bot_thread = BotThread(self.engine)
-        self.bot_thread.finished.connect(self._on_thread_finished)
-        self.bot_thread.log_signal.connect(self._append_log)
-        self.bot_thread.result_signal.connect(self.update_result_table)
-        self.bot_thread.start()
+        self.worker = BotWorker(self.engine)
+        logging.warning("🟢 BotWorker created (unique instance).")
+        self.worker.log_signal.connect(self.append_log, QtCore.Qt.QueuedConnection)
+        self.worker.result_signal.connect(self.update_result_table)
+        self.worker.finished.connect(self._on_worker_finished)
+        self.worker.start()
+        BOT_WORKER_STARTED = True
         self.start_button.setEnabled(False)
         self.stop_button.setEnabled(True)
         self.status_label.setText("Estado: Iniciando...")
 
     def stop_trading(self) -> None:
-        if self.bot_thread is None:
+        worker = getattr(self, "worker", None)
+        if worker is None or not worker.isRunning():
+            self.worker = None
+            self._worker_started = False
+            global BOT_WORKER_STARTED
+            BOT_WORKER_STARTED = False
             if self.auto_shutdown_active:
                 self.auto_shutdown_active = False
                 self.start_button.setEnabled(True)
@@ -5753,9 +5856,14 @@ class BotWindow(QtWidgets.QWidget):
                 self.status_label.setText("Estado: Detenido")
                 self._on_trade_state("ready")
             return
-        self.bot_thread.stop()
-        self.bot_thread.wait(2000)
-        self.bot_thread = None
+        worker.running.clear()
+        worker.stop()
+        worker.quit()
+        worker.wait()
+        logging.warning("🛑 BotWorker stopped cleanly.")
+        self.worker = None
+        self._worker_started = False
+        BOT_WORKER_STARTED = False
         self.start_button.setEnabled(True)
         self.stop_button.setEnabled(False)
         self.status_label.setText("Estado: Detenido")
@@ -5791,7 +5899,8 @@ class BotWindow(QtWidgets.QWidget):
         self.engine.configure_auto_shutdown(habilitado, limite)
         if not habilitado and self.auto_shutdown_active:
             self.auto_shutdown_active = False
-            if self.bot_thread is None:
+            worker = getattr(self, "worker", None)
+            if worker is None or not worker.isRunning():
                 self.start_button.setEnabled(True)
 
     def _on_kelly_toggled(self, checked: bool) -> None:
@@ -5974,8 +6083,11 @@ class BotWindow(QtWidgets.QWidget):
         if hasattr(self, "trade_state_label"):
             self.trade_state_label.setText(texto)
 
-    def _on_thread_finished(self) -> None:
-        self.bot_thread = None
+    def _on_worker_finished(self) -> None:
+        self.worker = None
+        self._worker_started = False
+        global BOT_WORKER_STARTED
+        BOT_WORKER_STARTED = False
         if self.auto_shutdown_active:
             self.start_button.setEnabled(False)
             self.stop_button.setEnabled(True)
@@ -5986,17 +6098,43 @@ class BotWindow(QtWidgets.QWidget):
             self.status_label.setText("Estado: Detenido")
         self._on_trade_state("ready")
 
-    def _append_log(self, message: str) -> None:
+    def _dispatch_gui_status(self, message: str) -> None:
+        QtCore.QTimer.singleShot(0, lambda m=message: self.append_log(f"[STATUS] {m}"))
+
+    def _dispatch_gui_open(self, payload: Dict[str, Any]) -> None:
+        def handler(data=dict(payload)):
+            symbol = str(data.get('symbol', '-'))
+            direction = str(data.get('direction', '-'))
+            confidence = data.get('confidence')
+            entry = data.get('entry')
+            sl_pips = data.get('sl_pips')
+            parts = [f"[TRADE] OPEN {symbol} {direction}"]
+            if isinstance(confidence, (int, float)):
+                parts.append(f"conf={float(confidence):.2f}")
+            if isinstance(entry, (int, float)):
+                parts.append(f"entry={float(entry):.5f}")
+            if isinstance(sl_pips, (int, float)):
+                parts.append(f"SL={int(sl_pips)}p")
+            self.append_log(" | ".join(parts))
+        QtCore.QTimer.singleShot(0, handler)
+
+    def _dispatch_gui_close(self, payload: Dict[str, Any]) -> None:
+        def handler(data=dict(payload)):
+            ticket = data.get('ticket', '-')
+            result = data.get('result', '-')
+            pnl = data.get('pnl')
+            parts = [f"[TRADE] CLOSE ticket={ticket} result={result}"]
+            if isinstance(pnl, (int, float)):
+                parts.append(f"pnl={float(pnl):.2f}")
+            self.append_log(" | ".join(parts))
+        QtCore.QTimer.singleShot(0, handler)
+
+    @pyqtSlot(str)
+    def append_log(self, message: str):
         try:
-            if hasattr(self, "log_view") and self.log_view:
-                self.log_view.appendPlainText(message)
-                self.log_view.verticalScrollBar().setValue(
-                    self.log_view.verticalScrollBar().maximum()
-                )
-            else:
-                print(message)
-        except Exception as exc:
-            print(f"[LogError] {exc}: {message}")
+            self.log_view.appendPlainText(message)
+        except Exception:
+            pass
 
     def _update_stats_labels(self, stats: Dict[str, float]) -> None:
         self.stats_values["Operaciones"].setText(str(int(stats.get("operations", 0.0))))
@@ -6169,9 +6307,17 @@ class BotWindow(QtWidgets.QWidget):
                 self.history_list.addItem(item)
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # type: ignore[override]
-        if self.bot_thread is not None and self.bot_thread.isRunning():
-            self.bot_thread.stop()
-            self.bot_thread.wait(2000)
+        worker = getattr(self, "worker", None)
+        if worker is not None and worker.isRunning():
+            worker.running.clear()
+            worker.stop()
+            worker.quit()
+            worker.wait()
+            logging.warning("🛑 BotWorker stopped cleanly.")
+        self.worker = None
+        self._worker_started = False
+        global BOT_WORKER_STARTED
+        BOT_WORKER_STARTED = False
         logging.getLogger().removeHandler(self.log_handler)
         super().closeEvent(event)
 
