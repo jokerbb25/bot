@@ -5280,15 +5280,16 @@ class QtLogHandler(logging.Handler):
         self.emitter.message.emit(message)
 
 
-class BotWorker(QtCore.QObject):
+class BotWorker(QtCore.QThread):
     log_signal = pyqtSignal(str)
     result_signal = pyqtSignal(dict)
-    finished = pyqtSignal()
 
     def __init__(self, engine: TradingEngine) -> None:
         super().__init__()
         self.engine = engine
-        self._active = False
+        self.running = threading.Event()
+        self._cycle_running = False
+        self._market_locked = False
         self._closed_contracts: Set[int] = set()
         self.logged_contracts: Set[int] = set()
         self._result_callback = self._handle_trade_result
@@ -5304,7 +5305,6 @@ class BotWorker(QtCore.QObject):
     def _handle_trade_result(self, data: Dict[str, Any]) -> None:
         contract_id = self._normalize_contract_id(data.get("ticket") or data.get("contract_id"))
         if contract_id is not None:
-            self.logged_contracts = getattr(self, "logged_contracts", set())
             logged_contracts = self.logged_contracts
             if contract_id in logged_contracts:
                 logging.debug(f"Duplicate ticket {contract_id} ignored.")
@@ -5329,8 +5329,8 @@ class BotWorker(QtCore.QObject):
             return
 
         self._cycle_running = True
+        self.running.set()
         logging.info("🚀 BotWorker started successfully.")
-        self._active = True
         self._closed_contracts.clear()
         self.logged_contracts.clear()
         self.engine.add_result_listener(self._result_callback)
@@ -5339,9 +5339,9 @@ class BotWorker(QtCore.QObject):
                 self.engine.start_engine()
             except Exception as exc:
                 logging.error(f"Thread error: {exc}")
-                self._active = False
+                self.running.clear()
                 return
-            while self._active and self.engine.is_running():
+            while self.running.is_set() and self.engine.is_running():
                 start_time = time.time()
                 if getattr(self, "_market_locked", False):
                     time.sleep(0.05)
@@ -5361,27 +5361,24 @@ class BotWorker(QtCore.QObject):
                 elapsed = time.time() - start_time
                 if elapsed > CYCLE_TIMEOUT:
                     logging.warning(f"⚠️ Cycle timeout ({elapsed:.2f}s) — forcing next iteration")
-                if not self._active or not self.engine.is_running():
+                if not self.running.is_set() or not self.engine.is_running():
                     break
                 time.sleep(0.1)
         finally:
+            self.running.clear()
             self._cycle_running = False
             try:
                 self.engine.stop()
             finally:
                 self.engine.remove_result_listener(self._result_callback)
                 logging.info("🧩 BotWorker stopped.")
-                self._active = False
-                self.finished.emit()
 
     @pyqtSlot()
     def stop(self) -> None:
-        self._active = False
+        self.running.clear()
         self.engine.stop()
         self._closed_contracts.clear()
         self.logged_contracts.clear()
-
-
 class BotWindow(QtWidgets.QWidget):
     def __init__(self) -> None:
         super().__init__()
@@ -5440,8 +5437,7 @@ class BotWindow(QtWidgets.QWidget):
         for name, enabled in self.strategy_initial_state.items():
             self.engine.set_strategy_state(name, enabled)
 
-        self.bot_thread: Optional[QtCore.QThread] = None
-        self.bot_worker: Optional[BotWorker] = None
+        self.worker: Optional[BotWorker] = None
         self._worker_started = False
         self.latest_stats: Dict[str, float] = {
             "operations": 0.0,
@@ -5845,40 +5841,28 @@ class BotWindow(QtWidgets.QWidget):
             engine.set_learning_enabled(enabled)
 
     def start_trading(self) -> None:
-        if self.bot_thread is not None and self.bot_thread.isRunning():
-            logging.warning("🚫 Worker is already running — second worker creation blocked.")
-            return
-        if self.bot_worker is not None and getattr(self.bot_worker, "_active", False):
-            logging.warning("🚫 Worker is already running — second worker creation blocked.")
-            return
-        if self._worker_started:
-            logging.warning("🚫 Worker is already running — second worker creation blocked.")
+        if hasattr(self, "worker") and self.worker is not None and self.worker.isRunning():
+            logging.warning("🚫 Worker already running — second worker creation blocked.")
             return
         self._worker_started = True
         self.auto_shutdown_active = False
         self.engine.auto_shutdown_triggered = False
         self.logged_contracts.clear()
         self.pending_contracts.clear()
-        self.bot_thread = QtCore.QThread()
-        self.bot_worker = BotWorker(self.engine)
-        logging.warning("🟢 Worker created (unique instance).")
-        self.bot_worker.moveToThread(self.bot_thread)
-        self.bot_worker.log_signal.connect(self.append_log, QtCore.Qt.QueuedConnection)
-        self.bot_worker.result_signal.connect(self.update_result_table)
-        self.bot_worker.finished.connect(self.bot_thread.quit)
-        self.bot_worker.finished.connect(self._on_worker_finished)
-        self.bot_thread.started.connect(self.bot_worker.run)
-        self.bot_thread.finished.connect(self._on_thread_finished)
-        self.bot_thread.start()
+        self.worker = BotWorker(self.engine)
+        logging.warning("🟢 BotWorker created (unique instance).")
+        self.worker.log_signal.connect(self.append_log, QtCore.Qt.QueuedConnection)
+        self.worker.result_signal.connect(self.update_result_table)
+        self.worker.finished.connect(self._on_worker_finished)
+        self.worker.start()
         self.start_button.setEnabled(False)
         self.stop_button.setEnabled(True)
         self.status_label.setText("Estado: Iniciando...")
 
     def stop_trading(self) -> None:
-        if self.bot_thread is None or not self.bot_thread.isRunning():
-            if self.bot_thread is not None and not self.bot_thread.isRunning():
-                self.bot_thread = None
-            self.bot_worker = None
+        worker = getattr(self, "worker", None)
+        if worker is None or not worker.isRunning():
+            self.worker = None
             self._worker_started = False
             if self.auto_shutdown_active:
                 self.auto_shutdown_active = False
@@ -5887,13 +5871,12 @@ class BotWindow(QtWidgets.QWidget):
                 self.status_label.setText("Estado: Detenido")
                 self._on_trade_state("ready")
             return
-        if self.bot_worker is not None:
-            self.bot_worker.stop()
-        self.bot_thread.quit()
-        self.bot_thread.wait(2000)
-        logging.warning("🛑 Worker stopped cleanly.")
-        self.bot_thread = None
-        self.bot_worker = None
+        worker.running.clear()
+        worker.stop()
+        worker.quit()
+        worker.wait()
+        logging.warning("🛑 BotWorker stopped cleanly.")
+        self.worker = None
         self._worker_started = False
         self.start_button.setEnabled(True)
         self.stop_button.setEnabled(False)
@@ -5930,7 +5913,8 @@ class BotWindow(QtWidgets.QWidget):
         self.engine.configure_auto_shutdown(habilitado, limite)
         if not habilitado and self.auto_shutdown_active:
             self.auto_shutdown_active = False
-            if self.bot_thread is None:
+            worker = getattr(self, "worker", None)
+            if worker is None or not worker.isRunning():
                 self.start_button.setEnabled(True)
 
     def _on_kelly_toggled(self, checked: bool) -> None:
@@ -6114,12 +6098,7 @@ class BotWindow(QtWidgets.QWidget):
             self.trade_state_label.setText(texto)
 
     def _on_worker_finished(self) -> None:
-        self.bot_worker = None
-        self._worker_started = False
-
-    def _on_thread_finished(self) -> None:
-        self.bot_thread = None
-        self.bot_worker = None
+        self.worker = None
         self._worker_started = False
         if self.auto_shutdown_active:
             self.start_button.setEnabled(False)
@@ -6340,14 +6319,14 @@ class BotWindow(QtWidgets.QWidget):
                 self.history_list.addItem(item)
 
     def closeEvent(self, event: QtGui.QCloseEvent) -> None:  # type: ignore[override]
-        if self.bot_thread is not None and self.bot_thread.isRunning():
-            if self.bot_worker is not None:
-                self.bot_worker.stop()
-            self.bot_thread.quit()
-            self.bot_thread.wait(2000)
-            logging.warning("🛑 Worker stopped cleanly.")
-        self.bot_thread = None
-        self.bot_worker = None
+        worker = getattr(self, "worker", None)
+        if worker is not None and worker.isRunning():
+            worker.running.clear()
+            worker.stop()
+            worker.quit()
+            worker.wait()
+            logging.warning("🛑 BotWorker stopped cleanly.")
+        self.worker = None
         self._worker_started = False
         logging.getLogger().removeHandler(self.log_handler)
         super().closeEvent(event)
