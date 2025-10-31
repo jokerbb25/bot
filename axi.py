@@ -4155,13 +4155,15 @@ class TradingEngine:
                 return None
 
             if strategies_aligned < required_confluence:
-                logger.info("❌ SKIPPED: por confluencia insuficiente (2/2 requeridas)")
+                logger.info(
+                    f"❌ SKIPPED: confluencia detectada {strategies_aligned}/{required_confluence} (mínimo requerido {required_confluence})"
+                )
                 logger.info("-----------------------------------------------")
                 return None
 
             if confidence < required_confidence:
                 logger.info(
-                    f"❌ SKIPPED: por confianza insuficiente {confidence:.2f} / {required_confidence}"
+                    f"❌ SKIPPED: confianza insuficiente ({confidence:.2f}/{required_confidence:.2f})"
                 )
                 logger.info("-----------------------------------------------")
                 return None
