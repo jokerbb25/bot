@@ -1,0 +1,19 @@
+symbols:
+  - EURUSD
+  - XAUUSD
+  - BTCUSD
+
+timeframe: M1
+
+thresholds:
+  base_confidence: 0.70
+  range_confidence: 0.75
+  strong_trend: 0.65
+
+volatility:
+  atr_percentage:
+    forex: 0.15
+    metals: 0.25
+    crypto: 0.40
+
+poll_interval: 5
