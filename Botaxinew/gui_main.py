@@ -166,7 +166,7 @@ class BotAxiGUI(QWidget):
         self.confidence_bar = QProgressBar()
         self.confidence_bar.setRange(0, 100)
         self.confidence_bar.setValue(0)
-        self.confidence_bar.setMinimumHeight(26)
+        self.confidence_bar.setMinimumHeight(20)
 
         self.trade_table = QTableWidget(0, 7)
         self.trade_table.setHorizontalHeaderLabels([
@@ -180,7 +180,7 @@ class BotAxiGUI(QWidget):
         ])
         header = self.trade_table.horizontalHeader()
         header.setSectionResizeMode(QHeaderView.Fixed)
-        column_widths = [80, 80, 80, 80, 80, 80, 120]
+        column_widths = [75, 75, 70, 70, 75, 70, 120]
         for index, width in enumerate(column_widths):
             self.trade_table.setColumnWidth(index, width)
         self.trade_table.verticalHeader().setVisible(False)
@@ -218,6 +218,7 @@ class BotAxiGUI(QWidget):
         summary_tab = self._build_summary_tab()
         config_tab = self._build_config_tab()
         learning_tab = self._build_learning_tab()
+        log_tab = self._build_log_tab()
 
         self.tabs = QTabWidget()
         self.tabs.addTab(general_tab, "General")
@@ -225,6 +226,7 @@ class BotAxiGUI(QWidget):
         self.tabs.addTab(summary_tab, "Resumen")
         self.tabs.addTab(config_tab, "Configuración")
         self.tabs.addTab(learning_tab, "Aprendizaje")
+        self.tabs.addTab(log_tab, "Log")
 
         layout = QVBoxLayout()
         layout.addWidget(self.tabs)
@@ -289,12 +291,8 @@ class BotAxiGUI(QWidget):
 
         layout.addLayout(header_layout)
         layout.addLayout(config_grid)
-        layout.addWidget(self.confidence_label)
-        layout.addWidget(self.confidence_bar)
         layout.addLayout(performance_layout)
         layout.addWidget(self.trade_table)
-        layout.addWidget(QLabel("Logs"))
-        layout.addWidget(self.log_view)
         return widget
 
     def _build_strategies_tab(self) -> QWidget:
@@ -331,6 +329,15 @@ class BotAxiGUI(QWidget):
         layout.addWidget(self.summary_precision)
         layout.addWidget(self.summary_pnl)
         layout.addStretch(1)
+        return widget
+
+    def _build_log_tab(self) -> QWidget:
+        widget = QWidget()
+        layout = QVBoxLayout(widget)
+        layout.addWidget(self.confidence_label)
+        layout.addWidget(self.confidence_bar)
+        layout.addWidget(QLabel("Logs"))
+        layout.addWidget(self.log_view)
         return widget
 
     def _build_config_tab(self) -> QWidget:
