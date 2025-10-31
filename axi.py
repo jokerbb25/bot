@@ -5323,6 +5323,11 @@ class BotWorker(QtCore.QObject):
 
     @pyqtSlot()
     def run(self) -> None:
+        if getattr(self, "_cycle_running", False):
+            logging.warning("⛔ run() ignored — cycle already running")
+            return
+
+        self._cycle_running = True
         logging.info("🚀 BotWorker started successfully.")
         self._active = True
         self._closed_contracts.clear()
@@ -5337,6 +5342,10 @@ class BotWorker(QtCore.QObject):
                 return
             while self._active and self.engine.is_running():
                 start_time = time.time()
+                if getattr(self, "_market_locked", False):
+                    time.sleep(0.05)
+                    continue
+                self._market_locked = True
                 try:
                     self.engine.scan_market()
                 except Exception as exc:
@@ -5346,6 +5355,8 @@ class BotWorker(QtCore.QObject):
                     except Exception:
                         logging.debug("Failed to emit worker error", exc_info=True)
                     break
+                finally:
+                    self._market_locked = False
                 elapsed = time.time() - start_time
                 if elapsed > CYCLE_TIMEOUT:
                     logging.warning(f"⚠️ Cycle timeout ({elapsed:.2f}s) — forcing next iteration")
@@ -5353,6 +5364,7 @@ class BotWorker(QtCore.QObject):
                     break
                 time.sleep(0.1)
         finally:
+            self._cycle_running = False
             try:
                 self.engine.stop()
             finally:
