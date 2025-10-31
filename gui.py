@@ -45,7 +45,7 @@ def push_status(message: str) -> None:
     text = str(message)
     if trade_state.get("state") == BotState.OPEN and "NEUTRAL" in text.upper():
         return
-    logger.info(text)
+    # removed console logging to avoid duplicate
     for callback in list(_status_callbacks):
         try:
             callback(text)

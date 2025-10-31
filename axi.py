@@ -3128,10 +3128,6 @@ class TradingEngine:
 
     def _log(self, message: str) -> None:
         logging.info(message)
-        try:
-            ui_bus.bridge.log_signal.emit(message)
-        except Exception:
-            logging.debug('Failed to emit log message', exc_info=True)
 
 
     def add_trade_listener(self, callback: Callable[[TradeRecord, Dict[str, float]], None]) -> None:
