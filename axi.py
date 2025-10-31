@@ -5204,7 +5204,7 @@ class TradingEngine:
             self._notify_trade_state("ready")
         return trade_initiated
 
-    def run(self) -> None:
+    def run_unused_do_not_call(self) -> None:
         self.start_engine()
         try:
             while self.running.is_set():
