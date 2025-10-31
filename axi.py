@@ -4127,20 +4127,26 @@ class TradingEngine:
             strategies_aligned = aligned_count
             confidence = confidence_value
 
+            logger.info(f"----------- {symbol} -----------")
             logger.info(f"[{symbol}] RSI: {rsi_signal}")
             logger.info(f"[{symbol}] EMA: {ema_signal}")
             logger.info(f"[{symbol}] MACD: {macd_signal}")
             logger.info(f"[{symbol}] Pullback: {pullback_signal}")
             logger.info(f"[{symbol}] Bollinger: {bollinger_signal}")
+            logger.info(f"[{symbol}] ADX: {adx_signal}")
+            logger.info(f"[{symbol}] Candle Momentum: {candle_signal}")
+            logger.info(f"[{symbol}] Breakout: {range_break_signal}")
+            logger.info(f"[{symbol}] Divergence: {divergence_signal}")
+            logger.info(f"[{symbol}] Volatility: {volatility_signal}")
 
-            active_total = consensus['active']
-            logger.info(f"📊 Estrategias activas: {active_total}/{TOTAL_STRATEGY_COUNT}")
+            total_enabled = consensus['active']
+            logger.info(f"📊 Estrategias activas: {total_enabled}/{TOTAL_STRATEGY_COUNT}")
 
             required_confluence = 2
             required_confidence = 0.65
 
             logger.info(
-                f"✅ Estrategias Alineadas {strategies_aligned}/{required_confluence} | Confianza: {confidence:.2f} | Action: {final_action}"
+                f"✅ Estrategias alineadas: {strategies_aligned}/{required_confluence} | Confianza: {confidence:.2f} | Acción: {final_action}"
             )
 
             if final_action not in {'CALL', 'PUT'}:
@@ -4149,12 +4155,14 @@ class TradingEngine:
                 return None
 
             if strategies_aligned < required_confluence:
-                logger.info(f"❌ SKIPPED: por confluencia insuficiente ({strategies_aligned}/{required_confluence} requeridas)")
+                logger.info("❌ SKIPPED: por confluencia insuficiente (2/2 requeridas)")
                 logger.info("-----------------------------------------------")
                 return None
 
             if confidence < required_confidence:
-                logger.info(f"❌ SKIPPED: por confianza insuficiente {confidence:.2f} / {required_confidence}")
+                logger.info(
+                    f"❌ SKIPPED: por confianza insuficiente {confidence:.2f} / {required_confidence}"
+                )
                 logger.info("-----------------------------------------------")
                 return None
 
