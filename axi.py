@@ -5205,6 +5205,9 @@ class TradingEngine:
         return trade_initiated
 
     def run_unused_do_not_call(self) -> None:
+        """[DEPRECATED] This method is intentionally unused to avoid running multiple market loops.
+        Use BotWorker.run() for the active trading loop.
+        """
         self.start_engine()
         try:
             while self.running.is_set():
