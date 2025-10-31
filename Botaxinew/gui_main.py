@@ -39,14 +39,13 @@ class BotAxiGUI(QWidget):
     def __init__(self, parent: Optional[QWidget] = None, gui_log: Optional[Callable[[str], None]] = None):
         super().__init__(parent)
         self.setWindowTitle("Bot AxiNew")
-        self.resize(1180, 760)
+        self.resize(1320, 780)
         self.setStyleSheet(
             """
     QWidget {
         background-color: #0B0F19;   /* BotAxi dark */
         color: #E2E8F0;
-        font-family: 'Segoe UI', 'Roboto', sans-serif;
-        font-size: 10px;             /* BotAxi small text */
+        font: 12pt 'Consolas';   /* SAME FONT + SIZE AS OLD BOT */
     }
 
     /* Tab bar — BotAxi blue and compact height */
