@@ -5322,6 +5322,8 @@ class BotWorker(QtCore.QObject):
 
     @pyqtSlot()
     def run(self) -> None:
+        import threading
+        logging.warning(f"🚨 BotWorker RUN STARTED — THREAD ID: {threading.get_ident()}")
         if getattr(self, "_cycle_running", False):
             logging.warning("⛔ run() ignored — cycle already running")
             return
@@ -5844,8 +5846,13 @@ class BotWindow(QtWidgets.QWidget):
 
     def start_trading(self) -> None:
         if self.bot_thread is not None and self.bot_thread.isRunning():
+            logging.warning("🚫 Worker is already running — second worker creation blocked.")
+            return
+        if self.bot_worker is not None and getattr(self.bot_worker, "_active", False):
+            logging.warning("🚫 Worker is already running — second worker creation blocked.")
             return
         if self._worker_started:
+            logging.warning("🚫 Worker is already running — second worker creation blocked.")
             return
         self._worker_started = True
         self.auto_shutdown_active = False
@@ -5854,6 +5861,7 @@ class BotWindow(QtWidgets.QWidget):
         self.pending_contracts.clear()
         self.bot_thread = QtCore.QThread()
         self.bot_worker = BotWorker(self.engine)
+        logging.warning("🟢 Worker created (unique instance).")
         self.bot_worker.moveToThread(self.bot_thread)
         self.bot_worker.log_signal.connect(self.append_log, QtCore.Qt.QueuedConnection)
         self.bot_worker.result_signal.connect(self.update_result_table)
@@ -5883,6 +5891,7 @@ class BotWindow(QtWidgets.QWidget):
             self.bot_worker.stop()
         self.bot_thread.quit()
         self.bot_thread.wait(2000)
+        logging.warning("🛑 Worker stopped cleanly.")
         self.bot_thread = None
         self.bot_worker = None
         self._worker_started = False
@@ -6336,8 +6345,10 @@ class BotWindow(QtWidgets.QWidget):
                 self.bot_worker.stop()
             self.bot_thread.quit()
             self.bot_thread.wait(2000)
-            self.bot_thread = None
-            self.bot_worker = None
+            logging.warning("🛑 Worker stopped cleanly.")
+        self.bot_thread = None
+        self.bot_worker = None
+        self._worker_started = False
         logging.getLogger().removeHandler(self.log_handler)
         super().closeEvent(event)
 
