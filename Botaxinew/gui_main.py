@@ -45,8 +45,8 @@ class BotAxiGUI(QWidget):
     QWidget {
         background-color: #0B0F19;   /* BotAxi dark */
         color: #E2E8F0;
-        font-size: 12px;
-        font-family: 'Consolas', 'Segoe UI', 'Roboto';
+        font-size: 12pt;
+        font-family: 'Consolas', 'Segoe UI', sans-serif;
     }
 
     /* Tab bar — BotAxi blue and compact height */
@@ -168,21 +168,20 @@ class BotAxiGUI(QWidget):
         self.confidence_bar.setValue(0)
         self.confidence_bar.setMinimumHeight(20)
 
-        self.trade_table = QTableWidget(0, 7)
+        self.trade_table = QTableWidget(0, 9)
         self.trade_table.setHorizontalHeaderLabels([
+            "Operaciones",
             "Hora",
             "Símbolo",
             "Decisión",
             "Confianza",
             "Resultado",
+            "Precisión",
             "PnL",
             "Notas",
         ])
         header = self.trade_table.horizontalHeader()
-        header.setSectionResizeMode(QHeaderView.Fixed)
-        column_widths = [75, 75, 70, 70, 75, 70, 120]
-        for index, width in enumerate(column_widths):
-            self.trade_table.setColumnWidth(index, width)
+        header.setSectionResizeMode(QHeaderView.Stretch)
         self.trade_table.verticalHeader().setVisible(False)
         self.trade_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
         self.trade_table.setSelectionBehavior(QAbstractItemView.SelectRows)
@@ -199,8 +198,6 @@ class BotAxiGUI(QWidget):
         self.wins_label = QLabel("Ganadas: 0")
         self.losses_label = QLabel("Perdidas: 0")
         self.precision_label = QLabel("Precisión: 0.0%")
-        self.pnl_label = QLabel("PnL: 0.00")
-
         config_path = Path(__file__).resolve().parent / "config.yaml"
         memory_path = Path(__file__).resolve().parent / "memory.json"
         self.engine = BotEngine(
@@ -269,6 +266,19 @@ class BotAxiGUI(QWidget):
         operation_label = QLabel("Operation Amount")
         config_grid.addWidget(operation_label, 0, 0)
         config_grid.addWidget(self.amount_spin, 1, 0)
+
+        # --- NEW: Wins / Losses block under the lot size control ---
+        self.wins_label.setText("Ganadas: 0")
+        self.losses_label.setText("Perdidas: 0")
+
+        self.wins_label.setStyleSheet("font-size: 14pt; color: #00FF7F; font-weight: bold;")
+        self.losses_label.setStyleSheet("font-size: 14pt; color: #FF4C4C; font-weight: bold;")
+
+        winloss_layout = QVBoxLayout()
+        winloss_layout.addWidget(self.wins_label)
+        winloss_layout.addWidget(self.losses_label)
+
+        config_grid.addLayout(winloss_layout, 2, 0)
         mode_caption = QLabel("SL/TP Mode")
         config_grid.addWidget(mode_caption, 0, 1)
         config_grid.addWidget(self.sl_tp_mode_combo, 1, 1)
@@ -283,10 +293,7 @@ class BotAxiGUI(QWidget):
         performance_layout = QHBoxLayout()
         performance_layout.setSpacing(16)
         performance_layout.addWidget(self.trades_label)
-        performance_layout.addWidget(self.wins_label)
-        performance_layout.addWidget(self.losses_label)
         performance_layout.addWidget(self.precision_label)
-        performance_layout.addWidget(self.pnl_label)
         performance_layout.addStretch(1)
 
         layout.addLayout(header_layout)
@@ -588,19 +595,63 @@ class BotAxiGUI(QWidget):
 
     def _append_order(self, event: Dict[str, Any]) -> None:
         row = self.trade_table.rowCount()
+        operation_number = row + 1
         self.trade_table.insertRow(row)
+
+        confidence_raw = event.get('confidence', 0.0)
+        precision_raw = event.get('precision', 0.0)
+        pnl_raw = event.get('pnl', 0.0)
+
+        try:
+            confidence_value = float(confidence_raw)
+        except (TypeError, ValueError):
+            confidence_value = 0.0
+
+        try:
+            precision_value = float(precision_raw) if precision_raw is not None else 0.0
+        except (TypeError, ValueError):
+            precision_value = 0.0
+
+        try:
+            pnl_value = float(pnl_raw)
+        except (TypeError, ValueError):
+            pnl_value = 0.0
+
         values = [
-            str(event.get("time", "")),
-            str(event.get("symbol", "")),
-            str(event.get("decision", "")),
-            f"{float(event.get('confidence', 0.0)):.2f}",
-            str(event.get("result", "")),
-            f"{float(event.get('pnl', 0.0)):.2f}",
-            str(event.get("notes", "")),
+            str(operation_number),
+            str(event.get('time', '')),
+            str(event.get('symbol', '')),
+            str(event.get('decision', '')),
+            f"{confidence_value:.2f}",
+            str(event.get('result', '')),
+            f"{precision_value:.2f}",
+            f"{pnl_value:.2f}",
+            str(event.get('notes', '')),
         ]
         for column, value in enumerate(values):
             item = QTableWidgetItem(value)
             item.setTextAlignment(Qt.AlignCenter)
+
+            if column == 5:
+                if 'WIN' in value.upper():
+                    item.setForeground(Qt.green)
+                elif 'LOSS' in value.upper():
+                    item.setForeground(Qt.red)
+
+            if column == 4:
+                try:
+                    conf = float(confidence_raw)
+                    item.setForeground(Qt.green if conf >= 0.70 else Qt.red)
+                except (TypeError, ValueError):
+                    pass
+
+            if column == 7:
+                try:
+                    pnl_val = float(pnl_raw)
+                except (TypeError, ValueError):
+                    pnl_val = 0.0
+                item.setForeground(Qt.green if pnl_val > 0 else Qt.red)
+
             self.trade_table.setItem(row, column, item)
         self.trade_table.scrollToBottom()
 
@@ -614,7 +665,6 @@ class BotAxiGUI(QWidget):
         self.wins_label.setText(f"Ganadas: {wins}")
         self.losses_label.setText(f"Perdidas: {losses}")
         self.precision_label.setText(f"Precisión: {precision:.1f}%")
-        self.pnl_label.setText(f"PnL: {pnl:.2f}")
         self.summary_trades.setText(f"Operaciones del día: {trades}")
         self.summary_wins.setText(f"Ganadas: {wins}")
         self.summary_losses.setText(f"Perdidas: {losses}")
