@@ -82,9 +82,8 @@ class BotEngine:
             "memory": True,
         }
 
-        self.last_operation_timestamp = 0.0
-        self.trade_lock_seconds = 60
         self.last_confidence = 0.0
+        self.last_candle = None
 
         self.stats: Dict[str, Any] = {
             "trades": 0,
@@ -363,14 +362,30 @@ class BotEngine:
             atr_value = float(analysis.get("atr", calc_atr(df)))
 
             if direction in {"CALL", "PUT"}:
+                lot = self._select_lot_by_confidence()
                 if confidence >= self.base_confidence:
-                    executed = self.execute_market_order(symbol, direction, confidence, df, atr_value, analysis)
+                    # Prevent duplicate trade in the same candle, but still evaluate strategies every cycle
+                    candle_time = df.index[-1]
+
+                    if getattr(self, "last_candle", None) == candle_time:
+                        return  # skip only the trade, not the scan
+
+                    self.last_candle = candle_time
+                    executed = self.execute_market_order(symbol, direction, lot)
                     if executed:
+                        self._handle_market_order_success(symbol, direction, confidence, lot, analysis)
                         self._notify_status("Operation executed")
                         return
                 elif pullback_flag and confidence >= self.lower_confidence:
+                    # Prevent duplicate trade in the same candle, but still evaluate strategies every cycle
+                    candle_time = df.index[-1]
+
+                    if getattr(self, "last_candle", None) == candle_time:
+                        return  # skip only the trade, not the scan
+
+                    self.last_candle = candle_time
                     pending_price = self._determine_pending_price(direction, last_price, atr_value)
-                    executed = self.execute_pending_order(symbol, direction, pending_price, df, atr_value)
+                    executed = self.execute_pending_order(symbol, direction, pending_price, df, atr_value, lot)
                     if executed:
                         self._notify_status("Operation executed")
                         return
@@ -378,47 +393,74 @@ class BotEngine:
         finally:
             self.cycle_lock.release()
 
-    def execute_market_order(
+    def execute_market_order(self, symbol, direction, lot):
+        from MetaTrader5 import (
+            ORDER_TYPE_BUY,
+            ORDER_TYPE_SELL,
+            TRADE_ACTION_DEAL,
+            TRADE_RETCODE_DONE,
+            symbol_info,
+            symbol_info_tick,
+            symbol_select,
+        )
+
+        info = symbol_info(symbol)
+        if not info:
+            self.logger.log(f"⚠️ Symbol not found: {symbol}")
+            return False
+
+        if not info.visible:
+            symbol_select(symbol, True)
+
+        volume = max(lot, info.volume_min)
+
+        tick = symbol_info_tick(symbol)
+        if tick is None:
+            self.logger.log(f"⚠️ No tick data for {symbol}")
+            return False
+        price = tick.ask if direction == "CALL" else tick.bid
+
+        stop_level = info.trade_stops_level
+        p = info.point
+
+        sl = price - (stop_level * p * 3) if direction == "CALL" else price + (stop_level * p * 3)
+        tp = price + (stop_level * p * 6) if direction == "CALL" else price - (stop_level * p * 6)
+
+        order = {
+            "action": TRADE_ACTION_DEAL,
+            "symbol": symbol,
+            "volume": volume,
+            "type": ORDER_TYPE_BUY if direction == "CALL" else ORDER_TYPE_SELL,
+            "price": price,
+            "sl": sl,
+            "tp": tp,
+            "deviation": 50,
+            "magic": 987654,
+            "comment": "BotAxi Market Order",
+        }
+
+        result = mt5.order_send(order)
+
+        if result is None or result.retcode != TRADE_RETCODE_DONE:
+            retcode = getattr(result, "retcode", "no response")
+            self.logger.log(f"❌ Market order failed [{symbol}]: {retcode}")
+            return False
+
+        self.logger.log(f"✅ ORDER EXECUTED [{symbol}] → {direction} lot={volume:.2f}")
+        return True
+
+    def _handle_market_order_success(
         self,
         symbol: str,
         direction: str,
         confidence: float,
-        df: pd.DataFrame,
-        atr_value: float,
+        lot: float,
         analysis: Dict[str, Any],
-    ) -> bool:
-        if not self._acquire_trade_slot():
-            return False
-        lot = self._select_lot_by_confidence()
-        mt5.symbol_select(symbol, True)
-        tick = mt5.symbol_info_tick(symbol)
-        if not tick:
-            self.logger.log(f"No tick data available for {symbol}.")
-            return False
-        entry_price = tick.ask if direction == "CALL" else tick.bid
-        sl_price, tp_price = self._calc_sl_tp_prices(symbol, direction, entry_price, df, atr_value)
-        order = {
-            "action": mt5.TRADE_ACTION_DEAL,
-            "symbol": symbol,
-            "volume": lot,
-            "type": mt5.ORDER_TYPE_BUY if direction == "CALL" else mt5.ORDER_TYPE_SELL,
-            "price": entry_price,
-            "sl": sl_price,
-            "tp": tp_price,
-            "deviation": 10,
-            "magic": 123456,
-            "comment": "AXINEW-market",
-            "type_time": mt5.ORDER_TIME_GTC,
-            "type_filling": mt5.ORDER_FILLING_FOK,
-        }
-        result = mt5.order_send(order)
-        if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
-            self.logger.log(f"Market order failed for {symbol}: {getattr(result, 'retcode', 'no response')}")
-            return False
-        message = f"✅ ORDER EXECUTED [{symbol}] → {direction} lot={lot:.2f}"
-        self.logger.log(message)
+    ) -> None:
+        info = mt5.symbol_info(symbol)
+        actual_lot = max(lot, info.volume_min) if info else lot
+        message = f"✅ ORDER EXECUTED [{symbol}] → {direction} lot={actual_lot:.2f}"
         self.send_telegram(message)
-
         event = self._build_trade_event(
             symbol=symbol,
             decision=direction,
@@ -452,7 +494,6 @@ class BotEngine:
         self.send_telegram(result_message)
         self._notify_order(result_event)
         self._update_stats(trade_result, pnl_value)
-        return True
 
     def execute_pending_order(
         self,
@@ -461,11 +502,11 @@ class BotEngine:
         price: float,
         df: pd.DataFrame,
         atr_value: float,
+        lot: float,
     ) -> bool:
-        if not self._acquire_trade_slot():
-            return False
-        lot = self._select_lot_by_confidence()
         mt5.symbol_select(symbol, True)
+        info = mt5.symbol_info(symbol)
+        volume = max(lot, info.volume_min) if info else lot
         if not self.apply_sl_tp_on_pending:
             sl_price, tp_price = 0.0, 0.0
         else:
@@ -473,7 +514,7 @@ class BotEngine:
         order = {
             "action": mt5.TRADE_ACTION_PENDING,
             "symbol": symbol,
-            "volume": lot,
+            "volume": volume,
             "type": mt5.ORDER_TYPE_BUY_LIMIT if direction == "CALL" else mt5.ORDER_TYPE_SELL_LIMIT,
             "price": price,
             "sl": sl_price,
@@ -488,7 +529,7 @@ class BotEngine:
         if result is None or result.retcode not in (mt5.TRADE_RETCODE_DONE, mt5.TRADE_RETCODE_PLACED):
             self.logger.log(f"Pending order failed for {symbol}: {getattr(result, 'retcode', 'no response')}")
             return False
-        message = f"📌 PENDING ORDER SET [{symbol}] {direction} @ {price:.5f}"
+        message = f"📌 PENDING ORDER SET [{symbol}] {direction} @ {price:.5f} lot={volume:.2f}"
         self.logger.log(message)
         self.send_telegram(message)
         event = self._build_trade_event(
@@ -513,14 +554,6 @@ class BotEngine:
             return round(self.lot_high, 2)
         return round(self.lot_low, 2)
 
-    def _acquire_trade_slot(self) -> bool:
-        now = time.time()
-        if now - self.last_operation_timestamp < self.trade_lock_seconds:
-            self.logger.log("⏳ Trade skipped due to candle lock.")
-            return False
-        self.last_operation_timestamp = now
-        return True
-
     def _fetch_rates(self, symbol: str) -> Optional[pd.DataFrame]:
         rates = mt5.copy_rates_from_pos(symbol, self.timeframe, 0, self.history_bars)
         if rates is None:
@@ -531,6 +564,7 @@ class BotEngine:
             self.logger.log(f"Empty dataframe for {symbol}.")
             return None
         df["time"] = pd.to_datetime(df["time"], unit="s")
+        df.set_index("time", inplace=True)
         return df
 
     def _points_per_pip(self, symbol: str) -> float:
