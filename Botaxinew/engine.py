@@ -75,10 +75,16 @@ class BotEngine:
 
         self.memory = LearningMemory(self.memory_path)
         self.strategy_flags: Dict[str, bool] = {
-            "rsi": True,
-            "ema": True,
-            "macd": True,
-            "pullback": True,
+            "rsi_direction": True,
+            "ema_trend": True,
+            "macd_momentum": True,
+            "pullback_signal": True,
+            "bollinger_position": True,
+            "bollinger_rebound": True,
+            "adx_trend": True,
+            "volume_spike": True,
+            "breakout": True,
+            "momentum_candle": True,
             "memory": True,
         }
 
@@ -207,7 +213,13 @@ class BotEngine:
             df = self._fetch_rates(symbol)
             if df is None or len(df) < 50:
                 return
-            analysis = evaluate_indicators(df, strategies=self.strategy_flags)
+            indicator_flags = {
+                "rsi": self.strategy_flags.get("rsi_direction", True),
+                "ema": self.strategy_flags.get("ema_trend", True),
+                "macd": self.strategy_flags.get("macd_momentum", True),
+                "pullback": self.strategy_flags.get("pullback_signal", True),
+            }
+            analysis = evaluate_indicators(df, strategies=indicator_flags)
             pullback_value = analysis.get("pullback", False)
             if hasattr(pullback_value, "__len__") and not isinstance(pullback_value, (str, bytes)):
                 try:
@@ -231,32 +243,33 @@ class BotEngine:
             base_direction = str(analysis.get("direction", "NONE"))
             strategies: List[Tuple[str, str, float]] = []
 
-            if self.strategy_flags.get("rsi", True):
+            if self.strategy_flags.get("rsi_direction", True):
                 rsi_signal = str(analysis.get("rsi_signal", "NONE"))
                 if rsi_signal in {"CALL", "PUT"}:
                     strategies.append(("RSI", rsi_signal, 0.20))
 
-            if self.strategy_flags.get("ema", True):
+            if self.strategy_flags.get("ema_trend", True):
                 ema_trend = str(analysis.get("ema_trend", "flat"))
                 ema_signal = "CALL" if ema_trend == "up" else "PUT" if ema_trend == "down" else "NONE"
                 if ema_signal in {"CALL", "PUT"}:
                     strategies.append(("EMA Trend", ema_signal, 0.20))
 
-            if self.strategy_flags.get("macd", True):
+            if self.strategy_flags.get("macd_momentum", True):
                 macd_signal = str(analysis.get("macd_signal", "NONE"))
                 if macd_signal in {"CALL", "PUT"}:
                     strategies.append(("MACD", macd_signal, 0.20))
 
-            if self.strategy_flags.get("pullback", True) and pullback_flag:
+            if self.strategy_flags.get("pullback_signal", True) and pullback_flag:
                 pullback_direction = base_direction if base_direction in {"CALL", "PUT"} else str(analysis.get("macd_signal", "NONE"))
                 if pullback_direction in {"CALL", "PUT"}:
                     strategies.append(("Pullback", pullback_direction, 0.15))
 
             bollinger_position = str(analysis.get("bollinger_position", "middle"))
-            if bollinger_position == "lower":
-                strategies.append(("Bollinger Position", "CALL", 0.10))
-            elif bollinger_position == "upper":
-                strategies.append(("Bollinger Position", "PUT", 0.10))
+            if self.strategy_flags.get("bollinger_position", True):
+                if bollinger_position == "lower":
+                    strategies.append(("Bollinger Position", "CALL", 0.10))
+                elif bollinger_position == "upper":
+                    strategies.append(("Bollinger Position", "PUT", 0.10))
 
             base_votes = [signal for (_, signal, _) in strategies if signal in {"CALL", "PUT"}]
             if base_direction in {"CALL", "PUT"}:
@@ -266,52 +279,57 @@ class BotEngine:
             else:
                 main_signal = "CALL"
 
-            try:
-                bb = BollingerBands(close=close_prices, window=20, window_dev=2)
-                upper = float(bb.bollinger_hband().iloc[-1])
-                lower = float(bb.bollinger_lband().iloc[-1])
-                last_close = float(close_prices.iloc[-1])
-                if last_close <= lower:
-                    strategies.append(("Bollinger Rebound", "CALL", 0.20))
-                elif last_close >= upper:
-                    strategies.append(("Bollinger Rebound", "PUT", 0.20))
-            except Exception:
-                pass
+            if self.strategy_flags.get("bollinger_rebound", True):
+                try:
+                    bb = BollingerBands(close=close_prices, window=20, window_dev=2)
+                    upper = float(bb.bollinger_hband().iloc[-1])
+                    lower = float(bb.bollinger_lband().iloc[-1])
+                    last_close = float(close_prices.iloc[-1])
+                    if last_close <= lower:
+                        strategies.append(("Bollinger Rebound", "CALL", 0.20))
+                    elif last_close >= upper:
+                        strategies.append(("Bollinger Rebound", "PUT", 0.20))
+                except Exception:
+                    pass
 
-            try:
-                adx = ADXIndicator(high_prices, low_prices, close_prices, window=14)
-                adx_val = float(adx.adx().iloc[-1])
-                if adx_val >= 25 and main_signal in {"CALL", "PUT"}:
-                    strategies.append(("ADX Trend", main_signal, 0.15))
-            except Exception:
-                pass
+            if self.strategy_flags.get("adx_trend", True):
+                try:
+                    adx = ADXIndicator(high_prices, low_prices, close_prices, window=14)
+                    adx_val = float(adx.adx().iloc[-1])
+                    if adx_val >= 25 and main_signal in {"CALL", "PUT"}:
+                        strategies.append(("ADX Trend", main_signal, 0.15))
+                except Exception:
+                    pass
 
-            try:
-                avg_volume = float(volumes.iloc[-10:].mean()) if len(volumes) >= 10 else float(volumes.mean())
-                if len(volumes) and volumes.iloc[-1] > avg_volume * 1.8 and main_signal in {"CALL", "PUT"}:
-                    strategies.append(("Volume Spike", main_signal, 0.15))
-            except Exception:
-                pass
+            if self.strategy_flags.get("volume_spike", True):
+                try:
+                    avg_volume = float(volumes.iloc[-10:].mean()) if len(volumes) >= 10 else float(volumes.mean())
+                    if len(volumes) and volumes.iloc[-1] > avg_volume * 1.8 and main_signal in {"CALL", "PUT"}:
+                        strategies.append(("Volume Spike", main_signal, 0.15))
+                except Exception:
+                    pass
 
-            try:
-                prev_high = float(high_prices.iloc[-2])
-                prev_low = float(low_prices.iloc[-2])
-                last_close = float(close_prices.iloc[-1])
-                if last_close > prev_high:
-                    strategies.append(("Breakout High", "CALL", 0.25))
-                elif last_close < prev_low:
-                    strategies.append(("Breakout Low", "PUT", 0.25))
-            except Exception:
-                pass
+            if self.strategy_flags.get("breakout", True):
+                try:
+                    prev_high = float(high_prices.iloc[-2])
+                    prev_low = float(low_prices.iloc[-2])
+                    last_close = float(close_prices.iloc[-1])
+                    if last_close > prev_high:
+                        strategies.append(("Breakout High", "CALL", 0.25))
+                    elif last_close < prev_low:
+                        strategies.append(("Breakout Low", "PUT", 0.25))
+                except Exception:
+                    pass
 
-            try:
-                body = abs(float(open_prices.iloc[-1]) - float(close_prices.iloc[-1]))
-                wick = abs(float(high_prices.iloc[-1]) - float(low_prices.iloc[-1]))
-                if body > wick * 0.70:
-                    momentum_direction = "CALL" if float(close_prices.iloc[-1]) > float(open_prices.iloc[-1]) else "PUT"
-                    strategies.append(("Momentum Candle", momentum_direction, 0.20))
-            except Exception:
-                pass
+            if self.strategy_flags.get("momentum_candle", True):
+                try:
+                    body = abs(float(open_prices.iloc[-1]) - float(close_prices.iloc[-1]))
+                    wick = abs(float(high_prices.iloc[-1]) - float(low_prices.iloc[-1]))
+                    if body > wick * 0.70:
+                        momentum_direction = "CALL" if float(close_prices.iloc[-1]) > float(open_prices.iloc[-1]) else "PUT"
+                        strategies.append(("Momentum Candle", momentum_direction, 0.20))
+                except Exception:
+                    pass
 
             confidence = sum(weight for (_, _, weight) in strategies)
             confidence = min(confidence, 1.0)
@@ -414,6 +432,19 @@ class BotEngine:
 
         volume = max(lot, info.volume_min)
 
+        if symbol.upper() == "EURUSD":
+            symbol_details = mt5.symbol_info(symbol)
+            if symbol_details is None:
+                self.logger.log("[ERROR] EURUSD symbol_info not available")
+                return False
+            volume = max(min(volume, symbol_details.volume_max), symbol_details.volume_min)
+            step = symbol_details.volume_step
+            if step:
+                volume = round(volume / step) * step
+            deviation = 20
+        else:
+            deviation = 5
+
         tick = symbol_info_tick(symbol)
         if tick is None:
             self.logger.log(f"⚠️ No tick data for {symbol}")
@@ -434,7 +465,7 @@ class BotEngine:
             "price": price,
             "sl": sl,
             "tp": tp,
-            "deviation": 50,
+            "deviation": deviation,
             "magic": 987654,
             "comment": "BotAxi Market Order",
         }

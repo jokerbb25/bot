@@ -5,6 +5,7 @@ from pathlib import Path
 from typing import Any, Callable, Dict, Optional
 
 from PyQt5.QtCore import Qt, pyqtSignal
+from PyQt5.QtGui import QFont
 from PyQt5.QtWidgets import (
     QWidget,
     QVBoxLayout,
@@ -134,6 +135,13 @@ class BotAxiGUI(QWidget):
         self.stop_button.setMinimumSize(110, 36)
         self.stop_button.setEnabled(False)
 
+        control_font = QFont("Segoe UI", 11)
+        for widget in [
+            self.start_button,
+            self.stop_button,
+        ]:
+            widget.setFont(control_font)
+
         self.status_label = QLabel("Estado: Idle")
         self.status_label.setAlignment(Qt.AlignRight | Qt.AlignVCenter)
         self.ai_label = QLabel("IA Memoria: Activa")
@@ -146,21 +154,26 @@ class BotAxiGUI(QWidget):
         self.amount_spin.setRange(0.0, 100.0)
         self.amount_spin.setSingleStep(0.01)
         self.amount_spin.setFixedHeight(34)
+        self.amount_spin.setFont(control_font)
 
         self.sl_tp_mode_combo = QComboBox()
         self.sl_tp_mode_combo.addItems(["Fixed pips", "ATR x Multiplier"])
         self.sl_tp_mode_combo.setFixedHeight(34)
+        self.sl_tp_mode_combo.setFont(control_font)
         self.sl_spin = QDoubleSpinBox()
         self.sl_spin.setDecimals(2)
         self.sl_spin.setRange(0.0, 500.0)
         self.sl_spin.setSingleStep(0.1)
         self.sl_spin.setFixedHeight(34)
+        self.sl_spin.setFont(control_font)
         self.tp_spin = QDoubleSpinBox()
         self.tp_spin.setDecimals(2)
         self.tp_spin.setRange(0.0, 500.0)
         self.tp_spin.setSingleStep(0.1)
         self.tp_spin.setFixedHeight(34)
+        self.tp_spin.setFont(control_font)
         self.apply_pending_check = QCheckBox("Apply to PENDING too")
+        self.apply_pending_check.setFont(control_font)
 
         self.sl_label = QLabel("SL (pips)")
         self.tp_label = QLabel("TP (pips)")
@@ -193,11 +206,14 @@ class BotAxiGUI(QWidget):
         self.trade_table.setSelectionMode(QAbstractItemView.SingleSelection)
         self.trade_table.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.trade_table.setMinimumHeight(260)
+        self.trade_table.setFont(QFont("Segoe UI", 10))
 
         self.log_view = QTextEdit()
         self.log_view.setReadOnly(True)
         self.log_view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.log_view.setMinimumHeight(220)
+        self.log_output = self.log_view
+        self.log_output.setMinimumHeight(int(self.height() * 0.45))
 
         self.trades_label = QLabel("Operaciones: 0")
         self.wins_label = QLabel("Ganadas: 0")
@@ -311,11 +327,17 @@ class BotAxiGUI(QWidget):
         layout.addWidget(QLabel("Activar / desactivar estrategias"))
         self.strategy_checks: Dict[str, QCheckBox] = {}
         for key, label in [
-            ("rsi", "RSI"),
-            ("ema", "EMA"),
-            ("macd", "MACD"),
-            ("pullback", "Pullback"),
-            ("memory", "Memoria"),
+            ("rsi_direction", "RSI Direction"),
+            ("ema_trend", "EMA Trend"),
+            ("macd_momentum", "MACD Momentum"),
+            ("adx_trend", "ADX Trend"),
+            ("volume_spike", "Volume Spike"),
+            ("breakout", "Breakout High / Low"),
+            ("momentum_candle", "Momentum Candle"),
+            ("bollinger_position", "Bollinger Position"),
+            ("bollinger_rebound", "Bollinger Rebound"),
+            ("pullback_signal", "Pullback Signal"),
+            ("memory", "Memoria IA"),
         ]:
             checkbox = QCheckBox(label)
             checkbox.setChecked(True)
