@@ -210,6 +210,19 @@ class BotAxiGUI(QWidget):
 
         self.log_view = QTextEdit()
         self.log_view.setReadOnly(True)
+        log_font = QFont("Consolas", 11)
+        log_font.setBold(False)
+        self.log_view.setFont(log_font)
+        self.log_view.setStyleSheet(
+            """
+            QTextEdit {
+                font-size: 11pt;
+                color: #E6F0FF;
+                background-color: #0C1726;
+                border: 1px solid #1E4057;
+            }
+            """
+        )
         self.log_view.setSizePolicy(QSizePolicy.Expanding, QSizePolicy.Expanding)
         self.log_view.setMinimumHeight(220)
         self.log_output = self.log_view
