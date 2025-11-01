@@ -9,6 +9,8 @@ from typing import Any, Callable, Dict, List, Optional, Tuple
 import MetaTrader5 as mt5
 import pandas as pd
 import yaml
+from ta.trend import ADXIndicator
+from ta.volatility import BollingerBands
 
 from utils.indicators import calc_atr, evaluate_indicators
 from utils.logger import Logger
@@ -216,8 +218,116 @@ class BotEngine:
             pullback_flag = bool(pullback_value)
             analysis["pullback"] = pullback_flag
 
-            confidence = float(analysis.get("confidence", 0.0))
-            direction = str(analysis.get("direction", "NONE"))
+            close_prices = df["close"].astype(float)
+            open_prices = df["open"].astype(float)
+            high_prices = df["high"].astype(float)
+            low_prices = df["low"].astype(float)
+            if "tick_volume" in df.columns:
+                volumes = df["tick_volume"].astype(float)
+            elif "real_volume" in df.columns:
+                volumes = df["real_volume"].astype(float)
+            else:
+                volumes = pd.Series([0.0] * len(df), index=df.index)
+
+            base_direction = str(analysis.get("direction", "NONE"))
+            strategies: List[Tuple[str, str, float]] = []
+
+            if self.strategy_flags.get("rsi", True):
+                rsi_signal = str(analysis.get("rsi_signal", "NONE"))
+                if rsi_signal in {"CALL", "PUT"}:
+                    strategies.append(("RSI", rsi_signal, 0.20))
+
+            if self.strategy_flags.get("ema", True):
+                ema_trend = str(analysis.get("ema_trend", "flat"))
+                ema_signal = "CALL" if ema_trend == "up" else "PUT" if ema_trend == "down" else "NONE"
+                if ema_signal in {"CALL", "PUT"}:
+                    strategies.append(("EMA Trend", ema_signal, 0.20))
+
+            if self.strategy_flags.get("macd", True):
+                macd_signal = str(analysis.get("macd_signal", "NONE"))
+                if macd_signal in {"CALL", "PUT"}:
+                    strategies.append(("MACD", macd_signal, 0.20))
+
+            if self.strategy_flags.get("pullback", True) and pullback_flag:
+                pullback_direction = base_direction if base_direction in {"CALL", "PUT"} else str(analysis.get("macd_signal", "NONE"))
+                if pullback_direction in {"CALL", "PUT"}:
+                    strategies.append(("Pullback", pullback_direction, 0.15))
+
+            bollinger_position = str(analysis.get("bollinger_position", "middle"))
+            if bollinger_position == "lower":
+                strategies.append(("Bollinger Position", "CALL", 0.10))
+            elif bollinger_position == "upper":
+                strategies.append(("Bollinger Position", "PUT", 0.10))
+
+            base_votes = [signal for (_, signal, _) in strategies if signal in {"CALL", "PUT"}]
+            if base_direction in {"CALL", "PUT"}:
+                main_signal = base_direction
+            elif base_votes:
+                main_signal = max(set(base_votes), key=base_votes.count)
+            else:
+                main_signal = "CALL"
+
+            try:
+                bb = BollingerBands(close=close_prices, window=20, window_dev=2)
+                upper = float(bb.bollinger_hband().iloc[-1])
+                lower = float(bb.bollinger_lband().iloc[-1])
+                last_close = float(close_prices.iloc[-1])
+                if last_close <= lower:
+                    strategies.append(("Bollinger Rebound", "CALL", 0.20))
+                elif last_close >= upper:
+                    strategies.append(("Bollinger Rebound", "PUT", 0.20))
+            except Exception:
+                pass
+
+            try:
+                adx = ADXIndicator(high_prices, low_prices, close_prices, window=14)
+                adx_val = float(adx.adx().iloc[-1])
+                if adx_val >= 25 and main_signal in {"CALL", "PUT"}:
+                    strategies.append(("ADX Trend", main_signal, 0.15))
+            except Exception:
+                pass
+
+            try:
+                avg_volume = float(volumes.iloc[-10:].mean()) if len(volumes) >= 10 else float(volumes.mean())
+                if len(volumes) and volumes.iloc[-1] > avg_volume * 1.8 and main_signal in {"CALL", "PUT"}:
+                    strategies.append(("Volume Spike", main_signal, 0.15))
+            except Exception:
+                pass
+
+            try:
+                prev_high = float(high_prices.iloc[-2])
+                prev_low = float(low_prices.iloc[-2])
+                last_close = float(close_prices.iloc[-1])
+                if last_close > prev_high:
+                    strategies.append(("Breakout High", "CALL", 0.25))
+                elif last_close < prev_low:
+                    strategies.append(("Breakout Low", "PUT", 0.25))
+            except Exception:
+                pass
+
+            try:
+                body = abs(float(open_prices.iloc[-1]) - float(close_prices.iloc[-1]))
+                wick = abs(float(high_prices.iloc[-1]) - float(low_prices.iloc[-1]))
+                if body > wick * 0.70:
+                    momentum_direction = "CALL" if float(close_prices.iloc[-1]) > float(open_prices.iloc[-1]) else "PUT"
+                    strategies.append(("Momentum Candle", momentum_direction, 0.20))
+            except Exception:
+                pass
+
+            confidence = sum(weight for (_, _, weight) in strategies)
+            confidence = min(confidence, 1.0)
+
+            votes = [signal for (_, signal, _) in strategies if signal in {"CALL", "PUT"}]
+            if votes:
+                direction = max(set(votes), key=votes.count)
+            else:
+                direction = "NONE"
+
+            for name, signal_name, weight in strategies:
+                self.logger.log(f"[{symbol}] {name} → {signal_name} (weight={weight:.2f})")
+
+            analysis["confidence"] = confidence
+            analysis["direction"] = direction
 
             memory_applied = False
             if self.strategy_flags.get("memory", True) and direction in {"CALL", "PUT"}:
@@ -232,7 +342,7 @@ class BotEngine:
                 )
                 if memory_applied:
                     self.logger.log(f"🧠 Memory match: +{self.memory_boost:.2f} confidence boost")
-                confidence = boosted_confidence
+                confidence = min(float(boosted_confidence), 1.0)
 
             analysis["confidence"] = confidence
             self.last_confidence = confidence
@@ -245,6 +355,8 @@ class BotEngine:
                 f"Confidence {confidence:.2f}"
             )
             self.logger.log(log_line)
+            final_marker = " ✅" if direction in {"CALL", "PUT"} else ""
+            self.logger.log(f"[{symbol}] CONFIDENCE FINAL: {confidence * 100:.0f}% → {direction}{final_marker}")
             self._notify_confidence(confidence, direction)
 
             last_price = float(df["close"].iloc[-1])
