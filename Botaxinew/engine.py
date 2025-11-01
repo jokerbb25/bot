@@ -15,6 +15,7 @@ from ta.volatility import BollingerBands
 from utils.indicators import calc_atr, evaluate_indicators
 from utils.logger import Logger
 from utils.learning import LearningMemory
+from telegram_bot import send_message, telegram_listener, BOT_ACTIVE
 
 try:
     import requests
@@ -97,6 +98,9 @@ class BotEngine:
             "losses": 0,
             "pnl": 0.0,
         }
+        self.total_operations = 0
+        self._last_ticket_id = 0
+        self._telegram_listener_started = False
 
     def start(self) -> bool:
         with self._thread_lock:
@@ -107,6 +111,9 @@ class BotEngine:
             self.running.set()
             self._thread = threading.Thread(target=self._run_loop, daemon=True)
             self._thread.start()
+            if not self._telegram_listener_started:
+                threading.Thread(target=telegram_listener, args=(self,), daemon=True).start()
+                self._telegram_listener_started = True
             return True
 
     def stop(self) -> None:
@@ -139,6 +146,13 @@ class BotEngine:
         self.base_confidence = float(min(max(base, 0.0), 1.0))
         self.lower_confidence = float(min(max(lower, 0.0), 1.0))
         self.memory_boost = float(min(max(memory_boost, 0.0), 1.0))
+
+    def get_accuracy(self) -> float:
+        trades = self.stats.get("trades", 0)
+        if trades == 0:
+            return 0.0
+        wins = self.stats.get("wins", 0)
+        return (wins / trades) * 100.0
 
     def update_strategy(self, name: str, enabled: bool) -> None:
         if name in self.strategy_flags:
@@ -380,6 +394,10 @@ class BotEngine:
             atr_value = float(analysis.get("atr", calc_atr(df)))
 
             if direction in {"CALL", "PUT"}:
+                if not BOT_ACTIVE:
+                    self.logger.log("⏸ Trading paused via Telegram.")
+                    self._notify_status("Paused")
+                    return
                 lot = self._select_lot_by_confidence()
                 if confidence >= self.base_confidence:
                     # Prevent duplicate trade in the same candle, but still evaluate strategies every cycle
@@ -432,6 +450,14 @@ class BotEngine:
 
         volume = max(lot, info.volume_min)
 
+        if info is not None:
+            min_lot = info.volume_min
+            max_lot = info.volume_max
+            lot_step = info.volume_step
+            volume = max(min_lot, min(volume, max_lot))
+            if lot_step:
+                volume = round(volume / lot_step) * lot_step
+
         if symbol.upper() == "EURUSD":
             symbol_details = mt5.symbol_info(symbol)
             if symbol_details is None:
@@ -477,6 +503,7 @@ class BotEngine:
             self.logger.log(f"❌ Market order failed [{symbol}]: {retcode}")
             return False
 
+        self._last_ticket_id = getattr(result, "order", 0)
         self.logger.log(f"✅ ORDER EXECUTED [{symbol}] → {direction} lot={volume:.2f}")
         return True
 
@@ -525,6 +552,14 @@ class BotEngine:
         self.send_telegram(result_message)
         self._notify_order(result_event)
         self._update_stats(trade_result, pnl_value)
+        is_win = trade_result == "WIN"
+        ticket_id = getattr(self, "_last_ticket_id", 0)
+        send_message(
+            f"Operacion: #{ticket_id} {symbol}\n"
+            f"Resultado: {'WIN ✅' if is_win else 'LOSS ❌'}\n"
+            f"Precision Actual: {self.get_accuracy():.2f}%\n"
+            f"Pnl: {pnl_value:+.2f} USD"
+        )
 
     def execute_pending_order(
         self,
@@ -681,6 +716,7 @@ class BotEngine:
         else:
             self.stats["losses"] += 1
         self.stats["pnl"] = round(float(self.stats["pnl"]) + pnl, 2)
+        self.total_operations = self.stats["trades"]
         self._notify_stats()
 
     def _notify_status(self, status: str) -> None:
