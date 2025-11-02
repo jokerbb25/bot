@@ -396,36 +396,28 @@ class BotEngine:
             if direction in {"CALL", "PUT"}:
                 if not BOT_ACTIVE:
                     self.logger.log("⏸ Trading paused via Telegram.")
-                    self._notify_status("Paused")
                     return
                 lot = self._select_lot_by_confidence()
+                candle_time = df.index[-1]
+                executed_order = False
                 if confidence >= self.base_confidence:
-                    # Prevent duplicate trade in the same candle, but still evaluate strategies every cycle
-                    candle_time = df.index[-1]
-
-                    if getattr(self, "last_candle", None) == candle_time:
-                        return  # skip only the trade, not the scan
-
-                    self.last_candle = candle_time
-                    executed = self.execute_market_order(symbol, direction, lot)
-                    if executed:
-                        self._handle_market_order_success(symbol, direction, confidence, lot, analysis)
-                        self._notify_status("Operation executed")
-                        return
+                    if getattr(self, "last_candle", None) != candle_time:
+                        self.last_candle = candle_time
+                        executed = self.execute_market_order(symbol, direction, lot)
+                        if executed:
+                            self._handle_market_order_success(symbol, direction, confidence, lot, analysis)
+                            self._notify_status("Operation executed")
+                            executed_order = True
                 elif pullback_flag and confidence >= self.lower_confidence:
-                    # Prevent duplicate trade in the same candle, but still evaluate strategies every cycle
-                    candle_time = df.index[-1]
-
-                    if getattr(self, "last_candle", None) == candle_time:
-                        return  # skip only the trade, not the scan
-
-                    self.last_candle = candle_time
-                    pending_price = self._determine_pending_price(direction, last_price, atr_value)
-                    executed = self.execute_pending_order(symbol, direction, pending_price, df, atr_value, lot)
-                    if executed:
-                        self._notify_status("Operation executed")
-                        return
-            self._notify_status("Scanning")
+                    if getattr(self, "last_candle", None) != candle_time:
+                        self.last_candle = candle_time
+                        pending_price = self._determine_pending_price(direction, last_price, atr_value)
+                        executed = self.execute_pending_order(symbol, direction, pending_price, df, atr_value, lot)
+                        if executed:
+                            self._notify_status("Operation executed")
+                            executed_order = True
+                if not executed_order:
+                    self._notify_status("Scanning")
         finally:
             self.cycle_lock.release()
 

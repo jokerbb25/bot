@@ -18,8 +18,8 @@ sl_tp:
   apply_to_pending: true
 
 confidence:
-  base_confidence: 0.70
-  lower_confidence: 0.60
+  base_confidence: 0.60
+  lower_confidence: 0.55
   memory_boost: 0.05
 
 telegram:
