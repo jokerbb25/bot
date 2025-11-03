@@ -243,6 +243,7 @@ class BotAxiGUI(QWidget):
             order_callback=self._order_from_engine,
             stats_callback=self._stats_from_engine,
         )
+        self.engine.gui = self
 
         general_tab = self._build_general_tab()
         strategies_tab = self._build_strategies_tab()
@@ -279,6 +280,10 @@ class BotAxiGUI(QWidget):
             self.log_received.connect(lambda message: gui_log(message))
 
         self.refresh_memory_view()
+
+    def update_trade_result(self, symbol: str, result: str, pnl: float) -> None:
+        message = f"Resultado cierre [{symbol}] → {result} | PnL: {pnl:.2f}"
+        self.log_received.emit(message)
 
     def _build_general_tab(self) -> QWidget:
         widget = QWidget()

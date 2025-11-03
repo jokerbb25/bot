@@ -39,6 +39,7 @@ class BotEngine:
         self.memory_path = memory_path or base_path / "memory.json"
         self.gui_log = gui_log
         self.logger = Logger(gui_log=self.gui_log)
+        self.gui = None
         self.status_callback = status_callback
         self.confidence_callback = confidence_callback
         self.order_callback = order_callback
@@ -101,6 +102,7 @@ class BotEngine:
         self.total_operations = 0
         self._last_ticket_id = 0
         self._telegram_listener_started = False
+        self.open_positions: Dict[int, Dict[str, Any]] = {}
 
     def start(self) -> bool:
         with self._thread_lock:
@@ -196,6 +198,7 @@ class BotEngine:
                 symbols_to_scan = self._get_symbols_to_scan()
                 if not symbols_to_scan:
                     self.logger.log("No symbols configured for scanning.")
+                    self.check_positions()
                     time.sleep(self.poll_interval)
                     continue
                 for symbol in symbols_to_scan:
@@ -206,11 +209,52 @@ class BotEngine:
                     except Exception as exc:  # pragma: no cover
                         self.logger.log(f"Error in {symbol}: {exc}")
                     time.sleep(0.4)
+                self.check_positions()
         finally:
             mt5.shutdown()
             self.logger.log("🛑 Trading engine stopped — MT5 disconnected")
             self.send_telegram("🛑 Trading engine stopped — MT5 disconnected")
             self._notify_status("Idle")
+
+    def check_positions(self) -> None:
+        positions = mt5.positions_get()
+        if positions is None:
+            return
+
+        active_tickets = [p.ticket for p in positions]
+
+        for ticket, pos_data in list(self.open_positions.items()):
+            if ticket not in active_tickets:
+                self._handle_closed_trade(ticket, pos_data)
+                self.open_positions.pop(ticket, None)
+
+    def _handle_closed_trade(self, ticket: int, pos_data: Dict[str, Any]) -> None:
+        history = mt5.history_deals_get(time.time() - 86400, time.time(), ticket=ticket)
+
+        pnl_value: Optional[float] = None
+        if history:
+            pnl_value = sum([deal.profit for deal in history])
+
+        if pnl_value is None:
+            pnl_value = 0.0
+
+        result = "WIN" if pnl_value > 0 else "LOSS"
+        msg = f"✅ Trade closed [{pos_data['symbol']}] → Result: {result} | PnL: {pnl_value:.2f}"
+        self.logger.log(msg)
+        self.send_telegram(msg)
+
+        if self.gui and hasattr(self.gui, "update_trade_result"):
+            try:
+                self.gui.update_trade_result(symbol=pos_data["symbol"], result=result, pnl=pnl_value)
+            except Exception as exc:  # pragma: no cover
+                self.logger.log(f"GUI update failed: {exc}")
+
+        if hasattr(self, "telegram_bot"):
+            try:
+                self.telegram_bot.send_message(msg)
+            except Exception as exc:  # pragma: no cover
+                self.logger.log(f"Telegram bot send failed: {exc}")
+
 
     def _get_symbols_to_scan(self) -> List[str]:
         with self._symbol_lock:
@@ -510,6 +554,7 @@ class BotEngine:
             self.logger.log(f"❌ Market order failed [{symbol}]: {retcode}")
             return False
 
+        entry_price = float(getattr(result, "price", price)) if hasattr(result, "price") else float(price)
         ticket = int(getattr(result, "order", 0) or getattr(result, "deal", 0) or 0)
         self._last_ticket_id = ticket
         self.logger.log(f"✅ ORDER EXECUTED [{symbol}] → {direction} lot={volume:.2f}")
@@ -523,22 +568,22 @@ class BotEngine:
                 "low": [price],
                 "close": [price],
             })
-        sl_price, tp_price = self._calc_sl_tp_prices(symbol, direction, price, df, atr_value)
+        sl_price, tp_price = self._calc_sl_tp_prices(symbol, direction, entry_price, df, atr_value)
         # --- SL/TP MIN DISTANCE ENFORCEMENT (FOREX SAFE MODE: A) ---
         stops_level = info.trade_stops_level
         point = info.point
         min_distance = stops_level * point
 
         if direction == "CALL":
-            if (price - sl_price) < min_distance:
-                sl_price = price - (min_distance * 2)
-            if (tp_price - price) < min_distance:
-                tp_price = price + (min_distance * 2)
+            if (entry_price - sl_price) < min_distance:
+                sl_price = entry_price - (min_distance * 2)
+            if (tp_price - entry_price) < min_distance:
+                tp_price = entry_price + (min_distance * 2)
         else:
-            if (sl_price - price) < min_distance:
-                sl_price = price + (min_distance * 2)
-            if (price - tp_price) < min_distance:
-                tp_price = price - (min_distance * 2)
+            if (sl_price - entry_price) < min_distance:
+                sl_price = entry_price + (min_distance * 2)
+            if (entry_price - tp_price) < min_distance:
+                tp_price = entry_price - (min_distance * 2)
         # -------------------------------------------------------------
 
 
@@ -572,6 +617,16 @@ class BotEngine:
         else:
             retcode = getattr(modify_result, "retcode", "no response")
             self.logger.log(f"⚠️ SL/TP modify failed [{symbol}]: {retcode}")
+
+        if ticket:
+            self.open_positions[ticket] = {
+                "symbol": symbol,
+                "entry_price": entry_price,
+                "sl": sl_price,
+                "tp": tp_price,
+                "direction": "BUY" if order_type == mt5.ORDER_TYPE_BUY else "SELL",
+                "timestamp": time.time(),
+            }
 
         return True
 
