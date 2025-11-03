@@ -6,8 +6,6 @@ from datetime import datetime
 from pathlib import Path
 from typing import Any, Callable, Dict, List, Optional, Tuple
 
-from dataclasses import dataclass
-
 import MetaTrader5 as mt5
 import pandas as pd
 import yaml
@@ -23,44 +21,6 @@ try:
     import requests
 except Exception:  # pragma: no cover
     requests = None
-
-
-@dataclass
-class TradePosition:
-    ticket: int
-    symbol: str
-    entry_price: float
-    sl: float
-    tp: float
-    direction: str
-    timestamp: float
-    lot: float
-
-    @classmethod
-    def from_mt5(cls, position: Any) -> "TradePosition":
-        ticket = int(getattr(position, "ticket", 0))
-        symbol = str(getattr(position, "symbol", ""))
-        entry_price = float(getattr(position, "price_open", 0.0))
-        sl_value = float(getattr(position, "sl", 0.0))
-        tp_value = float(getattr(position, "tp", 0.0))
-        volume = float(getattr(position, "volume", 0.0))
-        position_type = getattr(position, "type", None)
-        if position_type == mt5.POSITION_TYPE_BUY:
-            direction = "BUY"
-        elif position_type == mt5.POSITION_TYPE_SELL:
-            direction = "SELL"
-        else:
-            direction = "BUY"
-        return cls(
-            ticket=ticket,
-            symbol=symbol,
-            entry_price=entry_price,
-            sl=sl_value,
-            tp=tp_value,
-            direction=direction,
-            timestamp=time.time(),
-            lot=volume,
-        )
 
 
 class BotEngine:
@@ -142,7 +102,7 @@ class BotEngine:
         self.total_operations = 0
         self._last_ticket_id = 0
         self._telegram_listener_started = False
-        self.open_positions: Dict[int, TradePosition] = {}
+        self.open_positions: Dict[str, Dict[str, Any]] = {}
 
     def start(self) -> bool:
         with self._thread_lock:
@@ -235,10 +195,11 @@ class BotEngine:
         self._notify_status("Scanning")
         try:
             while self.running.is_set():
+                self.check_open_positions()
                 symbols_to_scan = self._get_symbols_to_scan()
                 if not symbols_to_scan:
                     self.logger.log("No symbols configured for scanning.")
-                    self.check_positions()
+                    self.check_open_positions()
                     time.sleep(self.poll_interval)
                     continue
                 for symbol in symbols_to_scan:
@@ -249,66 +210,57 @@ class BotEngine:
                     except Exception as exc:  # pragma: no cover
                         self.logger.log(f"Error in {symbol}: {exc}")
                     time.sleep(0.4)
-                self.check_positions()
+                self.check_open_positions()
         finally:
             mt5.shutdown()
             self.logger.log("🛑 Trading engine stopped — MT5 disconnected")
             self.send_telegram("🛑 Trading engine stopped — MT5 disconnected")
             self._notify_status("Idle")
 
-    def check_positions(self) -> None:
-        positions = mt5.positions_get()
-        if positions is None:
-            return
-
-        active_tickets = [p.ticket for p in positions]
-
-        for ticket, pos_data in list(self.open_positions.items()):
-            if ticket not in active_tickets:
-                self._handle_closed_trade(ticket, pos_data)
-                self.open_positions.pop(ticket, None)
-
-    def _handle_closed_trade(self, target: Any, pos_data: Optional[TradePosition] = None) -> None:
-        if hasattr(target, "ticket") and pos_data is None:
-            position = target
-            ticket = int(getattr(position, "ticket", 0))
+    def check_open_positions(self) -> None:
+        for symbol, trade_data in list(self.open_positions.items()):
+            ticket = int(trade_data.get("ticket", 0) or 0)
             if ticket <= 0:
-                return
-            trade = TradePosition.from_mt5(position)
-            self.open_positions[trade.ticket] = trade
-            self.logger.log(f"📊 Tracking trade [{trade.symbol}] ticket={trade.ticket}")
-            return
+                self.open_positions.pop(symbol, None)
+                continue
 
-        ticket = int(target)
-        if ticket <= 0:
-            return
-        trade_data = pos_data or self.open_positions.get(ticket)
-        if trade_data is None:
-            return
+            positions = mt5.positions_get(ticket=ticket)
+            if positions is not None and len(positions) > 0:
+                continue
 
-        time.sleep(0.3)
-        end_time = time.time()
-        start_time = end_time - 86400
-        history = mt5.history_deals_get(start_time, end_time, ticket=ticket)
+            time.sleep(0.3)
+            start_reference = trade_data.get("time")
+            if isinstance(start_reference, datetime):
+                start_time = max(0.0, start_reference.timestamp() - 86400)
+            else:
+                start_time = time.time() - 86400
+            end_time = time.time()
+            history = mt5.history_deals_get(start_time, end_time, ticket=ticket)
 
-        pnl_value = 0.0
-        if history is not None and len(history) > 0:
-            pnl_value = sum(float(getattr(deal, "profit", 0.0)) for deal in history)
+            pnl_value = 0.0
+            if history is not None and len(history) > 0:
+                pnl_value = sum(float(getattr(deal, "profit", 0.0)) for deal in history)
 
+            self._handle_closed_trade(symbol, trade_data, pnl_value)
+            self.open_positions.pop(symbol, None)
+
+    def _handle_closed_trade(self, symbol: str, trade_data: Dict[str, Any], pnl_value: float) -> None:
         result = "WIN" if pnl_value > 0 else "LOSS"
-        message = f"✅ Trade closed [{trade_data.symbol}] → {result} | PnL: {pnl_value:.2f}"
+        sign = "+" if pnl_value >= 0 else "-"
+        pnl_display = f"{sign}${abs(pnl_value):.2f}"
+        message = f"✅ Trade closed [{symbol}] Result: {result} {pnl_display}"
         self.logger.log(message)
         self.send_telegram(message)
 
         if self.gui:
             if hasattr(self.gui, "update_pnl"):
                 try:
-                    self.gui.update_pnl(symbol=trade_data.symbol, result=result, pnl=pnl_value)
+                    self.gui.update_pnl(symbol=symbol, result=result, pnl=pnl_value)
                 except Exception as exc:  # pragma: no cover
                     self.logger.log(f"GUI update failed: {exc}")
             elif hasattr(self.gui, "update_trade_result"):
                 try:
-                    self.gui.update_trade_result(symbol=trade_data.symbol, result=result, pnl=pnl_value)
+                    self.gui.update_trade_result(symbol=symbol, result=result, pnl=pnl_value)
                 except Exception as exc:  # pragma: no cover
                     self.logger.log(f"GUI update failed: {exc}")
 
@@ -321,7 +273,7 @@ class BotEngine:
         self._update_stats(result, pnl_value)
 
         send_message(
-            f"Operacion cerrada: #{ticket} {trade_data.symbol}\n"
+            f"Operacion cerrada: #{trade_data.get('ticket', 0)} {symbol}\n"
             f"Resultado: {'WIN ✅' if result == 'WIN' else 'LOSS ❌'}\n"
             f"Precision Actual: {self.get_accuracy():.2f}%\n"
             f"Pnl: {pnl_value:+.2f} USD"
@@ -700,10 +652,15 @@ class BotEngine:
             retcode = getattr(modify_result, "retcode", "no response")
             self.logger.log(f"❌ SL/TP FAILED retcode={retcode}")
 
-        setattr(position, "sl", sl_price)
-        setattr(position, "tp", tp_price)
-        setattr(position, "volume", volume)
-        self._handle_closed_trade(position)
+        self.open_positions[symbol] = {
+            "ticket": ticket,
+            "entry": entry_price,
+            "sl": sl_price,
+            "tp": tp_price,
+            "type": order_type,
+            "time": datetime.now(),
+            "lot": volume,
+        }
 
         return True
 
