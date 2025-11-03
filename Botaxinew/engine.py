@@ -354,9 +354,6 @@ class BotEngine:
             else:
                 direction = "NONE"
 
-            for name, signal_name, weight in strategies:
-                self.logger.log(f"[{symbol}] {name} → {signal_name} (weight={weight:.2f})")
-
             analysis["confidence"] = confidence
             analysis["direction"] = direction
 
@@ -378,46 +375,80 @@ class BotEngine:
             analysis["confidence"] = confidence
             self.last_confidence = confidence
 
-            log_line = (
-                f"[{symbol}] RSI {float(analysis.get('rsi_value', 0.0)):.2f} | "
-                f"EMA: {analysis.get('ema_trend', 'flat')} | "
-                f"MACD: {analysis.get('macd_signal', 'NONE')} | "
-                f"Pullback: {str(analysis.get('pullback', False)).lower()} | "
-                f"Confidence {confidence:.2f}"
-            )
-            self.logger.log(log_line)
-            final_marker = " ✅" if direction in {"CALL", "PUT"} else ""
-            self.logger.log(f"[{symbol}] CONFIDENCE FINAL: {confidence * 100:.0f}% → {direction}{final_marker}")
+            strategy_name_map = {
+                "rsi_direction": "RSI",
+                "ema_trend": "EMA Trend",
+                "macd_momentum": "MACD",
+                "adx_trend": "ADX Trend",
+                "volume_spike": "Volume Spike",
+                "breakout": "Breakout",
+                "momentum_candle": "Momentum Candle",
+                "bollinger_position": "Bollinger Position",
+                "bollinger_rebound": "Bollinger Rebound",
+                "pullback_signal": "Pullback",
+                "memory": "Memory IA",
+            }
+
+            self.logger.log(f"\n=== {symbol} ===")
+
+            strategy_votes = 0
+            active_strategies = 0
+
+            for key, enabled in self.strategy_flags.items():
+                if not enabled:
+                    continue
+
+                active_strategies += 1
+                expected = strategy_name_map.get(key, key)
+
+                match = next((s for (name, sig, w) in strategies if expected in name), None)
+
+                if match:
+                    name, sig, w = match
+                    strategy_votes += 1
+                    self.logger.log(f" ✅ {name:<22} → {sig} (weight={w:.2f})")
+                else:
+                    self.logger.log(f" ❌ {expected:<22} → no signal")
+
+            self.logger.log(f"[{symbol}] Active strategies: {active_strategies} | Strategies with signal: {strategy_votes}")
+            self.logger.log(f"[{symbol}] Confidence = {confidence:.2f}")
+            self.logger.log("------------------------------------------------------------")
+
             self._notify_confidence(confidence, direction)
 
-            last_price = float(df["close"].iloc[-1])
-            atr_value = float(analysis.get("atr", calc_atr(df)))
+            if not BOT_ACTIVE:
+                self.logger.log("⏸ Trading paused via Telegram.")
+                return
 
-            if direction in {"CALL", "PUT"}:
-                if not BOT_ACTIVE:
-                    self.logger.log("⏸ Trading paused via Telegram.")
-                    return
-                lot = self._select_lot_by_confidence()
-                candle_time = df.index[-1]
-                executed_order = False
-                if confidence >= self.base_confidence:
-                    if getattr(self, "last_candle", None) != candle_time:
-                        self.last_candle = candle_time
-                        executed = self.execute_market_order(symbol, direction, lot)
-                        if executed:
-                            self._handle_market_order_success(symbol, direction, confidence, lot, analysis)
-                            self._notify_status("Operation executed")
-                            executed_order = True
-                elif pullback_flag and confidence >= self.lower_confidence:
-                    if getattr(self, "last_candle", None) != candle_time:
-                        self.last_candle = candle_time
-                        pending_price = self._determine_pending_price(direction, last_price, atr_value)
-                        executed = self.execute_pending_order(symbol, direction, pending_price, df, atr_value, lot)
-                        if executed:
-                            self._notify_status("Operation executed")
-                            executed_order = True
-                if not executed_order:
-                    self._notify_status("Scanning")
+            if confidence < 0.60:
+                self.logger.log(f"[{symbol}] ❌ No trade → Confidence too low ({confidence:.2f})")
+                return
+
+            if strategy_votes < 2:
+                self.logger.log(f"[{symbol}] ❌ No trade → Not enough confluence ({strategy_votes}/2 strategies)")
+                return
+
+            if direction not in {"CALL", "PUT"}:
+                self.logger.log(f"[{symbol}] ❌ No trade → Direction unavailable")
+                return
+
+            vote_count = len([s for (_, s, _) in strategies if s == direction])
+            if vote_count < 2:
+                self.logger.log(f"[{symbol}] ❌ No trade → Not enough aligned votes ({vote_count}/2)")
+                return
+
+            candle_time = df.index[-1]
+            if getattr(self, "last_candle", None) == candle_time:
+                self.logger.log(f"[{symbol}] ℹ️ Trade already processed for this candle")
+                return
+
+            self.last_candle = candle_time
+            lot = self._select_lot_by_confidence()
+            executed = self.execute_market_order(symbol, direction, lot)
+
+            if executed:
+                self._handle_market_order_success(symbol, direction, confidence, lot, analysis)
+                self._notify_status("Operation executed")
         finally:
             self.cycle_lock.release()
 
