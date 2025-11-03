@@ -235,7 +235,7 @@ class BotEngine:
         history = mt5.history_deals_get(start_time, end_time, ticket=ticket)
 
         pnl_value = 0.0
-        if history:
+        if history is not None and len(history) > 0:
             pnl_value = sum(float(getattr(deal, "profit", 0.0)) for deal in history)
 
         result = "WIN" if pnl_value > 0 else "LOSS"
@@ -575,40 +575,44 @@ class BotEngine:
                 "close": [price],
             })
         sl_price, tp_price = self._calc_sl_tp_prices(symbol, direction, entry_price, df, atr_value)
-        # --- SL/TP MIN DISTANCE ENFORCEMENT (FOREX SAFE MODE: A) ---
-        stops_level = info.trade_stops_level
-        point = info.point
-        min_distance = stops_level * point
+        info = mt5.symbol_info(symbol) or info
+        stop_level = getattr(info, 'trade_stops_level', 0)
+        point = float(getattr(info, 'point', 0.0) or 0.0)
+        stop_distance = float(stop_level) * point
+        price_increment = point if point > 0 else max(abs(entry_price) * 0.0001, 1e-5)
 
         if direction == "CALL":
-            if (entry_price - sl_price) < min_distance:
-                sl_price = entry_price - (min_distance * 2)
-            if (tp_price - entry_price) < min_distance:
-                tp_price = entry_price + (min_distance * 2)
+            min_sl_level = entry_price - stop_distance if stop_distance > 0 else entry_price
+            if sl_price >= min_sl_level:
+                sl_price = min_sl_level - price_increment
+            min_tp_level = entry_price + stop_distance if stop_distance > 0 else entry_price
+            if tp_price <= min_tp_level:
+                tp_price = min_tp_level + price_increment
         else:
-            if (sl_price - entry_price) < min_distance:
-                sl_price = entry_price + (min_distance * 2)
-            if (entry_price - tp_price) < min_distance:
-                tp_price = entry_price - (min_distance * 2)
-        # -------------------------------------------------------------
-
+            min_sl_level = entry_price + stop_distance if stop_distance > 0 else entry_price
+            if sl_price <= min_sl_level:
+                sl_price = min_sl_level + price_increment
+            max_tp_level = entry_price - stop_distance if stop_distance > 0 else entry_price
+            if tp_price >= max_tp_level:
+                tp_price = max_tp_level - price_increment
 
         position = None
         if ticket:
             attempts = 0
             while attempts < 5 and position is None:
                 positions = mt5.positions_get(ticket=ticket)
-                if positions:
+                if positions is not None and len(positions) > 0:
                     position = positions[0]
                     break
                 time.sleep(0.3)
                 attempts += 1
             if position is None:
-                alt_positions = mt5.positions_get(symbol=symbol) or []
-                for pos in alt_positions:
-                    if int(getattr(pos, "ticket", 0)) == ticket:
-                        position = pos
-                        break
+                alt_positions = mt5.positions_get(symbol=symbol)
+                if alt_positions is not None:
+                    for pos in alt_positions:
+                        if int(getattr(pos, "ticket", 0)) == ticket:
+                            position = pos
+                            break
         if position is None:
             self.logger.log(f"⚠️ Unable to locate position for ticket {ticket}")
             return True
