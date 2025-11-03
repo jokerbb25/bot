@@ -1,0 +1,28 @@
+symbols:
+  - EURUSD
+  - XAUUSD
+  - GBPUSD
+  - USDJPY
+  - BTCUSD
+
+timeframe: M1
+
+risk:
+  lot_high: 0.10
+  lot_low: 0.05
+
+sl_tp:
+  mode: "ATR x Multiplier"
+  sl_value: 0.5
+  tp_value: 1.0
+  apply_to_pending: true
+
+confidence:
+  base_confidence: 0.60
+  lower_confidence: 0.55
+  memory_boost: 0.05
+
+telegram:
+  enabled: false
+  token: ""
+  chat_id: ""
