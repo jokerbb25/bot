@@ -25,7 +25,11 @@ from PyQt5.QtWidgets import (
     QHeaderView,
 )
 from PyQt5.QtCore import QThread, QTimer, Qt, pyqtSignal
+from PyQt5.QtCore import qRegisterMetaType
+from PyQt5.QtGui import QTextCursor, QTextBlock
 
+qRegisterMetaType(QTextCursor)
+qRegisterMetaType(QTextBlock)
 
 SYMBOLS = [
     "EURUSD",
