@@ -228,7 +228,43 @@ class BotEngine:
                 self._handle_closed_trade(ticket, pos_data)
                 self.open_positions.pop(ticket, None)
 
-    def _handle_closed_trade(self, ticket: int, pos_data: Dict[str, Any]) -> None:
+    def _handle_closed_trade(self, target: Any, pos_data: Optional[Dict[str, Any]] = None) -> None:
+        if hasattr(target, "ticket") and pos_data is None:
+            position = target
+            ticket = int(getattr(position, "ticket", 0))
+            if ticket <= 0:
+                return
+            symbol = str(getattr(position, "symbol", getattr(position, "_symbol", "")))
+            entry_price = float(getattr(position, "price_open", getattr(position, "_entry_price", 0.0)))
+            sl_value = float(getattr(position, "sl", getattr(position, "_assigned_sl", 0.0)))
+            tp_value = float(getattr(position, "tp", getattr(position, "_assigned_tp", 0.0)))
+            position_type = getattr(position, "type", None)
+            if position_type == mt5.POSITION_TYPE_BUY:
+                direction = "BUY"
+            elif position_type == mt5.POSITION_TYPE_SELL:
+                direction = "SELL"
+            else:
+                direction = str(getattr(position, "_direction", "BUY"))
+            volume = float(getattr(position, "volume", getattr(position, "_assigned_volume", 0.0)))
+            self.open_positions[ticket] = {
+                "symbol": symbol,
+                "entry_price": entry_price,
+                "sl": sl_value,
+                "tp": tp_value,
+                "direction": direction,
+                "timestamp": time.time(),
+                "lot": volume,
+            }
+            self.logger.log(f"📊 Tracking trade [{symbol}] ticket={ticket}")
+            return
+
+        ticket = int(target)
+        if ticket <= 0:
+            return
+        trade_data = pos_data or self.open_positions.get(ticket)
+        if not trade_data:
+            return
+
         time.sleep(0.3)
         end_time = time.time()
         start_time = end_time - 86400
@@ -239,19 +275,19 @@ class BotEngine:
             pnl_value = sum(float(getattr(deal, "profit", 0.0)) for deal in history)
 
         result = "WIN" if pnl_value > 0 else "LOSS"
-        message = f"✅ Trade closed [{pos_data['symbol']}] → {result} | PnL: {pnl_value:.2f}"
+        message = f"✅ Trade closed [{trade_data['symbol']}] → {result} | PnL: {pnl_value:.2f}"
         self.logger.log(message)
         self.send_telegram(message)
 
         if self.gui:
             if hasattr(self.gui, "update_pnl"):
                 try:
-                    self.gui.update_pnl(symbol=pos_data["symbol"], result=result, pnl=pnl_value)
+                    self.gui.update_pnl(symbol=trade_data["symbol"], result=result, pnl=pnl_value)
                 except Exception as exc:  # pragma: no cover
                     self.logger.log(f"GUI update failed: {exc}")
             elif hasattr(self.gui, "update_trade_result"):
                 try:
-                    self.gui.update_trade_result(symbol=pos_data["symbol"], result=result, pnl=pnl_value)
+                    self.gui.update_trade_result(symbol=trade_data["symbol"], result=result, pnl=pnl_value)
                 except Exception as exc:  # pragma: no cover
                     self.logger.log(f"GUI update failed: {exc}")
 
@@ -260,6 +296,15 @@ class BotEngine:
                 self.telegram_bot.send_message(message)
             except Exception as exc:  # pragma: no cover
                 self.logger.log(f"Telegram bot send failed: {exc}")
+
+        self._update_stats(result, pnl_value)
+
+        send_message(
+            f"Operacion cerrada: #{ticket} {trade_data['symbol']}\n"
+            f"Resultado: {'WIN ✅' if result == 'WIN' else 'LOSS ❌'}\n"
+            f"Precision Actual: {self.get_accuracy():.2f}%\n"
+            f"Pnl: {pnl_value:+.2f} USD"
+        )
 
 
     def _get_symbols_to_scan(self) -> List[str]:
@@ -576,23 +621,24 @@ class BotEngine:
             })
         sl_price, tp_price = self._calc_sl_tp_prices(symbol, direction, entry_price, df, atr_value)
         info = mt5.symbol_info(symbol) or info
-        stop_level = getattr(info, 'trade_stops_level', 0)
-        point = float(getattr(info, 'point', 0.0) or 0.0)
-        stop_distance = float(stop_level) * point
+        stop_level = float(getattr(info, "trade_stops_level", 0) or 0.0)
+        freeze_level = float(getattr(info, "freeze_level", 0) or 0.0)
+        point = float(getattr(info, "point", 0.0) or 0.0)
+        min_stop_distance = (stop_level + freeze_level) * point
         price_increment = point if point > 0 else max(abs(entry_price) * 0.0001, 1e-5)
 
         if direction == "CALL":
-            min_sl_level = entry_price - stop_distance if stop_distance > 0 else entry_price
+            min_sl_level = entry_price - min_stop_distance if min_stop_distance > 0 else entry_price - price_increment
             if sl_price >= min_sl_level:
                 sl_price = min_sl_level - price_increment
-            min_tp_level = entry_price + stop_distance if stop_distance > 0 else entry_price
+            min_tp_level = entry_price + min_stop_distance if min_stop_distance > 0 else entry_price + price_increment
             if tp_price <= min_tp_level:
                 tp_price = min_tp_level + price_increment
         else:
-            min_sl_level = entry_price + stop_distance if stop_distance > 0 else entry_price
+            min_sl_level = entry_price + min_stop_distance if min_stop_distance > 0 else entry_price + price_increment
             if sl_price <= min_sl_level:
                 sl_price = min_sl_level + price_increment
-            max_tp_level = entry_price - stop_distance if stop_distance > 0 else entry_price
+            max_tp_level = entry_price - min_stop_distance if min_stop_distance > 0 else entry_price - price_increment
             if tp_price >= max_tp_level:
                 tp_price = max_tp_level - price_increment
 
@@ -633,15 +679,14 @@ class BotEngine:
             retcode = getattr(modify_result, "retcode", "no response")
             self.logger.log(f"⚠️ SL/TP failed [{symbol}] retcode={retcode}")
 
-        if ticket:
-            self.open_positions[ticket] = {
-                "symbol": symbol,
-                "entry_price": entry_price,
-                "sl": sl_price,
-                "tp": tp_price,
-                "direction": "BUY" if order_type == mt5.ORDER_TYPE_BUY else "SELL",
-                "timestamp": time.time(),
-            }
+        if position is not None:
+            setattr(position, "_entry_price", entry_price)
+            setattr(position, "_assigned_sl", sl_price)
+            setattr(position, "_assigned_tp", tp_price)
+            setattr(position, "_assigned_volume", volume)
+            setattr(position, "_symbol", symbol)
+            setattr(position, "_direction", "BUY" if order_type == mt5.ORDER_TYPE_BUY else "SELL")
+            self._handle_closed_trade(position)
 
         return True
 
@@ -689,7 +734,6 @@ class BotEngine:
         self.logger.log(result_message)
         self.send_telegram(result_message)
         self._notify_order(result_event)
-        self._update_stats(trade_result, pnl_value)
         is_win = trade_result == "WIN"
         ticket_id = getattr(self, "_last_ticket_id", 0)
         send_message(
@@ -822,7 +866,7 @@ class BotEngine:
 
     def _evaluate_trade_result(self, symbol: str, direction: str) -> str:
         rates = mt5.copy_rates_from_pos(symbol, self.timeframe, 0, 3)
-        if not rates:
+        if rates is None or len(rates) == 0:
             return "UNKNOWN"
         df = pd.DataFrame(rates)
         if len(df) < 2:
