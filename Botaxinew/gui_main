@@ -185,6 +185,24 @@ class BotAxiGUI(QWidget):
         self.confidence_bar.setValue(0)
         self.confidence_bar.setMinimumHeight(20)
 
+        self.open_positions_table = QTableWidget(0, 6)
+        self.open_positions_table.setHorizontalHeaderLabels([
+            "Ticket",
+            "Símbolo",
+            "Dirección",
+            "SL",
+            "TP",
+            "PnL",
+        ])
+        open_header = self.open_positions_table.horizontalHeader()
+        open_header.setSectionResizeMode(QHeaderView.Stretch)
+        self.open_positions_table.verticalHeader().setVisible(False)
+        self.open_positions_table.setEditTriggers(QAbstractItemView.NoEditTriggers)
+        self.open_positions_table.setSelectionBehavior(QAbstractItemView.SelectRows)
+        self.open_positions_table.setSelectionMode(QAbstractItemView.SingleSelection)
+        self.open_positions_table.setMinimumHeight(160)
+        self.open_positions_table.setFont(QFont("Segoe UI", 10))
+
         self.trade_table = QTableWidget(0, 9)
         self.trade_table.setHorizontalHeaderLabels([
             "Operaciones",
@@ -288,6 +306,42 @@ class BotAxiGUI(QWidget):
     def update_pnl(self, symbol: str, result: str, pnl: float) -> None:
         self.update_trade_result(symbol, result, pnl)
 
+    def update_open_positions(self, positions: Any) -> None:
+        self.open_positions_table.setRowCount(0)
+        if not positions:
+            return
+
+        for row_index, pos in enumerate(positions):
+            self.open_positions_table.insertRow(row_index)
+            ticket_value = int(getattr(pos, "ticket", 0) or 0)
+            symbol_value = str(getattr(pos, "symbol", ""))
+            pos_type = int(getattr(pos, "type", 0) or 0)
+            direction = "BUY" if pos_type == 0 else "SELL"
+            sl_value = float(getattr(pos, "sl", 0.0) or 0.0)
+            tp_value = float(getattr(pos, "tp", 0.0) or 0.0)
+            profit_value = float(getattr(pos, "profit", 0.0) or 0.0)
+
+            values = [
+                str(ticket_value),
+                symbol_value,
+                direction,
+                f"{sl_value:.5f}" if sl_value else "-",
+                f"{tp_value:.5f}" if tp_value else "-",
+                f"{profit_value:.2f}",
+            ]
+
+            for column, text in enumerate(values):
+                item = QTableWidgetItem(text)
+                item.setTextAlignment(Qt.AlignCenter)
+                if column == 2:
+                    item.setForeground(Qt.green if direction == "BUY" else Qt.red)
+                if column == 5:
+                    if profit_value > 0:
+                        item.setForeground(Qt.green)
+                    elif profit_value < 0:
+                        item.setForeground(Qt.red)
+                self.open_positions_table.setItem(row_index, column, item)
+
     def _build_general_tab(self) -> QWidget:
         widget = QWidget()
         layout = QVBoxLayout(widget)
@@ -339,6 +393,7 @@ class BotAxiGUI(QWidget):
 
         layout.addLayout(header_layout)
         layout.addLayout(second_row)
+        layout.addWidget(self.open_positions_table)
         layout.addWidget(self.trade_table)
         return widget
 

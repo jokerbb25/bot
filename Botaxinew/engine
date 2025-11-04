@@ -102,7 +102,7 @@ class BotEngine:
         self.total_operations = 0
         self._last_ticket_id = 0
         self._telegram_listener_started = False
-        self.open_positions: Dict[str, Dict[str, Any]] = {}
+        self.open_positions: Dict[int, Dict[str, Any]] = {}
 
     def start(self) -> bool:
         with self._thread_lock:
@@ -196,10 +196,14 @@ class BotEngine:
         try:
             while self.running.is_set():
                 self.check_open_positions()
+                self.rescue_sl_tp_for_open_positions()
+                self.update_gui_positions()
                 symbols_to_scan = self._get_symbols_to_scan()
                 if not symbols_to_scan:
                     self.logger.log("No symbols configured for scanning.")
                     self.check_open_positions()
+                    self.rescue_sl_tp_for_open_positions()
+                    self.update_gui_positions()
                     time.sleep(self.poll_interval)
                     continue
                 for symbol in symbols_to_scan:
@@ -211,6 +215,8 @@ class BotEngine:
                         self.logger.log(f"Error in {symbol}: {exc}")
                     time.sleep(0.4)
                 self.check_open_positions()
+                self.rescue_sl_tp_for_open_positions()
+                self.update_gui_positions()
         finally:
             mt5.shutdown()
             self.logger.log("🛑 Trading engine stopped — MT5 disconnected")
@@ -218,31 +224,104 @@ class BotEngine:
             self._notify_status("Idle")
 
     def check_open_positions(self) -> None:
-        for symbol, trade_data in list(self.open_positions.items()):
-            ticket = int(trade_data.get("ticket", 0) or 0)
-            if ticket <= 0:
-                self.open_positions.pop(symbol, None)
+        positions = mt5.positions_get()
+        active_tickets = {
+            int(getattr(pos, "ticket", 0) or 0)
+            for pos in positions
+        } if positions else set()
+
+        for ticket, trade_data in list(self.open_positions.items()):
+            if ticket in active_tickets:
                 continue
-
-            positions = mt5.positions_get(ticket=ticket)
-            if positions is not None and len(positions) > 0:
-                continue
-
-            time.sleep(0.3)
-            start_reference = trade_data.get("time")
-            if isinstance(start_reference, datetime):
-                start_time = max(0.0, start_reference.timestamp() - 86400)
-            else:
-                start_time = time.time() - 86400
-            end_time = time.time()
-            history = mt5.history_deals_get(start_time, end_time, ticket=ticket)
-
-            pnl_value = 0.0
-            if history is not None and len(history) > 0:
-                pnl_value = sum(float(getattr(deal, "profit", 0.0)) for deal in history)
-
+            pnl_value = self._fetch_closed_pnl(ticket, trade_data)
+            symbol = str(trade_data.get("symbol", ""))
             self._handle_closed_trade(symbol, trade_data, pnl_value)
-            self.open_positions.pop(symbol, None)
+            self.open_positions.pop(ticket, None)
+
+    def _fetch_closed_pnl(self, ticket: int, trade_data: Dict[str, Any]) -> float:
+        time.sleep(0.3)
+        start_reference = trade_data.get("time")
+        if isinstance(start_reference, datetime):
+            start_time = max(0.0, start_reference.timestamp() - 86400)
+        else:
+            start_time = time.time() - 86400
+        end_time = time.time()
+        history = mt5.history_deals_get(start_time, end_time, ticket=ticket)
+
+        pnl_value = 0.0
+        if history is not None and len(history) > 0:
+            pnl_value = sum(float(getattr(deal, "profit", 0.0)) for deal in history)
+        return pnl_value
+
+    def rescue_sl_tp_for_open_positions(self, sl_distance_points: int = 200, tp_distance_points: int = 400) -> None:
+        positions = mt5.positions_get()
+        if positions is None or len(positions) == 0:
+            return
+
+        for pos in positions:
+            try:
+                current_sl = float(getattr(pos, "sl", 0.0) or 0.0)
+                current_tp = float(getattr(pos, "tp", 0.0) or 0.0)
+            except Exception:
+                current_sl = 0.0
+                current_tp = 0.0
+            if current_sl != 0.0 and current_tp != 0.0:
+                continue
+
+            symbol = str(getattr(pos, "symbol", ""))
+            ticket = int(getattr(pos, "ticket", 0))
+            price_open = float(getattr(pos, "price_open", 0.0))
+            if ticket <= 0 or not symbol:
+                continue
+
+            info = mt5.symbol_info(symbol)
+            if info is None:
+                continue
+            point = float(getattr(info, "point", 0.0) or 0.0)
+            stop_level = float(getattr(info, "trade_stops_level", 0.0) or 0.0)
+            min_distance = stop_level * point
+
+            sl_distance = max(sl_distance_points * point, min_distance * 2)
+            tp_distance = max(tp_distance_points * point, min_distance * 2)
+
+            order_type = int(getattr(pos, "type", mt5.ORDER_TYPE_BUY))
+            if order_type == mt5.ORDER_TYPE_BUY:
+                sl_price = price_open - sl_distance
+                tp_price = price_open + tp_distance
+            else:
+                sl_price = price_open + sl_distance
+                tp_price = price_open - tp_distance
+
+            modify_request = {
+                "action": mt5.TRADE_ACTION_SLTP,
+                "position": ticket,
+                "symbol": symbol,
+                "sl": sl_price,
+                "tp": tp_price,
+            }
+
+            result = mt5.order_send(modify_request)
+            if result and getattr(result, "retcode", None) == mt5.TRADE_RETCODE_DONE:
+                self.logger.log(f"✅ SL/TP rescue applied [{symbol}] ticket={ticket}")
+                if ticket in self.open_positions:
+                    self.open_positions[ticket]["sl"] = sl_price
+                    self.open_positions[ticket]["tp"] = tp_price
+            else:
+                retcode = getattr(result, "retcode", "no response")
+                self.logger.log(f"⚠️ SL/TP rescue failed [{symbol}] retcode={retcode}")
+
+    def update_gui_positions(self) -> None:
+        if not self.gui or not hasattr(self.gui, "update_open_positions"):
+            return
+        try:
+            positions = mt5.positions_get() or []
+        except Exception as exc:  # pragma: no cover
+            self.logger.log(f"GUI positions refresh failed: {exc}")
+            return
+        try:
+            self.gui.update_open_positions(positions)
+        except Exception as exc:  # pragma: no cover
+            self.logger.log(f"GUI update failed: {exc}")
 
     def _handle_closed_trade(self, symbol: str, trade_data: Dict[str, Any], pnl_value: float) -> None:
         result = "WIN" if pnl_value > 0 else "LOSS"
@@ -556,34 +635,31 @@ class BotEngine:
         order_type = mt5.ORDER_TYPE_BUY if direction == "CALL" else mt5.ORDER_TYPE_SELL
         price = tick.ask if order_type == mt5.ORDER_TYPE_BUY else tick.bid
 
+        filling_mode = getattr(info, "filling_mode", mt5.ORDER_FILLING_FOK)
         request = {
             "action": mt5.TRADE_ACTION_DEAL,
             "symbol": symbol,
             "volume": volume,
             "type": order_type,
             "price": price,
-            "deviation": 20,
-            "magic": 123456,
+            "magic": 777,
             "comment": "botaxi",
-            "type_filling": mt5.ORDER_FILLING_FOK,
+            "type_filling": filling_mode,
         }
 
         result = mt5.order_send(request)
-        if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
-            request["type_filling"] = mt5.ORDER_FILLING_IOC
-            result = mt5.order_send(request)
-
-        if result is None or result.retcode != mt5.TRADE_RETCODE_DONE:
+        if result is None or getattr(result, "retcode", None) != mt5.TRADE_RETCODE_DONE:
             retcode = getattr(result, "retcode", "no response")
             self.logger.log(f"❌ Market order failed [{symbol}]: {retcode}")
             return False
 
-        ticket = int(getattr(result, "order", 0) or getattr(result, "deal", 0) or 0)
+        ticket = int(getattr(result, "position", 0) or getattr(result, "order", 0) or getattr(result, "deal", 0) or 0)
         self._last_ticket_id = ticket
-        self.logger.log(f"✅ ORDER EXECUTED [{symbol}] → {direction} lot={volume:.2f}")
+        self.logger.log(f"✅ ORDER EXECUTED [{symbol}] → {direction} lot={volume:.2f} ticket={ticket}")
 
-        position = None
+        entry_price = float(price)
         if ticket:
+            position = None
             attempts = 0
             while attempts < 5 and position is None:
                 positions = mt5.positions_get(ticket=ticket)
@@ -599,11 +675,9 @@ class BotEngine:
                         if int(getattr(pos, "ticket", 0)) == ticket:
                             position = pos
                             break
-        if position is None:
-            self.logger.log(f"⚠️ Unable to locate position for ticket {ticket}")
-            return True
+            if position is not None:
+                entry_price = float(getattr(position, "price_open", price))
 
-        entry_price = float(getattr(position, "price_open", price))
         df = self._fetch_rates(symbol)
         atr_value = calc_atr(df) if df is not None and not df.empty else 0.0
         if df is None or df.empty:
@@ -614,45 +688,9 @@ class BotEngine:
                 "close": [price],
             })
         sl_price, tp_price = self._calc_sl_tp_prices(symbol, direction, entry_price, df, atr_value)
-        info = mt5.symbol_info(symbol) or info
-        stop_level = float(getattr(info, "trade_stops_level", 0) or 0.0)
-        freeze_level = float(getattr(info, "freeze_level", 0) or 0.0)
-        point = float(getattr(info, "point", 0.0) or 0.0)
-        min_stop_distance = (stop_level + freeze_level) * point
-        price_increment = point if point > 0 else max(abs(entry_price) * 0.0001, 1e-5)
 
-        if order_type == mt5.ORDER_TYPE_BUY:
-            target_sl = entry_price - min_stop_distance
-            if sl_price >= target_sl:
-                sl_price = target_sl - price_increment
-            target_tp = entry_price + min_stop_distance
-            if tp_price <= target_tp:
-                tp_price = target_tp + price_increment
-        else:
-            target_sl = entry_price + min_stop_distance
-            if sl_price <= target_sl:
-                sl_price = target_sl + price_increment
-            target_tp = entry_price - min_stop_distance
-            if tp_price >= target_tp:
-                tp_price = target_tp - price_increment
-
-        modify_request = {
-            "action": mt5.TRADE_ACTION_SLTP,
-            "position": position.ticket,
-            "sl": sl_price,
-            "tp": tp_price,
-            "magic": 777,
-            "comment": "SLTP",
-        }
-        modify_result = mt5.order_send(modify_request)
-
-        if modify_result and modify_result.retcode == mt5.TRADE_RETCODE_DONE:
-            self.logger.log(f"✅ SL/TP applied (SL={sl_price:.5f} / TP={tp_price:.5f})")
-        else:
-            retcode = getattr(modify_result, "retcode", "no response")
-            self.logger.log(f"❌ SL/TP FAILED retcode={retcode}")
-
-        self.open_positions[symbol] = {
+        self.open_positions[ticket] = {
+            "symbol": symbol,
             "ticket": ticket,
             "entry": entry_price,
             "sl": sl_price,
@@ -661,6 +699,9 @@ class BotEngine:
             "time": datetime.now(),
             "lot": volume,
         }
+
+        self.rescue_sl_tp_for_open_positions()
+        self.update_gui_positions()
 
         return True
 

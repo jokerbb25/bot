@@ -110,69 +110,107 @@ def connect_axi(account_id: int, password: str, server: str) -> None:
     print("✅ Connected to Axi MT5")
 
 
-def execute_market_order(symbol: str, action: str, atr_value: float, lot_size: float = LOT_SIZE) -> Tuple[Any, Optional[float]]:
-    """Execute a market order on MT5 using ATR-based dynamic stops."""
-
+def open_order(symbol: str, order_type: str, lot: float) -> Optional[Any]:
     symbol_info = mt5.symbol_info(symbol)
     if symbol_info is None:
-        raise RuntimeError(f"Symbol {symbol} is not available in MT5")
+        logger.error(f"[{symbol}] ❌ Symbol unavailable")
+        return None
+
+    if not symbol_info.visible:
+        mt5.symbol_select(symbol, True)
 
     tick = mt5.symbol_info_tick(symbol)
     if tick is None:
-        raise RuntimeError(f"No tick data for {symbol}")
+        logger.error(f"[{symbol}] ❌ No tick data available")
+        return None
 
-    direction = str(action or "CALL").upper()
-    order_type = mt5.ORDER_TYPE_BUY if direction == "CALL" else mt5.ORDER_TYPE_SELL
-    price = tick.ask if direction == "CALL" else tick.bid
-    point = float(getattr(symbol_info, "point", 0.0) or 0.0)
-    if point <= 0.0:
-        raise RuntimeError(f"Invalid point size for {symbol}")
-
-    lot = float(lot_size)
-    atr = float(max(atr_value, 0.0))
-    atr_pips = atr / point if point else 0.0
-    stop_level = int(getattr(symbol_info, "trade_stops_level", 0) or 0)
-    sl_points = max(stop_level, int(max(1.0, atr_pips * 1.2)))
-    tp_points = max(stop_level, int(max(1.0, atr_pips * 2.5)))
+    price = tick.ask if order_type == "BUY" else tick.bid
+    filling_mode = getattr(symbol_info, "filling_mode", mt5.ORDER_FILLING_FOK)
 
     request = {
         "action": mt5.TRADE_ACTION_DEAL,
         "symbol": symbol,
         "volume": lot,
-        "type": order_type,
+        "type": mt5.ORDER_TYPE_BUY if order_type == "BUY" else mt5.ORDER_TYPE_SELL,
         "price": price,
-        "sl": price - sl_points * point if direction == "CALL" else price + sl_points * point,
-        "tp": price + tp_points * point if direction == "CALL" else price - tp_points * point,
-        "magic": 1001,
-        "comment": "axi-bot",
-        "type_time": mt5.ORDER_TIME_GTC,
-        "type_filling": mt5.ORDER_FILLING_IOC,
+        "magic": 777,
+        "comment": "axi.py",
+        "type_filling": filling_mode,
     }
 
     result = mt5.order_send(request)
+    if result is not None and getattr(result, "retcode", None) == mt5.TRADE_RETCODE_DONE:
+        ticket = getattr(result, "position", 0)
+        logger.info(f"✅ ORDER EXECUTED [{symbol}] ticket={ticket}")
+        return result
 
-    if result is None or getattr(result, "retcode", None) != mt5.TRADE_RETCODE_DONE:
-        logger.error(
-            f"[{symbol}] ❌ Order failed: retcode={getattr(result, 'retcode', None)}"
-        )
-        if BOT_ACTIVE:
-            reason = getattr(result, "comment", "No response from MT5" if result is None else "Unknown error")
-            telegram_send(
-                "❌ ORDER FAILED\n"
-                f"{symbol}\nReason: {reason}"
-            )
-        return result, None
+    logger.error(f"[{symbol}] ❌ Error placing order: retcode={getattr(result, 'retcode', None)}")
+    return None
 
-    logger.info(
-        f"[{symbol}] ✅ Order placed #{getattr(result, 'order', 0)} {direction} @ {price:.5f}"
-    )
+
+def rescue_sl_tp_for_open_positions(sl_distance_points: int = 200, tp_distance_points: int = 400) -> None:
+    positions = mt5.positions_get()
+    if not positions:
+        return
+
+    for pos in positions:
+        if getattr(pos, "sl", 0.0) and getattr(pos, "tp", 0.0):
+            continue
+
+        symbol = pos.symbol
+        ticket = pos.ticket
+        price_open = pos.price_open
+
+        info = mt5.symbol_info(symbol)
+        if info is None:
+            continue
+
+        point = info.point
+        min_distance = info.trade_stops_level * point
+
+        sl_distance = max(sl_distance_points * point, min_distance * 2)
+        tp_distance = max(tp_distance_points * point, min_distance * 2)
+
+        if pos.type == mt5.ORDER_TYPE_BUY:
+            sl = price_open - sl_distance
+            tp = price_open + tp_distance
+        else:
+            sl = price_open + sl_distance
+            tp = price_open - tp_distance
+
+        modify_request = {
+            "action": mt5.TRADE_ACTION_SLTP,
+            "position": ticket,
+            "symbol": symbol,
+            "sl": sl,
+            "tp": tp,
+        }
+
+        result = mt5.order_send(modify_request)
+
+        if result is not None and getattr(result, "retcode", None) == mt5.TRADE_RETCODE_DONE:
+            logger.info(f"✅ SL/TP ADDED [{symbol}] ticket={ticket}")
+        else:
+            logger.warning(f"⚠️ SL/TP FAILED [{symbol}] retcode={getattr(result, 'retcode', None)}")
+
+
+def execute_market_order(symbol: str, action: str, atr_value: float, lot_size: float = LOT_SIZE) -> Tuple[Any, Optional[float]]:
+    direction = str(action or "CALL").upper()
+    order_side = "BUY" if direction == "CALL" else "SELL"
+
+    order_result = open_order(symbol, order_side, float(lot_size))
+    if order_result is None:
+        return None, None
+
     if BOT_ACTIVE:
         telegram_send(
             "✅ MARKET ORDER EXECUTED\n"
-            f"{symbol}\nAction: {direction}\nLot: {lot}"
+            f"{symbol}\nAction: {order_side}\nLot: {lot_size}"
         )
 
-    ticket = getattr(result, "order", 0) or getattr(result, "deal", 0) or 0
+    rescue_sl_tp_for_open_positions()
+
+    ticket = getattr(order_result, "position", 0) or getattr(order_result, "order", 0) or getattr(order_result, "deal", 0) or 0
     profit: Optional[float] = None
     if ticket:
         try:
@@ -181,9 +219,7 @@ def execute_market_order(symbol: str, action: str, atr_value: float, lot_size: f
         except Exception:
             pass
         time.sleep(0.5)
-        deals = mt5.history_deals_get(position=ticket)
-        if not deals:
-            deals = mt5.history_deals_get(ticket=ticket)
+        deals = mt5.history_deals_get(position=ticket) or mt5.history_deals_get(ticket=ticket)
         if deals:
             last_deal = deals[-1]
             profit = float(getattr(last_deal, "profit", 0.0))
@@ -199,7 +235,7 @@ def execute_market_order(symbol: str, action: str, atr_value: float, lot_size: f
     else:
         logger.warning(f"[{symbol}] ⚠️ Could not fetch MT5 deal to compute real PnL")
 
-    return result, profit
+    return order_result, profit
 
 
 def get_candles(symbol: str, timeframe: int = mt5.TIMEFRAME_M1, count: int = 100) -> List[Dict[str, Any]]:
@@ -4417,6 +4453,7 @@ class TradingEngine:
             logging.info("⏸ Bot paused — waiting for Telegram resume command.")
             time.sleep(5)
             return
+        rescue_sl_tp_for_open_positions()
         now = time.time()
         if now < self._next_cycle_time:
             QtWidgets.QApplication.processEvents(QtCore.QEventLoop.AllEvents, 50)
@@ -5443,6 +5480,21 @@ class BotWindow(QtWidgets.QWidget):
             self.stats_values[title] = value_label
         vbox.addWidget(stats_group)
 
+        self.positions_table = QtWidgets.QTableWidget(0, 6)
+        self.positions_table.setHorizontalHeaderLabels([
+            "Ticket",
+            "Símbolo",
+            "Dirección",
+            "SL",
+            "TP",
+            "PnL",
+        ])
+        self.positions_table.horizontalHeader().setStretchLastSection(True)
+        self.positions_table.verticalHeader().setVisible(False)
+        self.positions_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        self.positions_table.setSelectionBehavior(QtWidgets.QAbstractItemView.SelectRows)
+        self.positions_table.setSelectionMode(QtWidgets.QAbstractItemView.SingleSelection)
+
         self.trade_table = QtWidgets.QTableWidget(0, 7)
         self.trade_table.setHorizontalHeaderLabels([
             "Hora",
@@ -5456,6 +5508,7 @@ class BotWindow(QtWidgets.QWidget):
         self.trade_table.horizontalHeader().setStretchLastSection(True)
         self.trade_table.verticalHeader().setVisible(False)
         self.trade_table.setEditTriggers(QtWidgets.QAbstractItemView.NoEditTriggers)
+        vbox.addWidget(self.positions_table, 1)
         vbox.addWidget(self.trade_table, 1)
 
         vbox.addWidget(self.log_view, 1)
@@ -6096,6 +6149,44 @@ class BotWindow(QtWidgets.QWidget):
                 checkbox.setChecked(desired)
         self._update_history_tab()
         self.update_learning_tab()
+        self.refresh_positions_table()
+
+    def refresh_positions_table(self) -> None:
+        self.positions_table.setRowCount(0)
+        positions = mt5.positions_get()
+        if not positions:
+            return
+
+        for row_index, pos in enumerate(positions):
+            self.positions_table.insertRow(row_index)
+            ticket_value = int(getattr(pos, "ticket", 0) or 0)
+            symbol_value = str(getattr(pos, "symbol", ""))
+            pos_type = int(getattr(pos, "type", 0) or 0)
+            direction = "BUY" if pos_type == mt5.ORDER_TYPE_BUY else "SELL"
+            sl_value = float(getattr(pos, "sl", 0.0) or 0.0)
+            tp_value = float(getattr(pos, "tp", 0.0) or 0.0)
+            profit_value = float(getattr(pos, "profit", 0.0) or 0.0)
+
+            values = [
+                str(ticket_value),
+                symbol_value,
+                direction,
+                f"{sl_value:.5f}" if sl_value else "-",
+                f"{tp_value:.5f}" if tp_value else "-",
+                f"{profit_value:.2f}",
+            ]
+
+            for column, text in enumerate(values):
+                item = QtWidgets.QTableWidgetItem(text)
+                item.setTextAlignment(QtCore.Qt.AlignCenter)
+                if column == 2:
+                    item.setForeground(QtGui.QColor("#00ff7f") if direction == "BUY" else QtGui.QColor("#ff5252"))
+                if column == 5:
+                    if profit_value > 0:
+                        item.setForeground(QtGui.QColor("#00ff7f"))
+                    elif profit_value < 0:
+                        item.setForeground(QtGui.QColor("#ff5252"))
+                self.positions_table.setItem(row_index, column, item)
 
     def _load_strategy_config(self) -> Dict[str, bool]:
         estados: Dict[str, bool] = {}
